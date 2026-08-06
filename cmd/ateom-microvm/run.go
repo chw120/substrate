@@ -38,6 +38,7 @@ import (
 	"github.com/agent-substrate/substrate/internal/proto/ateompb"
 	"github.com/agent-substrate/substrate/internal/readyz"
 	"github.com/agent-substrate/substrate/internal/resources"
+	"github.com/agent-substrate/substrate/internal/sizing"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
@@ -104,6 +105,12 @@ const (
 	assetConfig    = "kata-config"
 	assetVirtiofsd = "virtiofsd"
 )
+
+// vmmMemReserveMiB is the DEFAULT guest RAM held back from the pod's memory limit
+// for the cloud-hypervisor VMM + virtiofsd, which run as host processes in the same
+// pod cgroup as the guest RAM; without a margin the pod OOMs. Overridable per
+// deployment via --vmm-mem-reserve-mib (see AteomService.memReserveMiB).
+const vmmMemReserveMiB = 256
 
 // maxActorContainers is a sanity cap on containers per actor (all share the one
 // micro-VM + virtiofsd). 25 is far above any real pod.
@@ -214,6 +221,7 @@ func (s *AteomService) RunWorkload(ctx context.Context, req *ateompb.RunWorkload
 
 		actorVersion:         req.GetActorVersion(),
 		egressGatewayAddress: req.GetEgressGatewayAddress(),
+		size:                 sizing.FromLimits(req.GetCpuMilli(), req.GetMemoryBytes()),
 	}
 
 	s.actorLogger.EmitLifecycleLog("Actor starting", p.actorRef, p.actorUID, p.templateNS, p.templateName)
@@ -241,6 +249,10 @@ type actorBootParams struct {
 	// egressGatewayAddress is empty unless an egress gateway is configured, in
 	// which case actor TCP egress is redirected to atunnel's local listener.
 	egressGatewayAddress string
+	// size is the actor's declared limits (from the ActorTemplate), supplied on
+	// the RunWorkload / RestoreWorkload RPC. It sizes the VM (vCPUs, memory) and
+	// the guest container cgroup. Zero fields keep the kata defaults.
+	size sizing.SandboxSize
 }
 
 // coldBootAttempts is how many times a cold boot is tried when the micro-VM
@@ -324,7 +336,7 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 
 	// Prepare each container's OCI spec + record its bundle rootfs (the overlay RO
 	// lower). No host disk — the rootfs is overlay(virtio-fs lower + guest-tmpfs upper).
-	ctrs, err := s.buildActorContainers(actorUID, containers)
+	ctrs, err := s.buildActorContainers(actorUID, containers, p.size)
 	if err != nil {
 		return err
 	}
@@ -333,6 +345,22 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 	memMiB, vcpus, kparams, err := s.guestConfig(rr)
 	if err != nil {
 		return err
+	}
+
+	// Right-size the VM to the actor's declared limits (see internal/sizing),
+	// keeping the kata-config values above as the fallback when a limit is unset.
+	// vCPUs round up; VM RAM reserves a fixed margin for the VMM + virtiofsd, which
+	// share the pod cgroup with the guest RAM. NB: a FULL-scope snapshot restore
+	// reuses the size baked into the snapshot (restoreFullScope), so resizing an
+	// existing actor takes effect on its next cold boot.
+	sz := p.size
+	if v := sz.VCPUs(); v > 0 {
+		vcpus = v
+	}
+	if sz.MemoryBytes > 0 {
+		if m := int(sz.MemoryBytes/(1024*1024)) - s.memReserveMiB; m > 0 {
+			memMiB = m
+		}
 	}
 
 	// Clean stale per-sandbox state + create the runtime dir for the sockets.
@@ -481,13 +509,13 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 // built — the rootfs is overlay(virtio-fs RO lower + guest-tmpfs upper); the lowers
 // are bound into virtiofsd's shared dir in stageOverlayLowers after the sandbox state
 // is clean. Both RunWorkload and RestoreWorkload go through here.
-func (s *AteomService) buildActorContainers(actorUID string, containers []*ateompb.Container) ([]actorContainer, error) {
+func (s *AteomService) buildActorContainers(actorUID string, containers []*ateompb.Container, size sizing.SandboxSize) ([]actorContainer, error) {
 	netnsPath := ateompath.AteomNetNSPath(s.podUID)
 	ctrs := make([]actorContainer, len(containers))
 	for i, c := range containers {
 		cn := c.GetName()
 		bundle := ateompath.OCIBundlePath(actorUID, cn)
-		spec, err := ensureKataCompatibleSpec(bundle, actorUID, netnsPath)
+		spec, err := ensureKataCompatibleSpec(bundle, actorUID, netnsPath, size)
 		if err != nil {
 			return nil, fmt.Errorf("while preparing kata OCI spec for %q: %w", cn, err)
 		}

@@ -213,6 +213,11 @@ type RunRequest struct {
 	// fetches the relevant assets and records them with the actor's on-node state
 	// so a later Checkpoint can pin the same version into the snapshot manifest.
 	SandboxAssets *SandboxAssets `protobuf:"bytes,8,opt,name=sandbox_assets,json=sandboxAssets,proto3" json:"sandbox_assets,omitempty"`
+	// The actor's declared size, from the ActorTemplate's resource limits. atelet
+	// passes these through to the sandbox so it is sized to the actor (not the
+	// whole host or worker pod). Zero means "unset": keep the runtime default.
+	CpuMilli      int64 `protobuf:"varint,9,opt,name=cpu_milli,json=cpuMilli,proto3" json:"cpu_milli,omitempty"`           // CPU limit in millicores (1000 = one core).
+	MemoryBytes   int64 `protobuf:"varint,10,opt,name=memory_bytes,json=memoryBytes,proto3" json:"memory_bytes,omitempty"` // Memory limit in bytes.
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -301,6 +306,20 @@ func (x *RunRequest) GetSandboxAssets() *SandboxAssets {
 		return x.SandboxAssets
 	}
 	return nil
+}
+
+func (x *RunRequest) GetCpuMilli() int64 {
+	if x != nil {
+		return x.CpuMilli
+	}
+	return 0
+}
+
+func (x *RunRequest) GetMemoryBytes() int64 {
+	if x != nil {
+		return x.MemoryBytes
+	}
+	return 0
 }
 
 // AssetFile is one content-addressed file atelet fetches for a sandbox runtime
@@ -1366,8 +1385,14 @@ type RestoreRequest struct {
 	// of the `config` oneof: the actor's snapshot may be local (a pause
 	// checkpoint) while the golden snapshot is always external.
 	GoldenSnapshotUriPrefix string `protobuf:"bytes,12,opt,name=golden_snapshot_uri_prefix,json=goldenSnapshotUriPrefix,proto3" json:"golden_snapshot_uri_prefix,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	// The actor's declared size, from the ActorTemplate's resource limits. For
+	// gVisor and micro-VM DATA-scope restores the sandbox is (re)sized to these;
+	// for a FULL micro-VM restore the size baked into the snapshot wins. Zero
+	// means "unset": keep the runtime default.
+	CpuMilli      int64 `protobuf:"varint,13,opt,name=cpu_milli,json=cpuMilli,proto3" json:"cpu_milli,omitempty"`          // CPU limit in millicores (1000 = one core).
+	MemoryBytes   int64 `protobuf:"varint,14,opt,name=memory_bytes,json=memoryBytes,proto3" json:"memory_bytes,omitempty"` // Memory limit in bytes.
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *RestoreRequest) Reset() {
@@ -1495,6 +1520,20 @@ func (x *RestoreRequest) GetGoldenSnapshotUriPrefix() string {
 	return ""
 }
 
+func (x *RestoreRequest) GetCpuMilli() int64 {
+	if x != nil {
+		return x.CpuMilli
+	}
+	return 0
+}
+
+func (x *RestoreRequest) GetMemoryBytes() int64 {
+	if x != nil {
+		return x.MemoryBytes
+	}
+	return 0
+}
+
 type isRestoreRequest_Config interface {
 	isRestoreRequest_Config()
 }
@@ -1551,7 +1590,7 @@ var File_atelet_proto protoreflect.FileDescriptor
 
 const file_atelet_proto_rawDesc = "" +
 	"\n" +
-	"\fatelet.proto\x12\x06atelet\"\xe0\x02\n" +
+	"\fatelet.proto\x12\x06atelet\"\xa0\x03\n" +
 	"\n" +
 	"RunRequest\x12(\n" +
 	"\x10target_ateom_uid\x18\x01 \x01(\tR\x0etargetAteomUid\x12\x1a\n" +
@@ -1562,7 +1601,10 @@ const file_atelet_proto_rawDesc = "" +
 	"\x18actor_template_namespace\x18\x05 \x01(\tR\x16actorTemplateNamespace\x12.\n" +
 	"\x13actor_template_name\x18\x06 \x01(\tR\x11actorTemplateName\x12(\n" +
 	"\x04spec\x18\a \x01(\v2\x14.atelet.WorkloadSpecR\x04spec\x12<\n" +
-	"\x0esandbox_assets\x18\b \x01(\v2\x15.atelet.SandboxAssetsR\rsandboxAssets\"5\n" +
+	"\x0esandbox_assets\x18\b \x01(\v2\x15.atelet.SandboxAssetsR\rsandboxAssets\x12\x1b\n" +
+	"\tcpu_milli\x18\t \x01(\x03R\bcpuMilli\x12!\n" +
+	"\fmemory_bytes\x18\n" +
+	" \x01(\x03R\vmemoryBytes\"5\n" +
 	"\tAssetFile\x12\x10\n" +
 	"\x03url\x18\x01 \x01(\tR\x03url\x12\x16\n" +
 	"\x06sha256\x18\x02 \x01(\tR\x06sha256\"\x8e\x01\n" +
@@ -1638,7 +1680,7 @@ const file_atelet_proto_rawDesc = "" +
 	" \x01(\v2'.atelet.ExternalCheckpointConfigurationH\x00R\x0eexternalConfig\x12+\n" +
 	"\x05scope\x18\v \x01(\x0e2\x15.atelet.SnapshotScopeR\x05scopeB\b\n" +
 	"\x06config\"\x14\n" +
-	"\x12CheckpointResponse\"\xe5\x04\n" +
+	"\x12CheckpointResponse\"\xa5\x05\n" +
 	"\x0eRestoreRequest\x12(\n" +
 	"\x10target_ateom_uid\x18\x01 \x01(\tR\x0etargetAteomUid\x12\x1a\n" +
 	"\batespace\x18\x02 \x01(\tR\batespace\x12\x1d\n" +
@@ -1653,7 +1695,9 @@ const file_atelet_proto_rawDesc = "" +
 	"\x0fexternal_config\x18\n" +
 	" \x01(\v2'.atelet.ExternalCheckpointConfigurationH\x00R\x0eexternalConfig\x12+\n" +
 	"\x05scope\x18\v \x01(\x0e2\x15.atelet.SnapshotScopeR\x05scope\x12;\n" +
-	"\x1agolden_snapshot_uri_prefix\x18\f \x01(\tR\x17goldenSnapshotUriPrefixB\b\n" +
+	"\x1agolden_snapshot_uri_prefix\x18\f \x01(\tR\x17goldenSnapshotUriPrefix\x12\x1b\n" +
+	"\tcpu_milli\x18\r \x01(\x03R\bcpuMilli\x12!\n" +
+	"\fmemory_bytes\x18\x0e \x01(\x03R\vmemoryBytesB\b\n" +
 	"\x06config\"\x11\n" +
 	"\x0fRestoreResponse*`\n" +
 	"\n" +
