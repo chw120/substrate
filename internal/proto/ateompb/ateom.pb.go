@@ -114,6 +114,12 @@ type RunWorkloadRequest struct {
 	RuntimeAssetPaths map[string]string `protobuf:"bytes,8,rep,name=runtime_asset_paths,json=runtimeAssetPaths,proto3" json:"runtime_asset_paths,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// When absent, actor traffic uses direct egress instead of atunnel.
 	EgressGateway *EgressGateway `protobuf:"bytes,10,opt,name=egress_gateway,json=egressGateway,proto3,oneof" json:"egress_gateway,omitempty"`
+	// The actor's declared size, from the ActorTemplate's resource limits. ateom
+	// sizes the sandbox to these (cgroup caps via the OCI spec, and for the
+	// micro-VM the VM's vCPU count and memory). Zero means "unset": keep the
+	// runtime default (unlimited for gVisor, the kata config for the micro-VM).
+	CpuMilli      int64 `protobuf:"varint,11,opt,name=cpu_milli,json=cpuMilli,proto3" json:"cpu_milli,omitempty"`          // CPU limit in millicores (1000 = one core).
+	MemoryBytes   int64 `protobuf:"varint,12,opt,name=memory_bytes,json=memoryBytes,proto3" json:"memory_bytes,omitempty"` // Memory limit in bytes.
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -209,6 +215,20 @@ func (x *RunWorkloadRequest) GetEgressGateway() *EgressGateway {
 		return x.EgressGateway
 	}
 	return nil
+}
+
+func (x *RunWorkloadRequest) GetCpuMilli() int64 {
+	if x != nil {
+		return x.CpuMilli
+	}
+	return 0
+}
+
+func (x *RunWorkloadRequest) GetMemoryBytes() int64 {
+	if x != nil {
+		return x.MemoryBytes
+	}
+	return 0
 }
 
 // EgressGateway configures tunneled egress for one actor activation.
@@ -764,8 +784,14 @@ type RestoreWorkloadRequest struct {
 	// Set only when scope is SNAPSHOT_SCOPE_DATA_ON_GOLDEN. Mirrors the
 	// snapshot_uri_prefix contract (field 8).
 	GoldenSnapshotUriPrefix string `protobuf:"bytes,13,opt,name=golden_snapshot_uri_prefix,json=goldenSnapshotUriPrefix,proto3" json:"golden_snapshot_uri_prefix,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	// The actor's declared size, from the ActorTemplate's resource limits. Used to
+	// (re)size the sandbox on a DATA-scope restore (fresh guest container). On a
+	// FULL micro-VM restore the size baked into the snapshot is authoritative and
+	// these are ignored. Zero means "unset": keep the runtime default.
+	CpuMilli      int64 `protobuf:"varint,14,opt,name=cpu_milli,json=cpuMilli,proto3" json:"cpu_milli,omitempty"`          // CPU limit in millicores (1000 = one core).
+	MemoryBytes   int64 `protobuf:"varint,15,opt,name=memory_bytes,json=memoryBytes,proto3" json:"memory_bytes,omitempty"` // Memory limit in bytes.
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *RestoreWorkloadRequest) Reset() {
@@ -882,6 +908,20 @@ func (x *RestoreWorkloadRequest) GetGoldenSnapshotUriPrefix() string {
 	return ""
 }
 
+func (x *RestoreWorkloadRequest) GetCpuMilli() int64 {
+	if x != nil {
+		return x.CpuMilli
+	}
+	return 0
+}
+
+func (x *RestoreWorkloadRequest) GetMemoryBytes() int64 {
+	if x != nil {
+		return x.MemoryBytes
+	}
+	return 0
+}
+
 type RestoreWorkloadResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -922,7 +962,7 @@ var File_ateom_proto protoreflect.FileDescriptor
 
 const file_ateom_proto_rawDesc = "" +
 	"\n" +
-	"\vateom.proto\x12\x05ateom\"\x9b\x04\n" +
+	"\vateom.proto\x12\x05ateom\"\xdb\x04\n" +
 	"\x12RunWorkloadRequest\x12\x1a\n" +
 	"\batespace\x18\x01 \x01(\tR\batespace\x12\x1d\n" +
 	"\n" +
@@ -935,7 +975,9 @@ const file_ateom_proto_rawDesc = "" +
 	"\x04spec\x18\a \x01(\v2\x13.ateom.WorkloadSpecR\x04spec\x12`\n" +
 	"\x13runtime_asset_paths\x18\b \x03(\v20.ateom.RunWorkloadRequest.RuntimeAssetPathsEntryR\x11runtimeAssetPaths\x12@\n" +
 	"\x0eegress_gateway\x18\n" +
-	" \x01(\v2\x14.ateom.EgressGatewayH\x00R\regressGateway\x88\x01\x01\x1aD\n" +
+	" \x01(\v2\x14.ateom.EgressGatewayH\x00R\regressGateway\x88\x01\x01\x12\x1b\n" +
+	"\tcpu_milli\x18\v \x01(\x03R\bcpuMilli\x12!\n" +
+	"\fmemory_bytes\x18\f \x01(\x03R\vmemoryBytes\x1aD\n" +
 	"\x16RuntimeAssetPathsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\x11\n" +
@@ -980,7 +1022,7 @@ const file_ateom_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"C\n" +
 	"\x1aCheckpointWorkloadResponse\x12%\n" +
-	"\x0esnapshot_files\x18\x01 \x03(\tR\rsnapshotFiles\"\xbc\x05\n" +
+	"\x0esnapshot_files\x18\x01 \x03(\tR\rsnapshotFiles\"\xfc\x05\n" +
 	"\x16RestoreWorkloadRequest\x12\x1a\n" +
 	"\batespace\x18\x01 \x01(\tR\batespace\x12\x1d\n" +
 	"\n" +
@@ -996,7 +1038,9 @@ const file_ateom_proto_rawDesc = "" +
 	"\x05scope\x18\n" +
 	" \x01(\x0e2\x14.ateom.SnapshotScopeR\x05scope\x12@\n" +
 	"\x0eegress_gateway\x18\f \x01(\v2\x14.ateom.EgressGatewayH\x00R\regressGateway\x88\x01\x01\x12;\n" +
-	"\x1agolden_snapshot_uri_prefix\x18\r \x01(\tR\x17goldenSnapshotUriPrefix\x1aD\n" +
+	"\x1agolden_snapshot_uri_prefix\x18\r \x01(\tR\x17goldenSnapshotUriPrefix\x12\x1b\n" +
+	"\tcpu_milli\x18\x0e \x01(\x03R\bcpuMilli\x12!\n" +
+	"\fmemory_bytes\x18\x0f \x01(\x03R\vmemoryBytes\x1aD\n" +
 	"\x16RuntimeAssetPathsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\x11\n" +

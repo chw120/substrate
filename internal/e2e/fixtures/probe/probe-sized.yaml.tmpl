@@ -12,55 +12,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Sized variant of the probe fixture: the ActorTemplate declares
+# spec.resources.limits, so the sizing e2e suite can assert the actor's
+# sandbox is shaped to those limits. Reuses the probe image (it serves the
+# /resources endpoint). Kept in its own namespace so it never collides with
+# the plain probe fixture.
+
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: ate-demo-sandbox
+  name: ate-e2e-sizing
+
 ---
+
 apiVersion: ate.dev/v1alpha1
 kind: WorkerPool
 metadata:
-  name: sandbox-workerpool
-  namespace: ate-demo-sandbox
+  name: probe-sized
+  namespace: ate-e2e-sizing
   labels:
-    workload: sandbox
+    workload: probe-sized
 spec:
-  replicas: 2
+  replicas: 3
   ateomImage: ko://github.com/agent-substrate/substrate/cmd/ateom-gvisor
-  template:
-    # Per-worker resources: these size the worker POD and advertise its
-    # scheduling capacity (the per-actor ceiling). The sandbox itself is sized by
-    # the ActorTemplate's spec.resources below, not by these (see internal/sizing).
-    resources:
-      requests:
-        cpu: "500m"
-        memory: 512Mi
-      limits:
-        cpu: "2"
-        memory: 2Gi
+
 ---
+
 apiVersion: ate.dev/v1alpha1
 kind: ActorTemplate
 metadata:
-  name: sandbox-template
-  namespace: ate-demo-sandbox
+  name: probe-sized
+  namespace: ate-e2e-sizing
 spec:
-  workerSelector:
-    matchLabels:
-      workload: sandbox
   pauseImage: "registry.k8s.io/pause:3.10.2@sha256:f548e0e8e3dc1896ca956272154dde3314e8cc4fde0a57577ee9fa1c63f5baf4"
   containers:
-  - name: sandbox
-    image: ko://github.com/agent-substrate/substrate/demos/sandbox
-    env:
-    - name: PORT
-      value: "80"
-  # Sandbox size: an actor occupies its whole worker, so size it at (or below)
-  # the pool's per-worker capacity above. ateom writes these to the OCI spec
-  # (cgroup CPU quota + memory limit) — see internal/sizing.
+  - name: probe
+    image: ko://github.com/agent-substrate/substrate/internal/e2e/fixtures/probe
+    command: ["/ko-app/probe"]
+  # The feature under test: these limits size the sandbox (and, when the worker
+  # advertises capacity, gate scheduling). CPU=2 makes NumCPU() inside the
+  # gVisor sandbox a distinct, assertable value.
   resources:
     limits:
       cpu: "2"
-      memory: 1Gi
+      memory: 512Mi
+  workerSelector:
+    matchLabels:
+      workload: probe-sized
   snapshotsConfig:
-    location: gs://${BUCKET_NAME}/ate-demo-sandbox/
+    location: gs://${BUCKET_NAME}/ate-e2e-sizing/
