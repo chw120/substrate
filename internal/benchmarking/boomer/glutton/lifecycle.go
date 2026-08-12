@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"math/rand/v2"
 	"net/http"
 	"runtime"
@@ -54,6 +55,11 @@ const (
 	templateNS   = "benchmark-workloads"
 	actorDomain  = "actors.resources.substrate.ate.dev"
 	pingPath     = "/ping"
+	writeRAMPath = "/writeram"
+
+	// ramKey is the single array every WriteRAM call targets, so repeated
+	// writes replace one allocation instead of accumulating new ones.
+	ramKey = "benchmark"
 
 	sourceClient = "client"
 	sourceServer = "server"
@@ -116,6 +122,12 @@ func (r *taskRuntime) iterate() {
 	ctx := context.Background()
 	if !user.resume(ctx) {
 		return
+	}
+	// Load the guest before pinging it, so the ping latency is measured
+	// against a workload that is actually holding memory and the suspend
+	// snapshot that follows carries that memory too.
+	if ramBytes := r.cfg.Dyn.Load().GluttonRAMBytes; ramBytes > 0 {
+		user.writeRAM(ctx, ramBytes)
 	}
 	user.ping(ctx)
 	user.suspend(ctx)
@@ -281,19 +293,54 @@ func (u *gluttonUser) tracedCall(ctx context.Context, name string, do func(conte
 }
 
 func (u *gluttonUser) ping(ctx context.Context) {
-	ctx, span := u.cfg.Tracer.Start(ctx, "GluttonPing")
+	message := uuid.NewString()
+	pong := &gluttonpb.PingResponse{}
+	u.postProto(ctx, pingPath, "GluttonPing", &gluttonpb.PingRequest{Message: message}, pong, func() error {
+		if pong.Message != message {
+			return fmt.Errorf("ping echo mismatch: sent=%q recv=%q", message, pong.Message)
+		}
+		return nil
+	})
+}
+
+// writeRAM asks the glutton to hold `size` bytes resident. A fixed key plus
+// TRUNCATE makes this a water level rather than a climb: each iteration
+// replaces the previous allocation, so the guest sits at ~size for as long as
+// the actor lives, and the suspend snapshot taken right after carries it.
+func (u *gluttonUser) writeRAM(ctx context.Context, size int64) {
+	// WriteRAMRequest.size is an int32; a flag value past that is an operator
+	// error, and recording it as a failure surfaces it in the locust stats
+	// table immediately rather than silently clamping the water level.
+	if size > math.MaxInt32 {
+		bmetrics.RecordFailure("http", "GluttonWriteRAM", userClass, 0,
+			fmt.Sprintf("ram bytes %d exceeds the int32 WriteRAM limit of %d", size, math.MaxInt32))
+		return
+	}
+	u.postProto(ctx, writeRAMPath, "GluttonWriteRAM", &gluttonpb.WriteRAMRequest{
+		Key:       ramKey,
+		Size:      int32(size),
+		WriteMode: gluttonpb.WriteMode_WRITE_MODE_TRUNCATE,
+	}, &gluttonpb.WriteRAMResponse{}, nil)
+}
+
+// postProto POSTs proto.Marshal(req) to `path` on this user's actor through
+// the atenet router, unmarshals the reply into resp, and reports the call to
+// boomer under `name`. verify, when non-nil, runs on a well-formed reply and
+// turns a semantically wrong response into a recorded failure — the wire
+// succeeded but the workload did not do what was asked.
+func (u *gluttonUser) postProto(ctx context.Context, path, name string, req, resp proto.Message, verify func() error) {
+	ctx, span := u.cfg.Tracer.Start(ctx, name)
 	defer span.End()
 
-	message := uuid.NewString()
-	body, err := proto.Marshal(&gluttonpb.PingRequest{Message: message})
+	body, err := proto.Marshal(req)
 	if err != nil {
-		bmetrics.RecordFailure("http", "GluttonPing", userClass, 0, err.Error())
+		bmetrics.RecordFailure("http", name, userClass, 0, err.Error())
 		return
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, u.cfg.RouterURL+pingPath, bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, u.cfg.RouterURL+path, bytes.NewReader(body))
 	if err != nil {
-		bmetrics.RecordFailure("http", "GluttonPing", userClass, 0, err.Error())
+		bmetrics.RecordFailure("http", name, userClass, 0, err.Error())
 		return
 	}
 	httpReq.Host = u.hostHeader
@@ -301,41 +348,41 @@ func (u *gluttonUser) ping(ctx context.Context) {
 	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(httpReq.Header))
 
 	start := time.Now()
-	resp, err := u.cfg.HTTPClient.Do(httpReq)
+	httpResp, err := u.cfg.HTTPClient.Do(httpReq)
 	clientLatency := time.Since(start)
 	if err != nil {
-		bmetrics.RecordFailure("http", "GluttonPing", userClass, clientLatency, err.Error())
+		bmetrics.RecordFailure("http", name, userClass, clientLatency, err.Error())
 		return
 	}
-	defer resp.Body.Close()
+	defer httpResp.Body.Close()
 
-	respBody, readErr := io.ReadAll(resp.Body)
+	respBody, readErr := io.ReadAll(httpResp.Body)
 	if readErr != nil {
-		bmetrics.RecordFailure("http", "GluttonPing", userClass, clientLatency, readErr.Error())
+		bmetrics.RecordFailure("http", name, userClass, clientLatency, readErr.Error())
 		return
 	}
 
-	if resp.StatusCode >= 400 {
-		httpErr := fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
-		logSampledTrace(span, "GluttonPing", clientLatency, sourceClient, httpErr)
-		bmetrics.RecordFailure("http", "GluttonPing", userClass, clientLatency, httpErr.Error())
-		return
+	fail := func(err error) {
+		logSampledTrace(span, name, clientLatency, sourceClient, err)
+		bmetrics.RecordFailure("http", name, userClass, clientLatency, err.Error())
 	}
 
-	pong := &gluttonpb.PingResponse{}
-	if err := proto.Unmarshal(respBody, pong); err != nil {
-		logSampledTrace(span, "GluttonPing", clientLatency, sourceClient, err)
-		bmetrics.RecordFailure("http", "GluttonPing", userClass, clientLatency, err.Error())
+	if httpResp.StatusCode >= 400 {
+		fail(fmt.Errorf("HTTP %d: %s", httpResp.StatusCode, strings.TrimSpace(string(respBody))))
 		return
 	}
-	if pong.Message != message {
-		mismatch := fmt.Errorf("ping echo mismatch: sent=%q recv=%q", message, pong.Message)
-		logSampledTrace(span, "GluttonPing", clientLatency, sourceClient, mismatch)
-		bmetrics.RecordFailure("http", "GluttonPing", userClass, clientLatency, mismatch.Error())
+	if err := proto.Unmarshal(respBody, resp); err != nil {
+		fail(err)
 		return
 	}
-	logSampledTrace(span, "GluttonPing", clientLatency, sourceClient, nil)
-	bmetrics.RecordSuccess("http", "GluttonPing", userClass, clientLatency, int64(len(respBody)))
+	if verify != nil {
+		if err := verify(); err != nil {
+			fail(err)
+			return
+		}
+	}
+	logSampledTrace(span, name, clientLatency, sourceClient, nil)
+	bmetrics.RecordSuccess("http", name, userClass, clientLatency, int64(len(respBody)))
 }
 
 // logSampledTrace emits a single structured line per sampled span. Operators

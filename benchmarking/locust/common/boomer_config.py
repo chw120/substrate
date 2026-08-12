@@ -17,6 +17,7 @@
 Flag registration lives in the modules that own each flag:
   * --trace-probability             → common.trace.init_tracing
   * --min-wait-time / --max-wait-time → common.wait_time.init_wait_time
+  * --glutton-ram-bytes             → common.glutton_ram.init_glutton_ram
 
 This module ties them together so boomer-Go workers can pick up the values
 the operator set in the web UI form:
@@ -37,6 +38,7 @@ from collections.abc import Iterable
 from locust import events
 from locust.env import Environment
 
+from common.glutton_ram import init_glutton_ram
 from common.trace import init_tracing
 from common.wait_time import init_wait_time
 
@@ -44,7 +46,12 @@ logger = logging.getLogger(__name__)
 
 # Boomer-tunable flags. CLI form ("--foo-bar") is converted to the
 # attribute / JSON-key form ("foo_bar") by _attr().
-_FLAGS = ("--trace-probability", "--min-wait-time", "--max-wait-time")
+_FLAGS = (
+    "--trace-probability",
+    "--min-wait-time",
+    "--max-wait-time",
+    "--glutton-ram-bytes",
+)
 
 
 def _attr(flag: str) -> str:
@@ -73,6 +80,7 @@ def init_boomer_config() -> None:
     can fetch them at runtime."""
     init_tracing()
     init_wait_time()
+    init_glutton_ram()
 
     @events.init.add_listener
     def on_init(environment: Environment, **kwargs) -> None:

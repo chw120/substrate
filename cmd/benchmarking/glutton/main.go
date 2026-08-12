@@ -137,11 +137,13 @@ func main() {
 		reflection.Register(srv)
 		handler = splitGRPC(srv, mux)
 	case "http":
-		// HTTP/1.1 mode: a single /ping route that consumes
-		// proto.Marshal(PingRequest) and returns proto.Marshal(PingResponse).
-		// Only Ping is exposed in HTTP mode; the other RPCs remain gRPC-only
-		// (re-exposable as additional routes if/when needed).
-		mux.HandleFunc("/ping", httpPingHandler(svc))
+		// HTTP/1.1 mode: one route per RPC the load generator drives, each
+		// consuming proto.Marshal(Request) and returning proto.Marshal(Response).
+		// WriteRAM is here because it is how a benchmark puts a memory water
+		// level inside the sandbox; the remaining RPCs stay gRPC-only until
+		// something needs them (adding one is a single line).
+		mux.HandleFunc("/ping", httpProtoHandler[glutton.PingRequest]("Ping", svc.Ping))
+		mux.HandleFunc("/writeram", httpProtoHandler[glutton.WriteRAMRequest]("WriteRAM", svc.WriteRAM))
 		// otelhttp at the mux level + per-handler span follows
 		// docs/dev/best-practices/tracing.md: extract incoming context,
 		// then name the span after the operation in each handler.
@@ -176,10 +178,19 @@ func splitGRPC(grpcSrv, rest http.Handler) http.Handler {
 	})
 }
 
-// httpPingHandler accepts a POST whose body is proto.Marshal(PingRequest) and
-// returns proto.Marshal(PingResponse) (same Ping handler the gRPC server
-// uses, so the per-call stats stay comparable across protocols).
-func httpPingHandler(svc *gluttonService) http.HandlerFunc {
+// httpProtoHandler adapts a unary gRPC method to an HTTP/1.1 POST route whose
+// request and response bodies are proto.Marshal of that RPC's messages — the
+// same service methods the gRPC server registers, so per-call behavior stays
+// comparable across protocols.
+//
+// ReqT is the request struct, Req its pointer type (what the generated method
+// takes); the constraint is what lets the handler allocate a fresh request per
+// call. Callers write httpProtoHandler[glutton.PingRequest]("Ping", svc.Ping)
+// and inference fills in the rest.
+func httpProtoHandler[ReqT any, Req interface {
+	*ReqT
+	proto.Message
+}, Resp proto.Message](name string, call func(context.Context, Req) (Resp, error)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -190,16 +201,16 @@ func httpPingHandler(svc *gluttonService) http.HandlerFunc {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		var req glutton.PingRequest
-		if err := proto.Unmarshal(body, &req); err != nil {
+		req := Req(new(ReqT))
+		if err := proto.Unmarshal(body, req); err != nil {
 			http.Error(w, "unmarshal: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-		ctx, span := otel.Tracer("glutton").Start(r.Context(), "Ping")
+		ctx, span := otel.Tracer("glutton").Start(r.Context(), name)
 		defer span.End()
-		resp, err := svc.Ping(ctx, &req)
+		resp, err := call(ctx, req)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			http.Error(w, err.Error(), httpStatusFor(err))
 			return
 		}
 		out, err := proto.Marshal(resp)
@@ -210,6 +221,17 @@ func httpPingHandler(svc *gluttonService) http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/x-protobuf")
 		_, _ = w.Write(out)
 	}
+}
+
+// httpStatusFor maps the gRPC codes the service returns onto HTTP status. Only
+// InvalidArgument is the caller's fault; everything else is the server's, and
+// has to surface as 5xx so a misbehaving glutton shows up as a boomer failure
+// rather than as a well-formed rejection.
+func httpStatusFor(err error) int {
+	if status.Code(err) == codes.InvalidArgument {
+		return http.StatusBadRequest
+	}
+	return http.StatusInternalServerError
 }
 
 // diskKeyRE rejects anything that could escape the data dir or hit a

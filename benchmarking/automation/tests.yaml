@@ -83,3 +83,68 @@ tests:
       - "0.5"
       - "--max-wait-time"
       - "1.0"
+
+  # microVM runs. Each mirrors a gvisor test above with the same users /
+  # workerCount / wait times, so the pair is directly comparable and the only
+  # variable is the sandbox runtime. Read the per-sandbox memory cost with
+  # `kubectl ate top workers` while a run is in flight.
+  - name: glutton_microvm_baseline_1_user
+    description: "Glutton on microVM: 1 concurrent user for 1 minute (pairs with glutton_baseline_1_user)"
+    targetCluster: dev
+    file: /app/tests/glutton.py
+    duration: 1m
+    users: 1
+    workerCount: 1
+    sandboxClass: microvm
+    flags:
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
+  - name: glutton_microvm_baseline_5_users
+    description: "Glutton on microVM: 5 concurrent users for 1 minute (pairs with glutton_baseline_5_users)"
+    targetCluster: dev
+    file: /app/tests/glutton.py
+    duration: 1m
+    users: 5
+    workerCount: 5
+    sandboxClass: microvm
+    flags:
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
+
+  # Memory-pressure pair. --glutton-ram-bytes makes each actor hold 256MiB
+  # resident, rewritten every iteration, so the suspend snapshot carries it
+  # too. Run both to get the gvisor-vs-microVM delta under a known guest
+  # working set rather than at idle.
+  - name: glutton_mem_256mib_5_users
+    description: "Glutton on gvisor: 5 users holding 256MiB each for 2 minutes"
+    targetCluster: dev
+    file: /app/tests/glutton.py
+    duration: 2m
+    users: 5
+    workerCount: 5
+    flags:
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
+      - "--glutton-ram-bytes"
+      - "268435456"
+  - name: glutton_microvm_mem_256mib_5_users
+    description: "Glutton on microVM: 5 users holding 256MiB each for 2 minutes (pairs with glutton_mem_256mib_5_users)"
+    targetCluster: dev
+    file: /app/tests/glutton.py
+    duration: 2m
+    users: 5
+    workerCount: 5
+    sandboxClass: microvm
+    flags:
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
+      - "--glutton-ram-bytes"
+      - "268435456"

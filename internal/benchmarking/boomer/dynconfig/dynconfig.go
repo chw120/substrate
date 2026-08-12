@@ -37,6 +37,11 @@ type Config struct {
 	MinWait          time.Duration
 	MaxWait          time.Duration
 	TraceProbability float64
+	// GluttonRAMBytes is the resident-memory water level each VU asks its
+	// glutton to hold, in bytes. Zero (the default) skips the write, which is
+	// what every test that does not set the flag gets: the actor stays idle
+	// between resume and suspend, as it did before the knob existed.
+	GluttonRAMBytes int64
 }
 
 // Holder lets readers Load() the current Config and writers Store() a new
@@ -70,6 +75,10 @@ type payload struct {
 	TraceProbability *float64 `json:"trace_probability"`
 	MinWaitTime      *float64 `json:"min_wait_time"`
 	MaxWaitTime      *float64 `json:"max_wait_time"`
+	// GluttonRAMBytes is a float64 like every other field here because the
+	// locust side declares all of its flags as type=float; the value is a byte
+	// count, so we round to int64 on merge.
+	GluttonRAMBytes *float64 `json:"glutton_ram_bytes"`
 }
 
 // Parse decodes a JSON blob (typically from a CLI flag) and merges its
@@ -122,6 +131,9 @@ func (p payload) merge(current Config) Config {
 	if p.MaxWaitTime != nil {
 		out.MaxWait = time.Duration(*p.MaxWaitTime * float64(time.Second))
 	}
+	if p.GluttonRAMBytes != nil {
+		out.GluttonRAMBytes = int64(*p.GluttonRAMBytes)
+	}
 	return out
 }
 
@@ -148,6 +160,7 @@ func SubscribeSpawn(url string, holder *Holder, sampler ProbabilityUpdater, fetc
 			slog.Float64("trace_probability", next.TraceProbability),
 			slog.Duration("min_wait", next.MinWait),
 			slog.Duration("max_wait", next.MaxWait),
+			slog.Int64("glutton_ram_bytes", next.GluttonRAMBytes),
 		)
 	})
 }

@@ -28,8 +28,9 @@ if os.environ.get("LOCUST_NO_GLUTTON_USER") != "1":
     from common.boomer_config import init_boomer_config
 
     # Master serves /boomer-config so the boomer-glutton workers can fetch
-    # runtime flag values (trace probability, wait times) the operator set
-    # in the web UI form. No-op on workers without a web UI.
+    # runtime flag values (trace probability, wait times, guest RAM water
+    # level) the operator set in the web UI form. No-op on workers without a
+    # web UI.
     init_boomer_config()
 
     class GluttonUser(User):

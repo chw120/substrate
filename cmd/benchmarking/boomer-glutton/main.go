@@ -40,7 +40,7 @@ func main() {
 		routerURL     = flag.String("router-url", "http://atenet-router.ate-system.svc.cluster.local", "atenet HTTP router base URL (no trailing slash).")
 		atespace      = flag.String("atespace", "benchmark", "Atespace every actor this worker creates lives in. Ensured (CreateAtespace, AlreadyExists is ok) at startup.")
 		promAddr      = flag.String("prometheus-addr", ":8001", "Address for the Prometheus /metrics endpoint.")
-		configJSON    = flag.String("config-json", "", "Initial dynconfig as a JSON object (keys: trace_probability, min_wait_time, max_wait_time in seconds). Unset fields keep their built-in defaults.")
+		configJSON    = flag.String("config-json", "", "Initial dynconfig as a JSON object (keys: trace_probability, min_wait_time and max_wait_time in seconds, glutton_ram_bytes). Unset fields keep their built-in defaults.")
 		masterWebPort = flag.Int("master-web-port", 0, "If non-zero, fetch dynconfig from http://{master-host}:{master-web-port}/boomer-config on each spawn message and fail fatally on error. {master-host} comes from boomer's existing --master-host flag.")
 		useTokenAuth  = flag.Bool("use-token-auth", false, "Use Kubernetes ServiceAccount token for ateapi auth instead of client certificate.")
 	)
