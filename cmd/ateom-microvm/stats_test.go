@@ -123,6 +123,14 @@ type fakeAgent struct {
 	stats map[string]*agentpb.CgroupStats
 	errs  map[string]error
 
+	// scrape and scrapeErr are the canned GetMetrics reply, and onStats is a
+	// hook run at the top of every StatsContainer. All three are for the guest
+	// memory breakdown's tests; the GetWorkloadStats tests below leave them
+	// unset.
+	scrape    string
+	scrapeErr error
+	onStats   func()
+
 	// calls records the container ids asked for, in order, so a test can tell
 	// "summed two containers" from "read one twice".
 	calls []string
@@ -132,6 +140,9 @@ type fakeAgent struct {
 }
 
 func (f *fakeAgent) StatsContainer(ctx context.Context, containerID string) (*agentpb.CgroupStats, error) {
+	if f.onStats != nil {
+		f.onStats()
+	}
 	f.calls = append(f.calls, containerID)
 	_, ok := ctx.Deadline()
 	f.deadlines = append(f.deadlines, ok)
@@ -139,6 +150,13 @@ func (f *fakeAgent) StatsContainer(ctx context.Context, containerID string) (*ag
 		return nil, err
 	}
 	return f.stats[containerID], nil
+}
+
+func (f *fakeAgent) GetMetrics(ctx context.Context) (string, error) {
+	if f.scrapeErr != nil {
+		return "", f.scrapeErr
+	}
+	return f.scrape, nil
 }
 
 // containerStats is one container's guest reading: usage bytes, peak bytes,
@@ -155,7 +173,7 @@ func containerStats(usage, peak, inactiveFile, cpuNanos uint64) *agentpb.CgroupS
 
 // newStatsService builds a service executing testActor with the given guest
 // containers published to GetWorkloadStats.
-func newStatsService(agent containerStatsReader, workloadIDs ...string) *AteomService {
+func newStatsService(agent guestStatsReader, workloadIDs ...string) *AteomService {
 	s := &AteomService{}
 	s.activeActor.Store(&testActor)
 	s.guestStats.Store(&guestStatsTarget{actorUID: testActor.UID, agent: agent, workloadIDs: workloadIDs})

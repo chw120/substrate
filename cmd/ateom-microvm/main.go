@@ -214,7 +214,14 @@ func do(ctx context.Context) error {
 		grpc.StatsHandler(otelgrpc.NewServerHandler()),
 		grpc.UnaryInterceptor(ateinterceptors.InternalServerUnaryInterceptor),
 	)
-	ateompb.RegisterAteomServer(svr, NewService(*podUID, *chBinary, *kataConfig, *kataDebug, interiorNetNS, actorLogger, atunnelIngress, atunnelEgress, atunnelEgressPort, *workerCredentialBundle, *podIdentityTrustBundle, *egressGatewayTrustBundle))
+	svc := NewService(*podUID, *chBinary, *kataConfig, *kataDebug, interiorNetNS, actorLogger, atunnelIngress, atunnelEgress, atunnelEgressPort, *workerCredentialBundle, *podIdentityTrustBundle, *egressGatewayTrustBundle)
+	if err := svc.registerGuestMemoryMetrics(mp); err != nil {
+		// Not fatal: the breakdown is observability, and an ateom that cannot
+		// publish it can still run actors. Failing the boot over it would trade
+		// a blind spot for an outage.
+		slog.ErrorContext(ctx, "Failed to register the guest memory breakdown; the micro-VM's internal memory split will not be reported", slog.Any("error", err))
+	}
+	ateompb.RegisterAteomServer(svr, svc)
 	reflection.Register(svr)
 
 	slog.InfoContext(ctx, "ateom-microvm serving", slog.String("socket", sockPath))
