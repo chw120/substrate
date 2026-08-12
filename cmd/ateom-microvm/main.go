@@ -259,6 +259,12 @@ func do(ctx context.Context) error {
 		grpc.StatsHandler(otelgrpc.NewServerHandler()),
 		grpc.UnaryInterceptor(ateinterceptors.InternalServerUnaryInterceptor),
 	)
+	if err := ateomService.registerGuestMemoryMetrics(mp); err != nil {
+		// Not fatal: the breakdown is observability, and an ateom that cannot
+		// publish it can still run actors. Failing the boot over it would trade
+		// a blind spot for an outage.
+		slog.ErrorContext(ctx, "Failed to register the guest memory breakdown; the micro-VM's internal memory split will not be reported", slog.Any("error", err))
+	}
 	ateompb.RegisterAteomServer(svr, ateomService)
 	reflection.Register(svr)
 
