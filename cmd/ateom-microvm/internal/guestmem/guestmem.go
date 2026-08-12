@@ -34,6 +34,7 @@ package guestmem
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -172,7 +173,13 @@ func Parse(scrape string) (Guest, error) {
 
 	total, ok := s.meminfo("MemTotal")
 	if !ok {
-		return Guest{}, fmt.Errorf("no %s MemTotal entry in the agent scrape (%d metrics parsed)", meminfoFamily, len(s))
+		// Name what the agent DID publish, not just what was wanted. This error
+		// has one likely cause — a kata-agent whose metric naming has moved —
+		// and the fix is to teach this package the new name, so the error is
+		// only useful if it carries the new name. Without that a reader is left
+		// to reproduce a guest and dump the scrape by hand.
+		return Guest{}, fmt.Errorf("no %s MemTotal entry in the agent scrape (%d metrics parsed); the families it did publish are: %s",
+			meminfoFamily, len(s), strings.Join(familyNames(scrape), ", "))
 	}
 	if total == 0 {
 		return Guest{}, errors.New("the agent scrape reports a guest with zero MemTotal")
@@ -285,6 +292,50 @@ func parseScrape(text string) scrape {
 		out[key] = uint64(f)
 	}
 	return out
+}
+
+// maxReportedFamilies caps how many names an unparseable scrape names back. A
+// kata-agent publishes on the order of a dozen families and this only runs on
+// the error path, but the scrape is remote input and the result goes in a log
+// line, so it is bounded rather than trusted to be small.
+const maxReportedFamilies = 24
+
+// familyNames lists the distinct metric families a scrape carries, in the
+// spelling the agent used rather than the normalized one, for the error above.
+//
+// A second walk of the text rather than something the parse kept: the parse
+// runs on every collection and this runs when one has already failed, so the
+// cost is in the right place and the hot path stays a plain map.
+func familyNames(text string) []string {
+	seen := make(map[string]struct{})
+	var names []string
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		name := line
+		if i := strings.IndexAny(line, "{ \t"); i >= 0 {
+			name = line[:i]
+		}
+		if name == "" {
+			continue
+		}
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+		if len(names) == maxReportedFamilies {
+			names = append(names, "...")
+			break
+		}
+	}
+	if len(names) == 0 {
+		return []string{"(none: the scrape held no metric lines at all)"}
+	}
+	sort.Strings(names)
+	return names
 }
 
 // metricKey turns a sample's name-and-labels into the map key, or reports that
