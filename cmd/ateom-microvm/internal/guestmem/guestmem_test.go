@@ -15,6 +15,7 @@
 package guestmem
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -144,6 +145,48 @@ func TestParseNeedsMemTotal(t *testing.T) {
 				t.Error("Parse must fail without a usable MemTotal rather than report a zero-sized guest")
 			}
 		})
+	}
+}
+
+// The failure this error reports has one likely cause — the agent's metric
+// naming moved — and the fix is to teach the package the new name. So the error
+// has to carry the new name, or the reader has to go reproduce a guest and dump
+// the scrape by hand to learn it.
+func TestParseErrorNamesWhatTheAgentDidPublish(t *testing.T) {
+	_, err := Parse(`# HELP some_other_meminfo x
+some_other_meminfo{item="mem_total"} 2013204
+kata_guest_vmstat{item="pgfault"} 17
+some_other_meminfo{item="mem_free"} 1310720
+`)
+	if err == nil {
+		t.Fatal("Parse must fail when it cannot find MemTotal")
+	}
+	for _, want := range []string{"some_other_meminfo", "kata_guest_vmstat"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error does not name the family %q, so it does not say how to fix itself: %v", want, err)
+		}
+	}
+	// Named once, not once per sample.
+	if n := strings.Count(err.Error(), "some_other_meminfo"); n != 1 {
+		t.Errorf("family named %d times, want 1: %v", n, err)
+	}
+}
+
+// The scrape is remote input and this text goes into a log line.
+func TestParseErrorBoundsTheFamilyList(t *testing.T) {
+	var b strings.Builder
+	for i := range maxReportedFamilies * 3 {
+		fmt.Fprintf(&b, "family_%03d 1\n", i)
+	}
+	_, err := Parse(b.String())
+	if err == nil {
+		t.Fatal("Parse must fail when it cannot find MemTotal")
+	}
+	if n := strings.Count(err.Error(), "family_"); n > maxReportedFamilies {
+		t.Errorf("error names %d families, want at most %d", n, maxReportedFamilies)
+	}
+	if !strings.Contains(err.Error(), "...") {
+		t.Error("a truncated list must say it was truncated")
 	}
 }
 
