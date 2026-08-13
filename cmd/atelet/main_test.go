@@ -1064,9 +1064,11 @@ func TestDrainOnShutdownForceStopsAfterTimeout(t *testing.T) {
 	}
 }
 
-// allocatedBytes reports how much disk a file actually occupies, which is less than its
-// size when it has holes.
-func allocatedBytes(t *testing.T, path string) int64 {
+// diskUsage reports how much disk a file actually occupies, which is less than its
+// size when it has holes. It stats by path rather than reusing the production
+// allocatedBytes so a bug there cannot quietly make these hole-preservation
+// checks pass.
+func diskUsage(t *testing.T, path string) int64 {
 	t.Helper()
 	var st syscall.Stat_t
 	if err := syscall.Stat(path, &st); err != nil {
@@ -1137,7 +1139,7 @@ func TestCopyFilePreservesHoles(t *testing.T) {
 		t.Fatal("copy differs from source")
 	}
 
-	srcAlloc, dstAlloc := allocatedBytes(t, src), allocatedBytes(t, dst)
+	srcAlloc, dstAlloc := diskUsage(t, src), diskUsage(t, dst)
 	if srcAlloc >= size/2 {
 		t.Skipf("source did not end up sparse (%d of %d bytes allocated); "+
 			"this filesystem cannot report holes", srcAlloc, int64(size))
@@ -1223,7 +1225,7 @@ func TestCopyFilePreservesHolesUserspace(t *testing.T) {
 		t.Fatal("userspace copy differs from source")
 	}
 
-	srcAlloc, dstAlloc := allocatedBytes(t, src), allocatedBytes(t, dst)
+	srcAlloc, dstAlloc := diskUsage(t, src), diskUsage(t, dst)
 	if srcAlloc >= size/2 {
 		t.Skipf("source did not end up sparse (%d of %d bytes allocated)", srcAlloc, int64(size))
 	}
