@@ -52,15 +52,21 @@ import (
 // Names of the two metric families this package reads out of the agent's
 // scrape. Everything else in it (vmstat, loadavg, per-CPU /proc/stat, diskstat,
 // netdev) is ignored.
+// Both verified against kata-agent 4.0.0 (src/agent/src/metrics.rs), which is
+// the kata-static release hack/microvm-assets/assemble.sh pins. The agent hand
+// rolls its registry rather than using the Prometheus process collector, so
+// neither name follows the collector's conventions and neither can be guessed.
 const (
 	// meminfoFamily is the guest kernel's /proc/meminfo, which the agent
-	// republishes as a gauge per entry.
+	// republishes as one gauge labelled by entry: kata_guest_meminfo{item=...}.
 	meminfoFamily = "kata_guest_meminfo"
 
-	// agentRSSMetric is the agent process's own resident set, from the standard
-	// Prometheus process collector. Unambiguously bytes: the _bytes suffix is
-	// the convention the collector follows, unlike the meminfo entries above.
-	agentRSSMetric = "kata_agent_process_resident_memory_bytes"
+	// agentRSSMetric is the agent process's own resident set. Bytes: the agent
+	// reads stat.rss, which the kernel reports in pages, and multiplies by the
+	// page size before setting the gauge. The name carries no unit suffix and
+	// no "process" namespace, so it looks nothing like what the standard
+	// collector would publish.
+	agentRSSMetric = "kata_agent_total_rss"
 )
 
 // meminfoUnitFloor is the MemTotal below which the meminfo entries are read as
