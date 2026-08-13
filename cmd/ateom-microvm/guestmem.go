@@ -50,6 +50,7 @@ const (
 	guestMemFree           = "free"
 	guestMemPageCache      = "page_cache"
 	guestMemContainers     = "containers"
+	guestMemTmpfs          = "tmpfs"
 	guestMemAgent          = "kata_agent"
 	guestMemKernelAndOther = "kernel_and_other"
 )
@@ -72,7 +73,7 @@ func (s *AteomService) registerGuestMemoryMetrics(mp metric.MeterProvider) error
 	gauge, err := meter.Int64ObservableGauge(
 		guestMemoryMetric,
 		metric.WithUnit("By"),
-		metric.WithDescription("Guest RAM of the micro-VM this ateom is running, split by what is holding it. The components sum to the guest kernel's MemTotal, which is itself less than the RAM assigned to the VM."),
+		metric.WithDescription("Guest RAM of the micro-VM this ateom is running, split by what is holding it. The components sum to the guest kernel's MemTotal, which is itself less than the RAM assigned to the VM. Everything but 'free' costs snapshot bytes on a Full checkpoint, and so costs suspend and resume latency."),
 	)
 	if err != nil {
 		return fmt.Errorf("creating the %s gauge: %w", guestMemoryMetric, err)
@@ -93,6 +94,7 @@ func (s *AteomService) registerGuestMemoryMetrics(mp metric.MeterProvider) error
 		observe(guestMemFree, int64(b.Free))
 		observe(guestMemPageCache, int64(b.PageCache))
 		observe(guestMemContainers, int64(b.Containers))
+		observe(guestMemTmpfs, int64(b.Tmpfs))
 		observe(guestMemAgent, int64(b.Agent))
 		observe(guestMemKernelAndOther, b.KernelAndOther)
 		return nil

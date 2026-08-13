@@ -35,11 +35,14 @@ import (
 // units and spelling /proc/meminfo uses. The exhaustive parsing cases live in
 // internal/guestmem; what these tests need from it is a guest whose slices are
 // far enough apart to be told from each other.
+// Cached is 256 MiB of which 128 MiB is Shmem, so the page-cache and tmpfs
+// slices come out unequal — a scrape where they matched would pass even if the
+// callback observed one of them twice.
 const testScrape = `# TYPE kata_guest_meminfo gauge
 kata_guest_meminfo{item="mem_total"} 2013204
 kata_guest_meminfo{item="mem_free"} 1048576
 kata_guest_meminfo{item="cached"} 262144
-kata_guest_meminfo{item="shmem"} 0
+kata_guest_meminfo{item="shmem"} 131072
 kata_guest_meminfo{item="buffers"} 0
 kata_guest_meminfo{item="s_reclaimable"} 0
 kata_agent_process_resident_memory_bytes 15728640
@@ -119,7 +122,7 @@ func splitComponent(t *testing.T, set attribute.Set) (string, []attribute.KeyVal
 	return component, rest
 }
 
-// The whole point of the metric: five slices that tile the guest's MemTotal.
+// The whole point of the metric: six slices that tile the guest's MemTotal.
 // If this ever stops holding, a stacked chart of it is lying.
 func TestGuestMemoryComponentsTileMemTotal(t *testing.T) {
 	agent := &fakeAgent{
@@ -131,9 +134,11 @@ func TestGuestMemoryComponentsTileMemTotal(t *testing.T) {
 	got, _ := components(t, newStatsService(agent, "app_ovl"))
 
 	want := map[string]int64{
-		guestMemFree:       1048576 * 1024,
-		guestMemPageCache:  262144 * 1024,
+		guestMemFree: 1048576 * 1024,
+		// Cached minus Shmem: the tmpfs half is the next line, not this one.
+		guestMemPageCache:  131072 * 1024,
 		guestMemContainers: 256 << 20,
+		guestMemTmpfs:      131072 * 1024,
 		guestMemAgent:      15728640,
 	}
 	for component, v := range want {

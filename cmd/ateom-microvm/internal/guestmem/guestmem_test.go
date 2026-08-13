@@ -222,13 +222,20 @@ kata_guest_meminfo{item="mem_free"} 1310720
 	}
 }
 
+// sumOf adds every slice including the signed residual. Kept as a helper so a
+// slice added later has to be added here too, and the tiling tests below fail
+// loudly if it is not.
+func sumOf(b Breakdown) int64 {
+	return int64(b.Free) + int64(b.PageCache) + int64(b.Containers) +
+		int64(b.Tmpfs) + int64(b.Agent) + b.KernelAndOther
+}
+
 func TestComputeTilesTotal(t *testing.T) {
 	// 512 MiB of anonymous memory across the actor's containers.
 	const containersAnon = 512 << 20
 	b := Compute(wantGuest, containersAnon)
 
-	sum := int64(b.Free) + int64(b.PageCache) + int64(b.Containers) + int64(b.Agent) + b.KernelAndOther
-	if sum != int64(b.Total) {
+	if sum := sumOf(b); sum != int64(b.Total) {
 		t.Errorf("components sum to %d, want Total %d — the slices must tile the guest by construction", sum, b.Total)
 	}
 	if b.Containers != containersAnon {
@@ -239,6 +246,75 @@ func TestComputeTilesTotal(t *testing.T) {
 	wantCache := wantGuest.Buffers + (wantGuest.Cached - wantGuest.Shmem) + wantGuest.SReclaimable
 	if b.PageCache != wantCache {
 		t.Errorf("PageCache = %d, want %d (Cached must have Shmem taken out of it)", b.PageCache, wantCache)
+	}
+	if b.Tmpfs != wantGuest.Shmem {
+		t.Errorf("Tmpfs = %d, want %d — what PageCache gives up, Tmpfs must claim", b.Tmpfs, wantGuest.Shmem)
+	}
+}
+
+// The case the Tmpfs slice exists for. A micro-VM container's writable rootfs
+// layer is a guest tmpfs, so a workload writing a file allocates guest RAM
+// under an API that looks like disk. Those pages land in Shmem: not in the
+// container's cgroup anon, and taken back out of Cached because they cannot be
+// reclaimed. Without a slice of their own they were invisible — they fell
+// through into the residual and read as the guest kernel having grown.
+func TestComputeAttributesAFileWrittenToTmpfs(t *testing.T) {
+	const write = 256 << 20
+
+	before := Compute(wantGuest, 0)
+
+	after := wantGuest
+	after.Free -= write
+	after.Shmem += write
+	after.Cached += write // the kernel counts tmpfs pages in Cached too
+	got := Compute(after, 0)
+
+	if delta := got.Tmpfs - before.Tmpfs; delta != write {
+		t.Errorf("Tmpfs moved by %d, want %d", delta, write)
+	}
+	if got.PageCache != before.PageCache {
+		t.Errorf("PageCache moved from %d to %d; tmpfs pages are not reclaimable and must not read as cache",
+			before.PageCache, got.PageCache)
+	}
+	if got.Containers != before.Containers {
+		t.Errorf("Containers moved from %d to %d; the cgroup charges tmpfs to shmem, not anon",
+			before.Containers, got.Containers)
+	}
+	if got.KernelAndOther != before.KernelAndOther {
+		t.Errorf("KernelAndOther moved from %d to %d; a container's file write is not the guest kernel growing",
+			before.KernelAndOther, got.KernelAndOther)
+	}
+	if sum := sumOf(got); sum != int64(got.Total) {
+		t.Errorf("components sum to %d, want Total %d", sum, got.Total)
+	}
+}
+
+// The comparison the slice is meant to support: the same bytes written to a
+// durable-dir volume are host-backed, so the guest holds them as ordinary
+// reclaimable page cache instead. Same workload, same byte count, different
+// slice — and only one of the two costs memory-snapshot bytes.
+func TestComputeSeparatesTmpfsFromRealPageCache(t *testing.T) {
+	const write = 256 << 20
+
+	toTmpfs := wantGuest
+	toTmpfs.Free -= write
+	toTmpfs.Shmem += write
+	toTmpfs.Cached += write
+
+	toDurableDir := wantGuest
+	toDurableDir.Free -= write
+	toDurableDir.Cached += write // a file page with a backing store: no Shmem
+
+	tmpfs, durable := Compute(toTmpfs, 0), Compute(toDurableDir, 0)
+
+	if tmpfs.Tmpfs-durable.Tmpfs != write {
+		t.Errorf("Tmpfs: %d vs %d, want a %d difference", tmpfs.Tmpfs, durable.Tmpfs, write)
+	}
+	if durable.PageCache-tmpfs.PageCache != write {
+		t.Errorf("PageCache: %d vs %d, want a %d difference", durable.PageCache, tmpfs.PageCache, write)
+	}
+	if tmpfs.Free != durable.Free {
+		t.Errorf("Free differs (%d vs %d); both writes cost the guest the same RAM", tmpfs.Free, durable.Free)
 	}
 }
 
@@ -265,6 +341,12 @@ func TestComputeSaturatesShmemAboveCached(t *testing.T) {
 	b := Compute(g, 0)
 	if b.PageCache != 4096 {
 		t.Errorf("PageCache = %d, want 4096: Cached-Shmem must floor at zero, not wrap", b.PageCache)
+	}
+	// The floor changes what PageCache gives up, not what Tmpfs claims: Shmem
+	// is reported as read, so the residual absorbs the inconsistency instead of
+	// a slice silently shrinking to hide it.
+	if b.Tmpfs != 2000 {
+		t.Errorf("Tmpfs = %d, want 2000", b.Tmpfs)
 	}
 }
 
