@@ -17,8 +17,18 @@
 // GetWorkloadStats reports the workload's containers, which is the right answer
 // to "how much is this actor using" and no answer at all to "why is a 2048 MiB
 // guest full". The containers are one slice of the guest; the guest kernel, the
-// kata-agent, the page cache charged to no container, and whatever is still
-// free are the rest, and none of them appear in a per-container cgroup read.
+// kata-agent, the page cache charged to no container, the tmpfs holding every
+// file a container wrote, and whatever is still free are the rest, and none of
+// them appear in a per-container cgroup read.
+//
+// The split is also what connects guest RAM to snapshot cost. A Full checkpoint
+// writes the guest's touched pages to a sparse memory-ranges file, so how big a
+// snapshot is — and therefore how long a suspend and a resume take — is decided
+// by the slices below. They are not equally hard to shrink: page cache could be
+// dropped before a checkpoint without changing what the guest computes, tmpfs
+// could move to a durable-dir volume that never enters the memory snapshot, and
+// container anon is the workload itself. A single "the guest is using 1.2 GiB"
+// tells a reader none of that.
 //
 // The missing slices come from the kata-agent's own Prometheus registry
 // (grpc.AgentService/GetMetrics), which carries the guest's /proc/meminfo. This
@@ -86,8 +96,8 @@ type Guest struct {
 	Free uint64
 
 	// Buffers, Cached, SReclaimable and Shmem are the page-cache constituents.
-	// Cached includes Shmem (tmpfs pages), which is not reclaimable and belongs
-	// with whoever created it, so Compute subtracts it back out.
+	// Cached includes Shmem (tmpfs pages), which is not reclaimable, so Compute
+	// subtracts it back out of PageCache and reports it as its own slice.
 	Buffers      uint64
 	Cached       uint64
 	SReclaimable uint64
@@ -104,7 +114,7 @@ type Guest struct {
 // construction, add up to Total.
 //
 // "By construction" is doing real work here: KernelAndOther is a RESIDUAL, not
-// a measurement. Everything the four measured slices fail to account for lands
+// a measurement. Everything the five measured slices fail to account for lands
 // in it, so the slices always tile Total exactly and the sum is not a
 // consistency check. What the residual is good for is the opposite — its SIGN
 // and its MAGNITUDE are the check. See the field.
@@ -128,21 +138,52 @@ type Breakdown struct {
 	// counting its cgroup usage here would count them twice.
 	//
 	// The flip side is that this slice under-reports what a container "costs" —
-	// its kernel memory, and any tmpfs it wrote, are real and land in
-	// KernelAndOther instead. For "who is using the guest's RAM" that is the
-	// wrong bias; for "do these slices tile the guest" it is the only one that
-	// works. Read this against GetWorkloadStats' working-set figure, which
-	// answers the first question and does not have to tile anything.
+	// its kernel memory is real and lands in KernelAndOther instead, and the
+	// files it wrote land in Tmpfs or PageCache. For "who is using the guest's
+	// RAM" that is the wrong bias; for "do these slices tile the guest" it is
+	// the only one that works. Read this against GetWorkloadStats' working-set
+	// figure, which answers the first question and does not have to tile
+	// anything.
 	Containers uint64
+
+	// Tmpfs is Shmem: pages of a filesystem that lives in RAM, plus shared
+	// memory segments. It is its own slice rather than part of PageCache or
+	// Containers because it behaves like neither, and because on this runtime
+	// it is where a container's file writes actually go.
+	//
+	// A micro-VM gives each container an overlay rootfs whose writable upper is
+	// a guest tmpfs (see cmd/ateom-microvm/checkpoint.go). So a workload that
+	// writes a file anywhere outside a durable-dir volume is allocating RAM,
+	// under an API that looks like it is allocating disk. Those pages are:
+	//
+	//   - not reclaimable, unlike PageCache — there is no backing store to
+	//     write them out to, so the kernel cannot drop them under pressure;
+	//   - not visible in Containers, because the cgroup charges them to shmem
+	//     rather than anon;
+	//   - captured by a Full checkpoint, because they are guest RAM, so they
+	//     cost snapshot bytes and therefore suspend and resume latency —
+	//     the same bytes in a durable-dir volume would not.
+	//
+	// Folding them into PageCache would say they are reclaimable, which is
+	// wrong in the expensive direction: a reader would conclude the guest has
+	// headroom it does not have. Leaving them in KernelAndOther, which is what
+	// this package did before the slice existed, attributed a container's file
+	// writes to the guest kernel.
+	//
+	// Guest-wide, not per container: Shmem comes from /proc/meminfo, so it also
+	// counts /dev/shm, /run and any other tmpfs the guest mounts. Those are
+	// small and fixed next to a workload's writes, and separating them would
+	// mean a per-cgroup shmem read that only the container slice could use.
+	Tmpfs uint64
 
 	// Agent is the kata-agent's resident set.
 	Agent uint64
 
-	// KernelAndOther is what is left: Total minus the four above. Genuinely a
+	// KernelAndOther is what is left: Total minus the five above. Genuinely a
 	// mix — the guest kernel's non-reclaimable slab, page tables, kernel
 	// stacks, vmalloc, plus any process in the guest that is not a workload
-	// container, plus the container kernel memory and tmpfs that Containers
-	// declines to claim.
+	// container, plus the container kernel memory that Containers declines to
+	// claim.
 	//
 	// SIGNED, and negative is meaningful rather than a bug to clamp away. It
 	// means the measured slices overlapped — the same pages counted twice —
@@ -217,9 +258,10 @@ func Parse(scrape string) (Guest, error) {
 // cgroup usage.
 func Compute(g Guest, containersAnon uint64) Breakdown {
 	// Cached counts tmpfs pages, which are not cache in the sense that matters
-	// here — nothing reclaims them by dropping them. Saturating, because the
-	// kernel assembles /proc/meminfo without a lock and Shmem can read a hair
-	// above the Cached line beside it.
+	// here — nothing reclaims them by dropping them. Take them out and report
+	// them as Tmpfs instead. Saturating, because the kernel assembles
+	// /proc/meminfo without a lock and Shmem can read a hair above the Cached
+	// line beside it.
 	cached := g.Cached
 	if g.Shmem < cached {
 		cached -= g.Shmem
@@ -228,13 +270,14 @@ func Compute(g Guest, containersAnon uint64) Breakdown {
 	}
 	pageCache := g.Buffers + cached + g.SReclaimable
 
-	measured := g.Free + pageCache + containersAnon + g.AgentRSS
+	measured := g.Free + pageCache + containersAnon + g.Shmem + g.AgentRSS
 
 	return Breakdown{
 		Total:      g.Total,
 		Free:       g.Free,
 		PageCache:  pageCache,
 		Containers: containersAnon,
+		Tmpfs:      g.Shmem,
 		Agent:      g.AgentRSS,
 		// int64 across the whole guest range: a Total that would overflow it is
 		// an 8-exbibyte VM. The subtraction is the point — see the field.
