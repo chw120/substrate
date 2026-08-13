@@ -77,18 +77,42 @@ type Sample struct {
 	CPUUsageUsec uint64
 }
 
-// Keys of the memory.stat entry holding reclaimable file-backed pages. The
-// agent passes the guest's memory.stat through verbatim, so which one is
-// present depends on the cgroup version the guest kernel gave the container:
-// v2 names it inactive_file, v1 has a per-cgroup inactive_file and the
-// hierarchical total_inactive_file, and the total is the one that matches what
-// v2's figure means.
+// The agent passes the guest's memory.stat through verbatim — rustjail's
+// get_memory_stats sets stats = memory.stat.raw — so which keys are present
+// depends on the cgroup version the guest kernel gave the container, and each
+// list below carries both spellings.
+//
+// On this runtime it is always the FIRST key that hits, and that is settled at
+// boot rather than observed: kata 4.0.0 ships configuration-clh.toml with
+// kernel_params = "cgroup_no_v1=all systemd.unified_cgroup_hierarchy=1"
+// (src/runtime/arch/{arm64,amd64}-options.mk, substituted into the toml at
+// build time), ParseConfig reads that field and buildVMConfig appends it to the
+// cloud-hypervisor cmdline verbatim. So the guest kernel will not mount a v1
+// controller at all, systemd mounts cgroup2 on /sys/fs/cgroup, and the agent's
+// cgroups-rs hierarchies::auto() — which picks by the magic number of that
+// mount — resolves to v2 for every container.
+//
+// The v1 spellings stay anyway. None of that chain is this package's to
+// guarantee: a kata bump, an arch options file or an operator's kernel_params
+// could each move the guest back to v1, and the failure mode would be a
+// silently zeroed slice rather than an error. Two extra map lookups on a path
+// that runs once per collection is the right price for that.
+
+// Keys of the memory.stat entry holding reclaimable file-backed pages: v2 names
+// it inactive_file, v1 has a per-cgroup inactive_file and the hierarchical
+// total_inactive_file, and the total is the one that matches what v2's figure
+// means.
 var inactiveFileKeys = []string{"inactive_file", "total_inactive_file"}
 
 // Keys of the memory.stat entry holding anonymous pages, in the order to try
 // them. Same version split as the reclaimable keys above: v2 calls it anon, v1
 // calls it rss and also publishes the hierarchical total_rss, which is the one
 // that matches what v2's figure means — so it is tried first.
+//
+// v2's anon excludes tmpfs, which it charges to shmem (and counts again in
+// file). That is what keeps this figure disjoint from the breakdown's Tmpfs
+// slice, which reads the guest-wide Shmem: a container writing to its overlay
+// upper moves shmem, not anon, so the two slices cannot claim the same page.
 var anonKeys = []string{"anon", "total_rss", "rss"}
 
 // FromCgroupStats converts one container's guest cgroup accounting.
