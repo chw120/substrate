@@ -18,10 +18,14 @@
 
 ATE_DEMOS+=(demo-claude-code-multiplex) # register demo-claude-code-multiplex
 
+# The matched action is recorded in DEMO_ACTION rather than run here: the
+# dispatch loop in install-ate.sh (which sources this file) runs it with
+# errexit in effect, so a failing deploy actually fails the script.
+# shellcheck disable=SC2034 # DEMO_ACTION is read by install-ate.sh
 demo-claude-code-multiplex_cmdline() {
   case "${1}" in
-    --deploy-demo-claude-code-multiplex) demo-claude-code-multiplex_deploy ;;
-    --delete-demo-claude-code-multiplex) demo-claude-code-multiplex_delete ;;
+    --deploy-demo-claude-code-multiplex) DEMO_ACTION=(demo-claude-code-multiplex_deploy) ;;
+    --delete-demo-claude-code-multiplex) DEMO_ACTION=(demo-claude-code-multiplex_delete) ;;
     *)
       return 1
       ;;

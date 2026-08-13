@@ -22,11 +22,15 @@ demo-counter_usage() {
   echo "  --deploy-demo-counter-with-external-volume    Deploy demo-counter with external volume validation"
 }
 
+# The matched action is recorded in DEMO_ACTION rather than run here: the
+# dispatch loop in install-ate.sh (which sources this file) runs it with
+# errexit in effect, so a failing deploy actually fails the script.
+# shellcheck disable=SC2034 # DEMO_ACTION is read by install-ate.sh
 demo-counter_cmdline() {
   case "${1}" in
-    --deploy-demo-counter) demo-counter_deploy "false" ;;
-    --deploy-demo-counter-with-external-volume) demo-counter_deploy "true" ;;
-    --delete-demo-counter) demo-counter_delete ;;
+    --deploy-demo-counter) DEMO_ACTION=(demo-counter_deploy "false") ;;
+    --deploy-demo-counter-with-external-volume) DEMO_ACTION=(demo-counter_deploy "true") ;;
+    --delete-demo-counter) DEMO_ACTION=(demo-counter_delete) ;;
     *)
       return 1
       ;;

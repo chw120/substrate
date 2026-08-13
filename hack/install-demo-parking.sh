@@ -18,10 +18,14 @@
 
 ATE_DEMOS+=(demo-parking) # register demo-parking
 
+# The matched action is recorded in DEMO_ACTION rather than run here: the
+# dispatch loop in install-ate.sh (which sources this file) runs it with
+# errexit in effect, so a failing deploy actually fails the script.
+# shellcheck disable=SC2034 # DEMO_ACTION is read by install-ate.sh
 demo-parking_cmdline() {
   case "${1}" in
-    --deploy-demo-parking) demo-parking_deploy ;;
-    --delete-demo-parking) demo-parking_delete ;;
+    --deploy-demo-parking) DEMO_ACTION=(demo-parking_deploy) ;;
+    --delete-demo-parking) DEMO_ACTION=(demo-parking_delete) ;;
     *)
       return 1
       ;;

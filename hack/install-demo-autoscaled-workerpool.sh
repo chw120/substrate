@@ -22,10 +22,14 @@ if [[ "${ATE_INSTALL_KIND:-false}" == "true" ]]; then
   ATE_DEMOS+=(demo-autoscaled-workerpool) # register demo-autoscaled-workerpool
 fi
 
+# The matched action is recorded in DEMO_ACTION rather than run here: the
+# dispatch loop in install-ate.sh (which sources this file) runs it with
+# errexit in effect, so a failing deploy actually fails the script.
+# shellcheck disable=SC2034 # DEMO_ACTION is read by install-ate.sh
 demo-autoscaled-workerpool_cmdline() {
   case "${1}" in
-    --deploy-demo-autoscaled-workerpool) demo-autoscaled-workerpool_deploy ;;
-    --delete-demo-autoscaled-workerpool) demo-autoscaled-workerpool_delete ;;
+    --deploy-demo-autoscaled-workerpool) DEMO_ACTION=(demo-autoscaled-workerpool_deploy) ;;
+    --delete-demo-autoscaled-workerpool) DEMO_ACTION=(demo-autoscaled-workerpool_delete) ;;
     *)
       return 1
       ;;

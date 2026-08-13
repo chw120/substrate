@@ -38,6 +38,10 @@ fi
 # ATE_DEMOS is an array that registers the prefix name of the demo functions.
 ATE_DEMOS=()
 
+# DEMO_ACTION is how ${demo}_cmdline hands the command it matched back to the
+# dispatch loop at the bottom, which runs it with errexit still in effect.
+DEMO_ACTION=()
+
 # Include demos.
 source "${ROOT}"/hack/install-demo-counter.sh
 source "${ROOT}"/hack/install-demo-egress.sh
@@ -828,13 +832,24 @@ esac
 store_backend >/dev/null
 
 while [[ "$#" -gt 0 ]]; do
-  # Run ${demo}_cmdline if it exists. If it returns 0, then we successfully
-  # handled this argument and can continue. Otherwise, fallthrough to check
-  # the other arguments.
+  # Ask each demo whether it claims this argument. ${demo}_cmdline only *matches*:
+  # it returns 0 and records what to run in DEMO_ACTION, or returns 1 to decline,
+  # in which case we fall through to the other arguments below.
+  #
+  # The action itself must run outside this `if`, because bash suppresses errexit
+  # for everything called from a condition — running a demo's deploy in there
+  # swallows its failures, so a `kubectl rollout status` that times out still looks
+  # like the demo came up.
   for demo_name in "${ATE_DEMOS[@]}"; do
     if declare -F "${demo_name}_cmdline" >/dev/null 2>&1; then
+      DEMO_ACTION=()
       if "${demo_name}_cmdline" "$1"; then
+        if [[ "${#DEMO_ACTION[@]}" -eq 0 ]]; then
+          echo "Error: ${demo_name}_cmdline claimed '$1' but recorded no DEMO_ACTION" >&2
+          exit 1
+        fi
         shift
+        "${DEMO_ACTION[@]}"
         continue 2
       fi
     fi

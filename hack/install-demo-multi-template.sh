@@ -18,10 +18,14 @@
 
 ATE_DEMOS+=(demo-multi-template) # register demo-multi-template
 
+# The matched action is recorded in DEMO_ACTION rather than run here: the
+# dispatch loop in install-ate.sh (which sources this file) runs it with
+# errexit in effect, so a failing deploy actually fails the script.
+# shellcheck disable=SC2034 # DEMO_ACTION is read by install-ate.sh
 demo-multi-template_cmdline() {
   case "${1}" in
-    --deploy-demo-multi-template) demo-multi-template_deploy ;;
-    --delete-demo-multi-template) demo-multi-template_delete ;;
+    --deploy-demo-multi-template) DEMO_ACTION=(demo-multi-template_deploy) ;;
+    --delete-demo-multi-template) DEMO_ACTION=(demo-multi-template_delete) ;;
     *)
       return 1
       ;;

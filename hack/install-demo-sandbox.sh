@@ -18,10 +18,14 @@
 
 ATE_DEMOS+=(demo-sandbox) # register demo-sandbox
 
+# The matched action is recorded in DEMO_ACTION rather than run here: the
+# dispatch loop in install-ate.sh (which sources this file) runs it with
+# errexit in effect, so a failing deploy actually fails the script.
+# shellcheck disable=SC2034 # DEMO_ACTION is read by install-ate.sh
 demo-sandbox_cmdline() {
   case "${1}" in
-    --deploy-demo-sandbox) demo-sandbox_deploy ;;
-    --delete-demo-sandbox) demo-sandbox_delete ;;
+    --deploy-demo-sandbox) DEMO_ACTION=(demo-sandbox_deploy) ;;
+    --delete-demo-sandbox) DEMO_ACTION=(demo-sandbox_delete) ;;
     *)
       return 1
       ;;
