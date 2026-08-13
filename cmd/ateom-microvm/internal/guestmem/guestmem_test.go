@@ -40,8 +40,8 @@ kata_guest_meminfo{item="slab"} 51200
 # TYPE kata_guest_load gauge
 kata_guest_load{item="load1"} 0.08
 kata_guest_stat{cpu="cpu0",item="user"} 1234
-# TYPE kata_agent_process_resident_memory_bytes gauge
-kata_agent_process_resident_memory_bytes 15728640
+# TYPE kata_agent_total_rss gauge
+kata_agent_total_rss 15728640
 `
 
 // flattenedScrape is the other shape: the entry folded into the metric name,
@@ -54,7 +54,7 @@ kata_guest_meminfo_Buffers 8388608
 kata_guest_meminfo_Cached 419430400
 kata_guest_meminfo_SReclaimable 33554432
 kata_guest_meminfo_Shmem 4194304
-kata_agent_process_resident_memory_bytes 1.572864e+07
+kata_agent_total_rss 1.572864e+07
 `
 
 // wantGuest is the guest both scrapes above describe, in bytes.
@@ -66,6 +66,92 @@ var wantGuest = Guest{
 	SReclaimable: 32768 * 1024,
 	Shmem:        4096 * 1024,
 	AgentRSS:     15728640,
+}
+
+// agent400Scrape reproduces what kata-agent 4.0.0 actually publishes — the
+// release hack/microvm-assets/assemble.sh pins — rather than a shape this
+// package hoped for. Transcribed from src/agent/src/metrics.rs: the family
+// names come from NAMESPACE_KATA_GUEST/NAMESPACE_KATA_AGENT, the item labels
+// from set_gauge_vec_meminfo, and the values are bytes because the agent reads
+// /proc/meminfo through the procfs crate, which scales kB away.
+//
+// Every family the agent emits and this package ignores is kept, in the order
+// the registry gathers them, because "ignores the rest of a real scrape" is
+// most of what Parse has to get right. Trimmed only in the number of meminfo
+// entries and CPUs, which are long and uninteresting.
+//
+// Not captured from a live guest — this is still transcription, and a real
+// capture should replace it. It is pinned to a version, which the hand-built
+// fixtures above are not.
+const agent400Scrape = `# HELP kata_agent_scrape_count Metrics scrape count
+# TYPE kata_agent_scrape_count counter
+kata_agent_scrape_count 41
+# HELP kata_agent_threads Agent process threads
+# TYPE kata_agent_threads gauge
+kata_agent_threads 12
+# HELP kata_agent_total_rss Agent process total RSS size
+# TYPE kata_agent_total_rss gauge
+kata_agent_total_rss 15728640
+# HELP kata_agent_total_time Agent process total time
+# TYPE kata_agent_total_time gauge
+kata_agent_total_time 0.34
+# HELP kata_agent_total_vm Agent process total VM size
+# TYPE kata_agent_total_vm gauge
+kata_agent_total_vm 1250037760
+# HELP kata_guest_load Guest system load.
+# TYPE kata_guest_load gauge
+kata_guest_load{item="load1"} 0.08
+# HELP kata_guest_meminfo Statistics about memory usage in the system.
+# TYPE kata_guest_meminfo gauge
+kata_guest_meminfo{item="active"} 209715200
+kata_guest_meminfo{item="anon_pages"} 178257920
+kata_guest_meminfo{item="buffers"} 8388608
+kata_guest_meminfo{item="cached"} 419430400
+kata_guest_meminfo{item="dirty"} 131072
+kata_guest_meminfo{item="inactive"} 314572800
+kata_guest_meminfo{item="inactive_file"} 289406976
+kata_guest_meminfo{item="mapped"} 41943040
+kata_guest_meminfo{item="mem_available"} 1843200000
+kata_guest_meminfo{item="mem_free"} 1342177280
+kata_guest_meminfo{item="mem_total"} 2061520896
+kata_guest_meminfo{item="page_tables"} 2097152
+kata_guest_meminfo{item="s_reclaimable"} 33554432
+kata_guest_meminfo{item="s_unreclaim"} 19922944
+kata_guest_meminfo{item="shmem"} 4194304
+kata_guest_meminfo{item="slab"} 53477376
+kata_guest_meminfo{item="swap_free"} 0
+kata_guest_meminfo{item="swap_total"} 0
+# HELP kata_guest_vm_stat Guest virtual memory statistics.
+# TYPE kata_guest_vm_stat gauge
+kata_guest_vm_stat{item="pgfault"} 92341
+`
+
+// The one assumption in this package nothing else can check: that the family
+// names, the item spellings and the units are what the pinned agent emits. A
+// wrong guess here does not fail loudly — an unmatched optional entry reads as
+// zero and its bytes drift into the residual — so it has to be asserted.
+func TestParseReadsARealAgentScrape(t *testing.T) {
+	got, err := Parse(agent400Scrape)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	want := Guest{
+		Total:        2061520896,
+		Free:         1342177280,
+		Buffers:      8388608,
+		Cached:       419430400,
+		SReclaimable: 33554432,
+		Shmem:        4194304,
+		AgentRSS:     15728640,
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("Parse mismatch (-want +got):\n%s", diff)
+	}
+	// The agent reports bytes, so the kibibyte heuristic must stay out of it.
+	// Scaling a real scrape by 1024 would claim a 2 TiB guest.
+	if got.Total != 2061520896 {
+		t.Errorf("Total = %d: a byte-valued scrape was rescaled", got.Total)
+	}
 }
 
 // The two spellings are the thing this parser exists to be indifferent to: the

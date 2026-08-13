@@ -45,7 +45,7 @@ kata_guest_meminfo{item="cached"} 262144
 kata_guest_meminfo{item="shmem"} 131072
 kata_guest_meminfo{item="buffers"} 0
 kata_guest_meminfo{item="s_reclaimable"} 0
-kata_agent_process_resident_memory_bytes 15728640
+kata_agent_total_rss 15728640
 `
 
 // containerStatsWithAnon is containerStats plus the anonymous figure, which is
