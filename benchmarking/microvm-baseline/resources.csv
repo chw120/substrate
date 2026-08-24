@@ -1,0 +1,21 @@
+test_case,resource_type,item,bytes,mib,pct_of_snapshot,measured_by,notes
+baseline,snapshot_file,memory-ranges,162635776,155.10,99.95,prometheus:atelet_snapshot_size_bytes,allocated blocks (st_blocks*512)
+baseline,snapshot_file,state.json,65536,0.06,0.04,prometheus:atelet_snapshot_size_bytes,-
+baseline,snapshot_file,config.json,4096,0.00,0.00,prometheus:atelet_snapshot_size_bytes,-
+baseline,snapshot_file,base-id,4096,0.00,0.00,prometheus:atelet_snapshot_size_bytes,36-byte file occupying one block
+baseline,snapshot_file,durable-dir.tar,4096,0.00,0.00,prometheus:atelet_snapshot_size_bytes,-
+baseline,snapshot_total,all_files,162713600,155.18,100.00,derived,sum of the snapshot_file rows
+baseline,guest_memory,free,1973127578,1881.90,-,prometheus:ate_microvm_guest_memory_bytes,six slices sum exactly to MemTotal 2048 MiB
+baseline,guest_memory,page_cache,67633152,64.50,41.6,prometheus:ate_microvm_guest_memory_bytes,largest single component of the snapshot
+baseline,guest_memory,kata_agent,19293798,18.40,11.9,prometheus:ate_microvm_guest_memory_bytes,fixed tax per microVM; 3.3x the workload
+baseline,guest_memory,kernel_and_other,14575206,13.90,9.0,prometheus:ate_microvm_guest_memory_bytes,-
+baseline,guest_memory,tmpfs,6291456,6.00,3.9,prometheus:ate_microvm_guest_memory_bytes,overlay upper; charged to shmem
+baseline,guest_memory,containers,5872026,5.60,3.6,prometheus:ate_microvm_guest_memory_bytes,the real workload; charged to anon
+baseline,derived,guest_non_free_total,113658214,108.40,69.9,derived,sum of the five non-free slices
+baseline,derived,touched_then_freed,48966042,46.70,30.1,inferred,"155.1 - 108.4; different instances and moments, order-of-magnitude only"
+baseline,derived,workload_total,12163482,11.60,7.5,derived,containers + tmpfs: the only slices the actor actually asked for
+baseline,snapshot_file_legacy,memory-ranges,2147483648,2048.00,-,fi.Size() before the fix,constant = configured guest RAM; carried no information
+baseline,snapshot_file_legacy,state.json,61297,0.06,-,fi.Size() before the fix,-
+baseline,snapshot_file_legacy,config.json,2950,0.00,-,fi.Size() before the fix,-
+baseline,snapshot_file_legacy,base-id,36,0.00,-,fi.Size() before the fix,-
+baseline,snapshot_file_legacy,durable-dir.tar,1536,0.00,-,fi.Size() before the fix,-

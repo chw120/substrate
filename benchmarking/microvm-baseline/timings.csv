@@ -1,0 +1,33 @@
+test_case,action,scope,snapshot_kind,step,parent_step,layer,duration_ms,pct_of_total,samples,measured_by,scales_with,notes
+baseline,suspend,full,-,total,-,atelet,920.8,100.0,2,prometheus:ate_actor_checkpoint_duration_seconds,-,range 866.9-974.6
+baseline,suspend,full,-,ateom_checkpoint,total,ateom,519.3,56.4,2,prometheus:ate_actor_checkpoint_duration_seconds,-,range 486.2-552.4
+baseline,suspend,full,-,persist,total,atelet,394.4,42.8,2,prometheus:ate_actor_checkpoint_duration_seconds,snapshot_bytes,zstd + upload; range 374.0-414.7
+baseline,suspend,full,-,atelet_other,total,atelet,7.1,0.8,2,derived,-,total minus ateom_checkpoint and persist
+baseline,suspend,full,-,pause,ateom_checkpoint,ateom,2.6,0.3,2,ateom_log:Actor checkpointed,-,guest frozen from here on
+baseline,suspend,full,-,snapshot,ateom_checkpoint,cloud-hypervisor,160.8,17.5,2,ateom_log:Actor checkpointed,guest_touched_pages,CH writes memory-ranges to local disk; range 149.1-172.4
+baseline,suspend,full,-,durable_dir,ateom_checkpoint,ateom,3.9,0.4,2,ateom_log:Actor checkpointed,durable_volume_bytes,range 1.1-6.7
+baseline,suspend,full,-,teardown,ateom_checkpoint,ateom,333.6,36.2,2,ateom_log:Actor checkpointed,nothing,snapshot is already on disk before this starts; range 317.7-349.4
+baseline,suspend,full,-,ch_api_shutdown,teardown,cloud-hypervisor,234.2,25.4,2,ateom_log:CH API shutdown done,nothing,waiting for an already-useless process to exit; range 221.5-246.9
+baseline,suspend,full,-,teardown_other,teardown,ateom,99.4,10.8,2,derived,-,kill CH + kill virtiofsd x2 + unmount + sandbox state sweep
+baseline,suspend,full,-,ateom_other,ateom_checkpoint,ateom,18.4,2.0,2,derived,-,gRPC + WaitReady + checkpoint dir setup
+baseline,suspend,data,-,total,-,atelet,183.1,100.0,1,prometheus:ate_actor_checkpoint_duration_seconds,-,-
+baseline,suspend,data,-,ateom_checkpoint,total,ateom,153.5,83.8,1,prometheus:ate_actor_checkpoint_duration_seconds,-,-
+baseline,suspend,data,-,persist,total,atelet,13.0,7.1,1,prometheus:ate_actor_checkpoint_duration_seconds,snapshot_bytes,28x cheaper than full: only durable-dir.tar ships
+baseline,suspend,data,-,atelet_other,total,atelet,16.6,9.1,1,derived,-,total minus ateom_checkpoint and persist
+baseline,suspend,data,-,pause,ateom_checkpoint,ateom,3.2,1.7,2,ateom_log:Actor checkpointed,-,range 2.7-3.6
+baseline,suspend,data,-,snapshot,ateom_checkpoint,cloud-hypervisor,0.0,0.0,2,ateom_log:Actor checkpointed,-,data scope captures no VM state
+baseline,suspend,data,-,durable_dir,ateom_checkpoint,ateom,6.2,3.4,2,ateom_log:Actor checkpointed,durable_volume_bytes,range 2.6-9.7
+baseline,suspend,data,-,teardown,ateom_checkpoint,ateom,118.4,64.7,2,ateom_log:Actor checkpointed,nothing,4x variance unexplained; range 45.2-191.6
+baseline,suspend,data,-,ateom_other,ateom_checkpoint,ateom,25.7,14.0,2,derived,-,gRPC + WaitReady + checkpoint dir setup
+baseline,resume,full,golden,total,-,atelet,707.2,100.0,1,prometheus:ate_actor_restore_duration_seconds,-,child steps overlap; they are not a partition of total
+baseline,resume,full,golden,download,total,atelet,429.4,60.7,1,prometheus:ate_actor_restore_duration_seconds,snapshot_bytes,largest single step of resume
+baseline,resume,full,golden,ateom_restore,total,ateom,263.9,37.3,1,prometheus:ate_actor_restore_duration_seconds,nothing,black box: restore.go has one timer and one log line
+baseline,resume,full,golden,manifest_fetch,total,atelet,7.2,1.0,1,prometheus:ate_actor_restore_duration_seconds,nothing,runs concurrently with download
+baseline,resume,full,golden,oci_unpack,total,atelet,4.7,0.7,1,prometheus:ate_actor_restore_duration_seconds,image_bytes,warm image cache; runs concurrently with download
+baseline,resume,full,golden,sandbox_assets,total,atelet,0.2,0.0,1,prometheus:ate_actor_restore_duration_seconds,nothing,-
+baseline,resume,full,golden,volume_mount,total,atelet,0.0,0.0,1,prometheus:ate_actor_restore_duration_seconds,nothing,-
+baseline,resume,data_on_golden,latest,total,-,atelet,683.4,100.0,1,prometheus:ate_actor_restore_duration_seconds,-,child steps overlap
+baseline,resume,data_on_golden,latest,download,total,atelet,425.7,62.3,1,prometheus:ate_actor_restore_duration_seconds,snapshot_bytes,-
+baseline,resume,data_on_golden,latest,ateom_restore,total,ateom,244.1,35.7,1,prometheus:ate_actor_restore_duration_seconds,nothing,-
+baseline,resume,data_on_golden,latest,oci_unpack,total,atelet,11.0,1.6,1,prometheus:ate_actor_restore_duration_seconds,image_bytes,-
+baseline,resume,data_on_golden,latest,manifest_fetch,total,atelet,9.4,1.4,1,prometheus:ate_actor_restore_duration_seconds,nothing,-
