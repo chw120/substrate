@@ -1,0 +1,2 @@
+test_case,date,description,git_branch,git_commit,sandbox_class,guest_ram_mib,workload,cycles,object_storage,storage_locality,balloon,overlay_lower_cache,drop_caches_before_checkpoint,kubernetes,host,samples_per_point,comparable_to
+baseline,2026-08-13,First full breakdown of the microVM suspend/resume path,microvm-guest-memory-breakdown,45dfdb9f,microvm,2048,counter actor (minimal),2,rustfs,local (in-cluster),off,always,no,kind single-node,Lima VM on macOS arm64 laptop,1-2,-

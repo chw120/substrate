@@ -27,7 +27,6 @@ import (
 
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/third_party/kata/agentpb"
 	"github.com/agent-substrate/substrate/internal/ateattr"
-	"github.com/agent-substrate/substrate/internal/ateomstats"
 	"github.com/agent-substrate/substrate/internal/resources"
 )
 
@@ -276,7 +275,7 @@ func TestGuestMemoryObservesNothingWithoutAGuest(t *testing.T) {
 // them.
 func TestGuestMemoryDropsASampleOverwrittenMidFlight(t *testing.T) {
 	s := newStatsService(nil)
-	other := ateomstats.ActorAttribution{
+	other := resources.ActorAttribution{
 		Ref:               resources.ActorRef{Atespace: "space-b", Name: "actor-b"},
 		UID:               "uid-b",
 		TemplateNamespace: "ns-b",
