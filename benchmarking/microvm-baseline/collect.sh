@@ -15,9 +15,10 @@
 # Remember to add a row to testcases.csv describing what changed. A timing with
 # no test case describing it is not comparable to anything.
 #
-# STATUS: metric names, labels and CLI flags are all grounded in the source, but
-# this has not been run end to end (the cluster it was derived from is gone).
-# Do a CYCLES=1 run and eyeball the CSV before trusting a long one.
+# ACTOR/ATESPACE name the actor to drive; WORKER_NS is where its worker pods
+# live (the WorkerPool's namespace, not the atespace — the atespace is an ATE
+# concept and has no pods of its own). Set all three together when driving
+# anything other than the counter-microvm demo.
 
 set -euo pipefail
 
@@ -25,7 +26,8 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 
 TEST_CASE=${TEST_CASE:-run-$(date +%Y%m%d-%H%M%S)}
 ACTOR=${ACTOR:-counter}
-ATESPACE=${ATESPACE:-ate-demo-counter}
+ATESPACE=${ATESPACE:-demo}
+WORKER_NS=${WORKER_NS:-ate-demo-counter-microvm}
 CYCLES=${CYCLES:-10}
 
 PROM_NS=${PROM_NS:-otel-system}
@@ -78,9 +80,24 @@ log "capturing counters BEFORE"
 capture "$TMP/before.json"
 
 log "driving ${CYCLES} suspend/resume cycles on ${ATESPACE}/${ACTOR}"
+# This loop only ever produces the two steady-state scopes: suspend/<onCommit>
+# and the resume that pairs with it. It cannot produce suspend/full or
+# resume/full/golden, and no flag makes it:
+#
+#   - The suspend scope is the template's snapshotsConfig.onCommit, except in
+#     the golden atespace, which always commits Full (commitSnapshotScope, in
+#     cmd/ateapi/internal/controlapi/workflow_suspend.go). So the baseline's
+#     full rows are the golden-actor bootstrap, not a demo-actor cycle.
+#   - `resume --boot` is read only when the actor has NO latestSnapshot
+#     (loadActorForResume, workflow_resume.go); it skips the golden snapshot.
+#     Every suspend writes a latestSnapshot, so from cycle 1 on --boot is
+#     silently ignored, and passing it would misreport a warm resume as cold.
+#
+# To sample the full path, delete the actor and its snapshots and let the
+# ActorTemplate rebuild its golden — a one-shot, not something to loop.
 for i in $(seq 1 "$CYCLES"); do
   log "  ${i}/${CYCLES} suspend"; kubectl ate suspend actor "$ACTOR" -a "$ATESPACE" >/dev/null
-  log "  ${i}/${CYCLES} resume";  kubectl ate resume  actor "$ACTOR" -a "$ATESPACE" >/dev/null
+  log "  ${i}/${CYCLES} resume"; kubectl ate resume actor "$ACTOR" -a "$ATESPACE" >/dev/null
 done
 
 log "waiting ${SETTLE_SECONDS}s for the export interval + scrape"
@@ -92,8 +109,8 @@ pq 'ate_microvm_guest_memory_bytes' > "$TMP/guestmem.json"
 
 # The four ateom checkpoint segments are log-only (observability gap #16).
 {
-  for pod in $(kubectl -n "$ATESPACE" get pods -o name 2>/dev/null); do
-    kubectl -n "$ATESPACE" logs "$pod" --all-containers --since="$((SETTLE_SECONDS + 120))s" 2>/dev/null || true
+  for pod in $(kubectl -n "$WORKER_NS" get pods -o name 2>/dev/null); do
+    kubectl -n "$WORKER_NS" logs "$pod" --all-containers --since="$((SETTLE_SECONDS + 120))s" 2>/dev/null || true
   done
 } | grep -E '"msg":"(Actor checkpointed|CH API shutdown done)"' > "$TMP/ateom.log" || true
 log "ateom log lines: $(wc -l < "$TMP/ateom.log" | tr -d ' ')"

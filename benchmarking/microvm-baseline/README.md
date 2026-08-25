@@ -75,7 +75,11 @@ suspend/full  persist                  394.4ms   394.1ms     -0.1%  snapshot_byt
 ```
 
 Steps are matched on `(action, scope, snapshot_kind, step)`, so a change that
-only touches suspend still lines up against the full baseline.
+only touches suspend still lines up against the full baseline. `snapshot_kind`
+is dropped from the key on suspend rows: the checkpoint metric gained
+`ate_snapshot_kind` after `baseline` was recorded, so the same step reads `-`
+there and `latest` on newer cases, and keying on it would report every suspend
+step as present in only one case.
 
 ## What the `baseline` case actually is
 
@@ -92,6 +96,46 @@ See `testcases.csv`. The parts that decide whether *your* run is comparable:
    returned before the size fix, kept so the 13× correction on `memory-ranges`
    stays visible. Do not diff against them.
 
+## Which scopes a suspend/resume loop can actually reach
+
+`collect.sh` drives `suspend` then `resume` in a loop, and that loop reaches
+exactly two of the four scope combinations the `baseline` case recorded. This
+is structural, not a gap in the script:
+
+- The suspend scope is the template's `snapshotsConfig.onCommit` — except in
+  the golden atespace, which always commits `Full` (`commitSnapshotScope`, in
+  `cmd/ateapi/internal/controlapi/workflow_suspend.go`). So `suspend/full` and
+  `resume/full/golden` are the **golden-actor bootstrap**, which happens once
+  when the ActorTemplate is reconciled. A demo actor never produces them.
+- `resume --boot` is consulted only when the actor has no `latestSnapshot`
+  (`loadActorForResume`, `workflow_resume.go`); every suspend writes one, so
+  from cycle 1 onwards the flag is silently ignored.
+
+To sample the full path, delete the ActorTemplate and let it rebuild its
+golden — one sample per rebuild, not something to loop.
+
+## What guest RAM does and does not buy (`main-guest2048` vs `main-guest896`)
+
+Halving guest RAM (2048 → 896 MiB) moved the warm loop by ~11%: resume total
+347.1 → 304.2 ms, suspend total 89.8 → 80.0 ms. That is not a memory effect.
+The shift is spread evenly across steps that scale with nothing
+(`ch_api_shutdown` −2%, `pause` ±0%), and the one step that *should* scale —
+`snapshot`, marked `guest_touched_pages` — is 0.0 ms in both, with a ~4 KiB
+persisted snapshot in both.
+
+The reason is the template's `onCommit: Data` + `onResume.fromData: Golden`:
+the loop only ever writes a data delta, which carries no guest memory. Guest
+RAM is paid on the golden bootstrap, which the loop never re-enters. **Sizing
+experiments on this path measure ambient load, not guest memory.**
+
+One hard result did fall out of it: at 384 MiB of guest RAM (the demo's
+shipped `512Mi` limit minus the 128 MiB VMM reserve) the guest **cold-boots
+fine but cannot be restored from a golden snapshot** — readyz times out after
+2 minutes, twice, with no OOM or panic on the guest console. A control at 2176
+Mi on the same worker pods and the same `full/golden` path went RUNNING in
+about 3 seconds. 896 MiB and 2048 MiB both work; the floor is somewhere
+between 384 and 896 and has not been bisected.
+
 ## Known gaps this baseline cannot fill
 
 - `ateom_restore` (264 ms, 37% of resume) is a single black box — `restore.go`
@@ -103,6 +147,10 @@ See `testcases.csv`. The parts that decide whether *your* run is comparable:
   `download` is the on-disk size, not the transferred size.
 - No host-side density metric, so "how many actors fit on a node" is still
   unanswerable.
+- `ate.microvm.guest.memory.bytes` does not reach Prometheus — in fact no
+  ateom-sourced metric does, with no registration error in the ateom logs. The
+  `main-guest*` cases therefore have no `guest_memory` rows at all, unlike
+  `baseline`.
 
 ## Provenance of the byte figures
 

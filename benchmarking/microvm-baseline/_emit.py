@@ -94,7 +94,10 @@ if os.path.exists(log_path):
             rec = json.loads(line)
         except ValueError:
             continue
-        scope = (rec.get("scope") or "unknown").lower()
+        # "CH API shutdown done" carries only a duration, no scope, so it cannot
+        # name the checkpoint it belongs to. Park it under a sentinel and attach
+        # it below, once we know which suspend scopes the window actually saw.
+        scope = (rec.get("scope") or "__noscope__").lower()
         for wire, step in (("took", "ch_api_shutdown"), ("pause", "pause"),
                            ("snapshot", "snapshot"), ("durable_dir", "durable_dir"),
                            ("teardown", "teardown")):
@@ -105,10 +108,23 @@ if os.path.exists(log_path):
             if wire in rec:
                 segs.setdefault((scope, step), []).append(float(rec[wire]) / 1e6)
 
-for (scope, step), vals in segs.items():
+suspend_scopes = {k[1] for k in groups if k[0] == "suspend"}
+for (scope, step), vals in sorted(segs.items()):
+    if scope == "__noscope__":
+        # Unambiguous only when the window saw a single suspend scope. With a
+        # mixed window, attributing it to either one would be a guess, and a
+        # wrong ch_api_shutdown is worse than an absent one.
+        if len(suspend_scopes) != 1:
+            print(f"skipping {step}: {len(suspend_scopes)} suspend scopes in this "
+                  f"window, and the log line carries no scope", file=sys.stderr)
+            continue
+        scope = next(iter(suspend_scopes))
     scope = "full" if "full" in scope else ("data" if "data" in scope else scope)
-    key = ("suspend", scope, "-")
-    if key in groups:
+    # Match on (action, scope) and let the kind fall where it may: the checkpoint
+    # metric carries ate_snapshot_kind on some versions and not others, while the
+    # log line never had it. Hardcoding a kind here silently drops every ateom
+    # segment the moment the metric grows the label.
+    for key in [k for k in groups if k[0] == "suspend" and k[1] == scope]:
         groups[key][step] = (sum(vals) / len(vals), len(vals),
                              "ateom_log:Actor checkpointed", "")
 

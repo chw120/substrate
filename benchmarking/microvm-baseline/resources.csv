@@ -19,3 +19,7 @@ baseline,snapshot_file_legacy,state.json,61297,0.06,-,fi.Size() before the fix,-
 baseline,snapshot_file_legacy,config.json,2950,0.00,-,fi.Size() before the fix,-
 baseline,snapshot_file_legacy,base-id,36,0.00,-,fi.Size() before the fix,-
 baseline,snapshot_file_legacy,durable-dir.tar,1536,0.00,-,fi.Size() before the fix,-
+main-guest2048,snapshot_file,durable-dir.tar,4096,0.0,100.0,prometheus:atelet_snapshot_size_bytes,
+main-guest2048,snapshot_total,all_files,4096,0.0,100.0,derived,sum of the snapshot_file rows
+main-guest896,snapshot_file,durable-dir.tar,4096,0.0,100.0,prometheus:atelet_snapshot_size_bytes,
+main-guest896,snapshot_total,all_files,4096,0.0,100.0,derived,sum of the snapshot_file rows

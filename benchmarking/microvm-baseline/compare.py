@@ -43,7 +43,14 @@ def main():
         if c not in cases:
             sys.exit(f"unknown test_case '{c}'. known: {', '.join(sorted(cases))}")
 
-    key = lambda r: (r["action"], r["scope"], r["snapshot_kind"], r["step"])
+    # snapshot_kind is deliberately NOT part of the join key for suspend rows: the
+    # checkpoint metric gained ate_snapshot_kind after the baseline was recorded,
+    # so the same step reads "-" on one case and "latest" on another. Keying on it
+    # would silently report every suspend step as present-in-one-case-only.
+    def key(r):
+        kind = "-" if r["action"] == "suspend" else r["snapshot_kind"]
+        return (r["action"], r["scope"], kind, r["step"])
+
     base = {key(r): r for r in timings if r["test_case"] == args.base}
     cand = {key(r): r for r in timings if r["test_case"] == args.candidate}
 
