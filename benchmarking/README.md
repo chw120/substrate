@@ -109,6 +109,15 @@ and state restoration latency when a durable directory is attached to the actor.
 * `DurDirServeWarm`: Subsequent read within the same active cycle (cached state baseline).
 * `DurDirOverwrite`: In-place file overwrite with checksum verification.
 
+#### DurDir Size Sweep
+
+The `durdir_size_*` scenarios in [automation/tests.yaml](automation/tests.yaml)
+sweep volume size from 5 MiB to 1 GiB to measure how suspend/resume latency
+scales with the size of the durable directory. For measured numbers see
+[results/baseline-2026-08-26.md](results/baseline-2026-08-26.md); to repeat the
+measurement, including the two failure modes that appear only above 500 MiB,
+see [results/REPRODUCING.md](results/REPRODUCING.md).
+
 ### Viewing Traces
 You must have enabled otel tracing for your cluster to view traces.
 
