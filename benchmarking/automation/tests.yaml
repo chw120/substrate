@@ -454,12 +454,85 @@ tests:
       - "1.0"
       - "--max-wait-time"
       - "1.0"
-  # The same two sizes on micro-VMs. A durable-dir volume is host-backed and
-  # served write-through over virtiofs, so the payload does not ride in the
-  # guest and these stay at the default actor memory, which keeps them on the
-  # same curve as the gvisor steps above. What the pair isolates is the boot
-  # cost the runtimes do not share: a Data-scope resume is a cold boot, and on
-  # micro-VMs that means a VMM launch the gvisor runs never pay.
+  # The same sweep on micro-VMs. A durable-dir volume is host-backed and served
+  # write-through over virtiofs, so the payload does not ride in the guest and
+  # these stay at the default actor memory, which keeps them on the same curve
+  # as the gvisor steps above. What the sweep isolates is the boot cost the
+  # runtimes do not share: a Data-scope resume is a cold boot, and on micro-VMs
+  # that means a VMM launch the gvisor runs never pay.
+  #
+  # The small steps are what make that cost visible, so they are not optional
+  # duplicates of the gvisor ones: resume barely moves from 5 to 64 MiB because
+  # a near-constant VMM launch dominates everything the volume contributes, and
+  # without the low end there is nothing to separate that floor from the linear
+  # region above it. They run longer than their 1m gvisor counterparts because
+  # a micro-VM iteration is slower, so the same wall clock buys fewer samples.
+  - name: durdir_size_5mb_microvm
+    type: locust
+    description: "DurDir file size sweep (5 MiB) on micro-VM: 1 concurrent user, digest read mode"
+    targetCluster: dev
+    sandboxClass: microvm
+    file: /app/tests/durdir.py
+    duration: 3m
+    users: 1
+    workerCount: 1
+    flags:
+      - "--durdir-template"
+      - "glutton-durdir-data"
+      - "--resume-mode"
+      - "explicit"
+      - "--durdir-read-mode"
+      - "digest"
+      - "--durdir-file-size-bytes"
+      - "5242880"
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
+  - name: durdir_size_10mb_microvm
+    type: locust
+    description: "DurDir file size sweep (10 MiB) on micro-VM: 1 concurrent user, digest read mode"
+    targetCluster: dev
+    sandboxClass: microvm
+    file: /app/tests/durdir.py
+    duration: 3m
+    users: 1
+    workerCount: 1
+    flags:
+      - "--durdir-template"
+      - "glutton-durdir-data"
+      - "--resume-mode"
+      - "explicit"
+      - "--durdir-read-mode"
+      - "digest"
+      - "--durdir-file-size-bytes"
+      - "10485760"
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
+  - name: durdir_size_64mb_microvm
+    type: locust
+    description: "DurDir file size sweep (64 MiB) on micro-VM: 1 concurrent user, digest read mode"
+    targetCluster: dev
+    sandboxClass: microvm
+    file: /app/tests/durdir.py
+    duration: 5m
+    users: 1
+    workerCount: 1
+    flags:
+      - "--durdir-template"
+      - "glutton-durdir-data"
+      - "--resume-mode"
+      - "explicit"
+      - "--durdir-read-mode"
+      - "digest"
+      - "--durdir-file-size-bytes"
+      - "67108864"
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
   - name: durdir_size_500mb_microvm
     type: locust
     description: "DurDir file size sweep (500 MiB) on micro-VM: 1 concurrent user, digest read mode"
