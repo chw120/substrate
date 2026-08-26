@@ -125,9 +125,10 @@ one user is the configuration that isolates latency from queueing.
 **`--sandbox-class` here is what actually decides where actors run.** The
 `sandboxClass` field in `tests.yaml` only tells the orchestrator how to deploy
 workloads; it is not consulted at test time. When driving scenarios by hand,
-whatever you deployed in this step is what you measure — which is how the
-5 / 10 / 64 MiB rows of the baseline were taken on micro-VM despite those
-scenarios being gvisor entries.
+whatever you deployed in this step is what you measure, regardless of which
+scenario name you pass. So keep the two in agreement — running a `_microvm`
+scenario against a gvisor deployment will happily produce gvisor numbers under
+a micro-VM label.
 
 ## 4. Building the Locust image
 
@@ -236,15 +237,17 @@ Then:
 source .ate-dev-env.sh
 IMG="us-docker.pkg.dev/${PROJECT_ID}/gcr.io/ate-images/locust-test:latest"
 
-for t in durdir_size_5mb durdir_size_10mb durdir_size_64mb \
+for t in durdir_size_5mb_microvm durdir_size_10mb_microvm durdir_size_64mb_microvm \
          durdir_size_500mb_microvm durdir_size_1gb_microvm; do
-  python3 /tmp/run_one.py "$t" "$IMG" /tmp/results 5m
+  python3 /tmp/run_one.py "$t" "$IMG" /tmp/results
 done
 ```
 
-Drop the trailing duration argument to use the durations committed in
-`tests.yaml` (1m for the small steps, 20m and 30m for 500 MiB and 1 GiB).
-The committed durations are what you want for a quotable baseline; see
+Swap the `_microvm` suffix off the names to sweep gvisor instead, after
+redeploying the workloads with `--sandbox-class gvisor` in step 3.
+
+Passing a trailing duration (`... /tmp/results 5m`) overrides the scenario's
+own. The committed durations are what you want for a quotable baseline; see
 [Sample counts](#sample-counts).
 
 `--dest` accepts a local path or a `gs://` URL. With a local path the CSVs stay
@@ -330,13 +333,17 @@ At 1 concurrent user with a 1.0 s fixed wait, iteration rate is set by how long
 one suspend/resume cycle takes, so the same wall-clock duration yields very
 different sample counts across the sweep:
 
-| Size | 5 min yields | committed duration | expected n |
+| Size | measured rate | committed micro-VM duration | expected n |
 |---|---|---|---|
-| 5 MiB | ~100 | 1m | ~20 |
-| 10 MiB | ~100 | 1m | ~20 |
-| 64 MiB | ~54 | 1m | ~11 |
-| 500 MiB | ~12 | 20m | ~50 |
-| 1 GiB | ~11 (in 8 min) | 30m | ~60 |
+| 5 MiB | ~100 in 5m | 3m | ~60 |
+| 10 MiB | ~100 in 5m | 3m | ~60 |
+| 64 MiB | ~54 in 5m | 5m | ~54 |
+| 500 MiB | ~12 in 5m | 20m | ~50 |
+| 1 GiB | ~11 in 8m | 30m | ~60 |
+
+The micro-VM scenarios run longer than their 1m gvisor counterparts at the same
+size because a micro-VM iteration is slower — the cold-boot VMM launch is on
+every resume — so the same wall clock buys fewer samples.
 
 At n≈12 locust's p95 is just the slowest sample, and p95, p99 and p100 come out
 identical. Locust also rounds to about two significant figures, so at the 1 GiB
