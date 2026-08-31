@@ -930,3 +930,48 @@ func expectedDeploymentApplyConfig(mutatePodSpec func(*corev1ac.PodSpecApplyConf
 				WithLabels(map[string]string{"ate.dev/worker-pool": wp.Name}).
 				WithSpec(podSpecAC)))
 }
+
+// TestAteomContainerEnvArchiveFormat covers the opt-in reaching worker pods.
+// The env var is the only way to turn the erofs durable-dir format on, and
+// nothing else in the pod spec is operator-settable, so without this
+// pass-through the feature is unreachable in a real deployment.
+func TestAteomContainerEnvArchiveFormat(t *testing.T) {
+	find := func(envs []*corev1ac.EnvVarApplyConfiguration) *corev1ac.EnvVarApplyConfiguration {
+		for _, e := range envs {
+			if e.Name != nil && *e.Name == ateomArchiveFormatEnv {
+				return e
+			}
+		}
+		return nil
+	}
+
+	// Unset on the controller must mean absent on the pod: a default install
+	// keeps every worker on tar.
+	t.Run("absent by default", func(t *testing.T) {
+		t.Setenv(ateomArchiveFormatEnv, "")
+		if got := find(ateomContainerEnv(ateomOTelSettings{})); got != nil {
+			t.Errorf("%s is set on the pod with nothing set on the controller", ateomArchiveFormatEnv)
+		}
+	})
+
+	// Forwarded whether or not telemetry is configured: ateomContainerEnv
+	// returns early when there is no OTLP endpoint.
+	for _, tc := range []struct {
+		name string
+		otel ateomOTelSettings
+	}{
+		{name: "without telemetry"},
+		{name: "with telemetry", otel: ateomOTelSettings{Endpoint: "http://collector:4317"}},
+	} {
+		t.Run("forwarded "+tc.name, func(t *testing.T) {
+			t.Setenv(ateomArchiveFormatEnv, "erofs")
+			got := find(ateomContainerEnv(tc.otel))
+			if got == nil {
+				t.Fatalf("%s is not on the pod", ateomArchiveFormatEnv)
+			}
+			if got.Value == nil || *got.Value != "erofs" {
+				t.Errorf("%s = %v, want %q", ateomArchiveFormatEnv, got.Value, "erofs")
+			}
+		})
+	}
+}

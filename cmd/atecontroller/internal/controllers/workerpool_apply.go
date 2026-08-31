@@ -200,12 +200,24 @@ func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel ateomOTelSettin
 				WithSpec(podSpecAC)))
 }
 
+// ateomArchiveFormatEnv selects the format ateom writes durable-dir snapshots
+// in. It is a node-level opt-in with fleet-wide consequences — any worker may be
+// asked to restore what another wrote — so the controller forwards its own value
+// onto every worker pod it manages, making the whole pool agree by construction
+// rather than by each pod being configured separately.
+const ateomArchiveFormatEnv = "ATEOM_ARCHIVE_FORMAT"
+
 // ateomContainerEnv adds the OTLP endpoint and resource identity only when
 // telemetry is configured. POD_* refs precede OTEL_RESOURCE_ATTRIBUTES so its
 // $(POD_*) substitutions resolve.
 func ateomContainerEnv(otel ateomOTelSettings) []*corev1ac.EnvVarApplyConfiguration {
 	envs := []*corev1ac.EnvVarApplyConfiguration{
 		fieldRefEnv("POD_UID", "metadata.uid"),
+	}
+	// Only propagated when set, so a default deployment adds no env to worker
+	// pods and every node keeps writing tars.
+	if v := os.Getenv(ateomArchiveFormatEnv); v != "" {
+		envs = append(envs, corev1ac.EnvVar().WithName(ateomArchiveFormatEnv).WithValue(v))
 	}
 	if otel.Endpoint == "" {
 		return envs
