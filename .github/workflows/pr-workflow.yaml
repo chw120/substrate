@@ -45,7 +45,15 @@ jobs:
     # skip for the unprivileged runner user above; rerun the packages that
     # contain them (any test importing internal/roottest) under sudo.
     - name: root-gated tests
-      run: hack/run-root-tests.sh -race -v
+      # erofs-utils is not on the runner image. Without it the durable-dir
+      # image tests skip, which is silent: the fidelity gate would report green
+      # having checked nothing. requireErofs turns a skip into a failure when CI
+      # is set, so the two have to stay together — dropping this install breaks
+      # the job rather than quietly disarming it.
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends erofs-utils
+        hack/run-root-tests.sh -race -v
     - name: verify
       run: hack/verify-all.sh
   # One kind cluster exercises BOTH runtimes. Free x86-64 ubuntu-latest runners
