@@ -272,9 +272,9 @@ func fidelityTree(t *testing.T) (dir string, mtime time.Time) {
 	if err := unix.Mkfifo(join("vol/fifo"), 0o600); err != nil {
 		t.Fatalf("mkfifo: %v", err)
 	}
-	// A 0:0 char device is how overlayfs records a deleted file. Losing it
-	// resurrects the file on the next resume, silently.
-	if err := unix.Mknod(join("vol/whiteout"), unix.S_IFCHR|0o000, int(unix.Mkdev(0, 0))); err != nil {
+	// A 0:0 char device with no permission bits is how overlayfs records a
+	// deleted file. Losing it resurrects the file on the next resume, silently.
+	if err := unix.Mknod(join("vol/whiteout"), unix.S_IFCHR, int(unix.Mkdev(0, 0))); err != nil {
 		t.Fatalf("mknod whiteout: %v", err)
 	}
 	// A socket: skipped, like Create skips it. Agents leave these lying around

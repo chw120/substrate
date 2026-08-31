@@ -145,7 +145,7 @@ func Preflight(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("erofs preflight: %w", err)
 	}
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }() // a probe tree; leaking one is not worth failing startup over
 
 	// trusted.overlay.opaque on a directory, which is exactly what the durable
 	// overlay's whiteouts rely on, rather than a user.* attribute: the two take
