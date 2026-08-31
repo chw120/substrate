@@ -207,6 +207,28 @@ func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel ateomOTelSettin
 // rather than by each pod being configured separately.
 const ateomArchiveFormatEnv = "ATEOM_ARCHIVE_FORMAT"
 
+// ateomArchiveFormatErofs is the one value of ateomArchiveFormatEnv that costs
+// the worker its unprivileged pod; see erofsNeedsPrivilegedWorker.
+const ateomArchiveFormatErofs = "erofs"
+
+// erofsNeedsPrivilegedWorker reports whether the archive format this controller
+// propagates forces its micro-VM workers to run privileged.
+//
+// Serving a durable dir from an erofs image means loop-mounting that image in
+// the worker, and a loop device is a block device: the unprivileged worker's
+// device cgroup denies opening one. MKNOD lets the worker create /dev/loopN,
+// but the open still fails with EPERM, and no capability grants it — the
+// allow-list is not something a container can widen from inside.
+//
+// So giving up the unprivileged worker is part of the format's price, not an
+// incidental detail. Advertising a loop device through atelet's device plugin,
+// the way /dev/kvm already reaches these pods, is the fix that would buy the
+// format back without it; until that exists the opt-in carries this with it. A
+// deployment that leaves ATEOM_ARCHIVE_FORMAT unset is unaffected.
+func erofsNeedsPrivilegedWorker() bool {
+	return os.Getenv(ateomArchiveFormatEnv) == ateomArchiveFormatErofs
+}
+
 // ateomContainerEnv adds the OTLP endpoint and resource identity only when
 // telemetry is configured. POD_* refs precede OTEL_RESOURCE_ATTRIBUTES so its
 // $(POD_*) substitutions resolve.
@@ -288,8 +310,11 @@ var ateomMicroVMCapabilities = slices.Concat(ateomGvisorCapabilities, []corev1.C
 })
 
 // ateomSecurityContext returns the ateom container security context for a sandbox
-// class. Neither class runs privileged; they differ in their capability set and
-// in seccomp. An empty class defaults to gVisor.
+// class. Neither class runs privileged by default; they differ in their
+// capability set and in seccomp. An empty class defaults to gVisor. The one
+// exception is a micro-VM worker under the erofs durable-dir opt-in, which needs
+// a block device the capability set cannot reach (see
+// erofsNeedsPrivilegedWorker).
 func ateomSecurityContext(class atev1alpha1.SandboxClass) *corev1ac.SecurityContextApplyConfiguration {
 	// Both runtimes mount inside the worker — runsc pivots root and the worker
 	// remounts /sys/fs/cgroup to nest per-actor cgroups; the micro-VM worker
@@ -315,6 +340,7 @@ func ateomSecurityContext(class atev1alpha1.SandboxClass) *corev1ac.SecurityCont
 		// with its own seccomp filter and nine capabilities, cloud-hypervisor with
 		// per-thread filters.
 		return sc.
+			WithPrivileged(erofsNeedsPrivilegedWorker()).
 			WithCapabilities(corev1ac.Capabilities().
 				WithDrop("ALL").
 				WithAdd(ateomMicroVMCapabilities...)).

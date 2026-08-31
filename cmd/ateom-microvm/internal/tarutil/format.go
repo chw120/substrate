@@ -39,6 +39,14 @@ package tarutil
 // only pays off where mounting works, so the unit to roll this out by is a node
 // pool, whose nodes share a kernel and a node image, not an individual node.
 //
+// Mounting the image is also what makes the format expensive in a way that has
+// nothing to do with speed: a loop device is a block device, and an
+// unprivileged worker's device cgroup denies opening one whatever capabilities
+// it holds. So the worker pod has to run privileged for as long as the image is
+// mounted this way, which atecontroller ties to the same opt-in. Handing the
+// worker a loop device through atelet's device plugin, the way /dev/kvm already
+// arrives, would remove that; until it exists, this is part of the trade.
+//
 // Turning it off is not the mirror image, and a rollback plan that assumes it
 // is will strand actors. Clearing the variable only changes what this node
 // WRITES; every image already sitting in a snapshot store stays an image, and

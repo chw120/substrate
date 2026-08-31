@@ -369,11 +369,15 @@ func TestMicroVMDeviceRequestsPreserveTemplateResources(t *testing.T) {
 	}
 }
 
-// TestAteomSecurityContextByClass asserts no worker runs privileged: every class
-// drops ALL capabilities and adds back an explicit set. Only the micro-VM class
-// gives up the runtime's default seccomp profile, and only so virtiofsd can keep
-// its own sandbox. An empty class defaults to gVisor.
+// TestAteomSecurityContextByClass asserts no worker runs privileged by default:
+// every class drops ALL capabilities and adds back an explicit set. Only the
+// micro-VM class gives up the runtime's default seccomp profile, and only so
+// virtiofsd can keep its own sandbox. An empty class defaults to gVisor.
 func TestAteomSecurityContextByClass(t *testing.T) {
+	// The erofs opt-in is the one thing that would make this privileged, and it
+	// is read from the process environment; pin it off so a developer who has it
+	// exported does not silently pass a test asserting the opposite.
+	t.Setenv(ateomArchiveFormatEnv, "")
 	tests := []struct {
 		name     string
 		class    atev1alpha1.SandboxClass
@@ -419,6 +423,37 @@ func TestAteomSecurityContextByClass(t *testing.T) {
 			}
 			if !tt.wantSeccompUnconfined && sc.SeccompProfile != nil {
 				t.Errorf("SeccompProfile = %v, want unset so the runtime default applies", sc.SeccompProfile)
+			}
+		})
+	}
+}
+
+// TestAteomSecurityContextErofsPrivilege pins the one escalation the erofs
+// durable-dir opt-in causes. Loop-mounting the image needs a block device the
+// worker's device cgroup denies, so the micro-VM worker goes privileged — and
+// only it, and only under that value, since the escalation is the format's cost
+// and must not reach a pool that did not ask for the format.
+func TestAteomSecurityContextErofsPrivilege(t *testing.T) {
+	tests := []struct {
+		format string
+		want   bool
+	}{
+		{format: "", want: false},
+		{format: "tar", want: false},
+		{format: "erofs", want: true},
+	}
+	for _, tt := range tests {
+		t.Run("format="+tt.format, func(t *testing.T) {
+			t.Setenv(ateomArchiveFormatEnv, tt.format)
+			sc := ateomSecurityContext(atev1alpha1.SandboxClassMicroVM)
+			if sc.Privileged == nil || *sc.Privileged != tt.want {
+				t.Errorf("micro-VM Privileged = %v, want %v", sc.Privileged, tt.want)
+			}
+			// gVisor does not serve durable dirs from an image, so it never pays
+			// this whatever the pool is configured to write.
+			gvisor := ateomSecurityContext(atev1alpha1.SandboxClassGvisor)
+			if gvisor.Privileged == nil || *gvisor.Privileged {
+				t.Errorf("gVisor Privileged = %v, want false", gvisor.Privileged)
 			}
 		})
 	}
