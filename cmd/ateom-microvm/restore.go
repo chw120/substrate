@@ -125,14 +125,28 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 		}
 	}()
 
-	// Restore the durable-dir volumes before anything can observe them: for Full
+	// Land the durable-dir volumes before anything can observe them: for Full
 	// that means before the share's virtiofsd starts, for Data before the workload
 	// cold-starts. The snapshot must carry them — the actor declares the volume, and
 	// every scope captures it.
+	//
+	// "Land", not "untar": an erofs snapshot is only parked here, and becomes a
+	// directory when stageDurableVolumes mounts it further down — after the
+	// CleanupSandboxState below, which would otherwise sweep the mount straight
+	// back off. Both scopes reach that staging (Full through restoreFullScope,
+	// Data through the cold boot).
+	//
+	// Timed on its own because this is the step the image format exists to make
+	// cheap: an untar is O(data size) and an image adoption is a link. Folding it
+	// into the total would leave the change unmeasurable on the Data path, which
+	// is most of the traffic.
+	var land time.Duration
 	if hasDurableVolumes(p.containers) {
-		if err := untarDurableVolumes(durableDir, restoreDir); err != nil {
+		tLand := time.Now()
+		if err := landDurableVolumes(durableDir, restoreDir, p.actorUID); err != nil {
 			return nil, err
 		}
+		land = time.Since(tLand)
 	}
 
 	switch scope := req.GetScope(); scope {
@@ -142,7 +156,7 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 		// files, and the untar above re-materialized the ACTOR's durable-dir
 		// data, so resuming the golden guest picks up the actor's data through
 		// the durable virtio-fs share.
-		if err := s.restoreFullScope(ctx, p, restoreDir, tStart); err != nil {
+		if err := s.restoreFullScope(ctx, p, restoreDir, tStart, land); err != nil {
 			return nil, err
 		}
 	case ateompb.SnapshotScope_SNAPSHOT_SCOPE_DATA:
@@ -153,7 +167,9 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 			return nil, err
 		}
 		slog.InfoContext(ctx, "Actor restored (durable-dir volumes, cold boot)",
-			slog.String("id", p.actorUID), slog.Duration("total", time.Since(tStart)))
+			slog.String("id", p.actorUID),
+			slog.Duration("land", land),
+			slog.Duration("total", time.Since(tStart)))
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, "unsupported snapshot scope: %v", scope)
 	}
@@ -172,9 +188,9 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 // find-paths paths; start the virtiofsd serving them; rebuild the tap (the snapshot's
 // virtio-net is fd-backed → fresh net_fds); relaunch CH with --restore (OnDemand),
 // and resume. Guest RAM — the actor's in-memory state and the frozen network config —
-// comes back from the memory snapshot; the durable-dir volumes were restored by the
-// caller from their tar.
-func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, restoreDir string, tStart time.Time) (retErr error) {
+// comes back from the memory snapshot; the durable-dir volumes were landed by the
+// caller and are staged into the share with the rest of the tree below.
+func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, restoreDir string, tStart time.Time, land time.Duration) (retErr error) {
 	actorUID := p.actorUID
 
 	rr := s.resolveRuntime(p.assetPaths)
@@ -262,7 +278,6 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 	}()
 
 	tLowers := time.Now()
-	tDurable := tLowers
 
 	// Networking: rebuild the per-activation veth + tap; the snapshot's virtio-net
 	// is fd-backed, so CH needs fresh tap FDs (net_fds) on restore.
@@ -362,13 +377,19 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 	// which hid that a first (cold) restore and a later (warm) one differ by more
 	// than 5x on the same actor. upper/lowers is the host reassembling the rootfs;
 	// vm_restore is cloud-hypervisor reading guest RAM back.
+	//
+	// land is the caller's durable-dir landing, which happened inside the prep
+	// window and is subtracted back out of it so the phases still sum to total.
+	// It is the one the archive format moves: O(data size) for a tar, a link for
+	// an image. Mounting the image is not here — it is part of stageMergedRootfs,
+	// so it lands in lowers.
 	slog.InfoContext(ctx, "Actor restore phases", slog.String("id", actorUID),
-		slog.Duration("prep", tPrep.Sub(tStart)),
+		slog.Duration("land", land),
+		slog.Duration("prep", tPrep.Sub(tStart)-land),
 		slog.Duration("bundles", tBundles.Sub(tPrep)),
 		slog.Duration("upper_join", tUpper.Sub(tBundles)),
 		slog.Duration("lowers", tLowers.Sub(tUpper)),
-		slog.Duration("durable", tDurable.Sub(tLowers)),
-		slog.Duration("tap", tTap.Sub(tDurable)),
+		slog.Duration("tap", tTap.Sub(tLowers)),
 		slog.Duration("vmm_launch", tLaunch.Sub(tTap)),
 		slog.Duration("vm_restore", tVMRestore.Sub(tLaunch)),
 		slog.Duration("resume", tResume.Sub(tVMRestore)),

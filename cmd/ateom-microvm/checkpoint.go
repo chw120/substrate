@@ -140,8 +140,10 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	//     since nothing will reattach to the frozen virtio-fs lower: at restore
 	//     the actor cold-boots from the OCI image (or, under an OnGolden data
 	//     resume policy, is combined with the golden snapshot's guest state).
-	//   - Durable-dir tar (any scope, when declared): host-backed, so pausing
-	//     the write-through share makes the tar coherent.
+	//   - Durable-dir archive (any scope, when declared): host-backed, so
+	//     pausing the write-through share makes it coherent. Read from
+	//     durableArchiveDir, which is the merged overlay when the actor was
+	//     restored from an image, so the archive is self-contained either way.
 	//   - Rootfs upper tar (Full only): host-backed like the durable volumes —
 	//     the memory snapshot does not carry rootfs writes. Under Data the
 	//     workload cold-starts on restore, discarding rootfs state.
@@ -157,7 +159,7 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	if durable {
 		g.Go(func() error {
 			t := time.Now()
-			if err := tarDurableVolumes(gctx, ateompath.DurableDirVolumeMountsDir(actorUID), checkpointDir); err != nil {
+			if err := archiveDurableVolumes(gctx, durableArchiveDir(actorUID), checkpointDir); err != nil {
 				return err
 			}
 			dDurable = time.Since(t)
@@ -338,6 +340,14 @@ func (s *AteomService) teardownActor(ctx context.Context, id string, ra *running
 	// disk-backed upper. Runs after the checkpoint tar, which is already on disk.
 	if err := os.RemoveAll(rootfsUpperDir(id)); err != nil {
 		slog.WarnContext(ctx, "Failed to remove rootfs upper dir", slog.String("actorUID", id), slog.Any("err", err))
+	}
+
+	// Same for the durable-dir image and its overlay dirs, and for the same
+	// ordering reason: the sweep above dropped the mounts that were using them.
+	// Their absence is what puts the next activation back on the plain-directory
+	// path until a restore lands another image.
+	if err := resetDurableOverlayState(id); err != nil {
+		slog.WarnContext(ctx, "Failed to remove durable-dir overlay state", slog.String("actorUID", id), slog.Any("err", err))
 	}
 
 	// Detach the bundle rootfs overlays composed in buildActorContainers, so

@@ -293,6 +293,14 @@ func (s *AteomService) RunWorkload(ctx context.Context, req *ateompb.RunWorkload
 		}
 	}()
 
+	// A cold boot serves the durable-dir volumes from atelet's plain directory,
+	// so drop any image and overlay dirs a previous activation left behind (see
+	// durable.go). Here rather than in coldBootActor, which a Data-scope restore
+	// also runs — that one has just landed an image and must keep it.
+	if err := resetDurableOverlayState(p.actorUID); err != nil {
+		return nil, err
+	}
+
 	if err := s.coldBootActorRetrying(ctx, p); err != nil {
 		return nil, err
 	}
@@ -683,7 +691,7 @@ func (s *AteomService) stageMergedRootfs(ctx context.Context, rr resolvedRuntime
 		}
 	}
 	if hasDurableVolumes(containers) {
-		if err := s.stageDurableVolumes(ctx, id); err != nil {
+		if err := s.stageDurableVolumes(ctx, id, containers); err != nil {
 			return nil, fmt.Errorf("while staging durable-dir volumes: %w", err)
 		}
 	}

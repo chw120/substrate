@@ -40,6 +40,7 @@ import (
 
 	"cloud.google.com/go/compute/metadata"
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/reaper"
+	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/tarutil"
 	"github.com/agent-substrate/substrate/internal/actorlog"
 	"github.com/agent-substrate/substrate/internal/ateinterceptors"
 	"github.com/agent-substrate/substrate/internal/ateomnet"
@@ -66,7 +67,15 @@ var (
 	kataDebug     = flag.Bool("kata-debug", false, "Verbose kata-agent debugging: raise the guest agent log level and forward the guest console (incl. agent logs) into the pod logs.")
 	vmmMemReserve = flag.Int("vmm-mem-reserve-mib", vmmMemReserveMiB, "Guest RAM (MiB) held back from the pod's memory limit for the cloud-hypervisor VMM + virtiofsd, which run as host processes in the pod cgroup alongside the guest RAM. Prevents the pod OOMing when the VM is sized to the pod's memory limit.")
 	showVersion   = flag.Bool("version", false, "Print version and exit.")
-	logLevelFlag  = flag.String("log-level", "info", "Minimum log level: debug, info, warn, or error.")
+
+	// The preflight needs a loop device at process start. If a pod's /dev is not
+	// ready that early the probe fails a node that would in fact have worked, and
+	// with the default it fails every node in the pool at once. Set this false for
+	// the first rollout onto a new pool, confirm the probe passes in a real pod,
+	// then put it back.
+	archivePreflightFatal = flag.Bool("archive-preflight-fatal", true,
+		"Exit if the archive format named by ATEOM_ARCHIVE_FORMAT cannot be round-tripped on this host. False logs and continues, which lets a node write images it cannot read back.")
+	logLevelFlag = flag.String("log-level", "info", "Minimum log level: debug, info, warn, or error.")
 
 	otlpRelaySocket = flag.String("otlp-relay-socket", ateompath.AteletOTLPSocketPath(),
 		"Unix socket of atelet's OTLP relay to export telemetry through, keeping it off the pod network. Empty, or absent at startup, exports directly to OTEL_EXPORTER_OTLP_ENDPOINT instead.")
@@ -112,6 +121,16 @@ func do(ctx context.Context) error {
 		return err
 	}
 	slog.InfoContext(ctx, "ateom-microvm booting", slog.String("version", version.String()))
+
+	// Refuse to start misconfigured rather than discovering it at the first
+	// suspend, when an actor is already on this worker and cannot be checked out.
+	if err := tarutil.Preflight(ctx); err != nil {
+		if *archivePreflightFatal {
+			return err
+		}
+		slog.ErrorContext(ctx, "Archive format preflight failed; continuing anyway because -archive-preflight-fatal=false",
+			slog.Any("err", err))
+	}
 
 	const serviceName = "ateom-microvm"
 	// Export through atelet's node-local relay when it is there, so telemetry
