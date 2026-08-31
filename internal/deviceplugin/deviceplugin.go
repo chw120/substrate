@@ -30,6 +30,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -39,11 +40,13 @@ import (
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 )
 
-// deviceCount is how many allocatable units of each device are advertised.
-// These are shareable pseudo-devices, so the count means nothing except as an
-// exhaustion limit; keep it far above any max-pods-per-node setting so device
-// accounting never constrains scheduling.
-const deviceCount = 4096
+// sharedDeviceCount is how many allocatable units of a shared device are
+// advertised. A shared device is a pseudo-device any number of containers may
+// hold at once, so the count means nothing except as an exhaustion limit; keep
+// it far above any max-pods-per-node setting so device accounting never
+// constrains scheduling. An exclusive device advertises one unit per node
+// instead, because there the count is the real supply.
+const sharedDeviceCount = 4096
 
 // registerTimeout bounds a single registration attempt against kubelet.
 const registerTimeout = 30 * time.Second
@@ -54,50 +57,110 @@ const (
 	// ResourceKVM grants /dev/kvm, which the micro-VM runtime needs to create a
 	// VM (cloud-hypervisor fails with EPERM on VmCreate without it).
 	ResourceKVM = "ate.dev/kvm"
+	// ResourceLoop grants one loop device, which a micro-VM worker needs to
+	// mount a durable-dir erofs image. Unlike /dev/kvm this is an exclusive
+	// grant: a loop device backs exactly one file, so two workers handed the
+	// same one would fight over it.
+	ResourceLoop = "ate.dev/loop"
 )
 
-// SandboxDevices are the host devices a sandbox runtime needs a grant for.
-// atelet advertises whichever of these exist on its node.
+// loopDeviceGlob matches the node's loop device nodes and nothing else. The
+// digit is what keeps /dev/loop-control out: nothing needs it here, because a
+// worker mounts the device it was granted rather than asking the kernel for a
+// free one.
+const loopDeviceGlob = "loop[0-9]*"
+
+// SandboxDevices returns the host devices a sandbox runtime needs a grant for,
+// as they appear under devRoot. atelet advertises whichever of these exist on
+// its node.
 //
 // Only devices the container runtime denies by default belong here. The
 // micro-VM runtime also opens /dev/net/tun, but that is in the runtime's
 // default allow-list, so the worker gets it as an ordinary bind mount instead.
-var SandboxDevices = []HostDevice{
-	{ResourceName: ResourceKVM, Path: "/dev/kvm"},
+//
+// The loop pool is discovered rather than declared: how many nodes exist is the
+// loop module's max_loop, which differs between node images, and advertising a
+// node that is not there would let the scheduler place a worker that then
+// cannot mount anything.
+func SandboxDevices(devRoot string) []HostDevice {
+	devs := []HostDevice{
+		{ResourceName: ResourceKVM, Nodes: []string{"/dev/kvm"}, Shared: true},
+	}
+	if loops := discoverLoopDevices(devRoot); len(loops) > 0 {
+		devs = append(devs, HostDevice{ResourceName: ResourceLoop, Nodes: loops})
+	}
+	return devs
 }
 
-// HostDevice is a device node advertised to kubelet under ResourceName.
+// discoverLoopDevices lists the node's loop devices as host paths, sorted, by
+// globbing devRoot. A node whose loop module never loaded has none, and then
+// the resource is simply not advertised.
+func discoverLoopDevices(devRoot string) []string {
+	matches, err := filepath.Glob(filepath.Join(devRoot, loopDeviceGlob))
+	if err != nil {
+		// The only error Glob reports is a malformed pattern, which is a
+		// constant here.
+		return nil
+	}
+	sort.Strings(matches)
+	nodes := make([]string, 0, len(matches))
+	for _, m := range matches {
+		nodes = append(nodes, "/dev/"+filepath.Base(m))
+	}
+	return nodes
+}
+
+// HostDevice is one extended resource and the device node or nodes behind it.
 type HostDevice struct {
 	// ResourceName is the fully-qualified extended resource name pods request,
 	// e.g. "ate.dev/kvm".
 	ResourceName string
-	// Path is the device node, e.g. "/dev/kvm". It is exposed to the container
-	// at the same path.
-	Path string
+	// Nodes are the device nodes this resource covers, e.g. ["/dev/kvm"] or
+	// every /dev/loopN on the node. Each is exposed to the container at its own
+	// host path.
+	Nodes []string
+	// Shared marks a device many containers may hold at once. A shared resource
+	// has exactly one node and hands it to every claimant; an exclusive one
+	// hands out its nodes individually, so kubelet's accounting is what stops
+	// two workers getting the same device.
+	Shared bool
 }
 
-// Present reports whether the device node exists on the node as a character
-// device. devRoot is where the node's /dev is mounted for inspection, our own
-// container having a minimal /dev of its own; Allocate still reports Path,
-// which kubelet resolves on the node.
+// Present reports whether at least one of the device's nodes exists on the node
+// as a device (character or block). devRoot is where the node's /dev is mounted
+// for inspection, our own container having a minimal /dev of its own; Allocate
+// still reports the real host paths, which kubelet resolves on the node.
 func (d HostDevice) Present(devRoot string) bool {
-	fi, err := os.Stat(d.resolve(devRoot))
-	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+	return len(d.present(devRoot)) > 0
 }
 
-// resolve maps the device's host path into devRoot ("/dev/kvm" ->
+// present returns the subset of Nodes that exist under devRoot as device nodes.
+func (d HostDevice) present(devRoot string) []string {
+	out := make([]string, 0, len(d.Nodes))
+	for _, n := range d.Nodes {
+		fi, err := os.Stat(resolve(devRoot, n))
+		if err == nil && fi.Mode()&os.ModeDevice != 0 {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// resolve maps a device's host path into devRoot ("/dev/kvm" ->
 // "<devRoot>/kvm").
-func (d HostDevice) resolve(devRoot string) string {
-	return filepath.Join(devRoot, strings.TrimPrefix(d.Path, "/dev/"))
+func resolve(devRoot, node string) string {
+	return filepath.Join(devRoot, strings.TrimPrefix(node, "/dev/"))
 }
 
-// Available returns the subset of devs present on this node, looking under
-// devRoot. atelet runs on every node, so advertising a resource only where its
-// device exists keeps pods requesting it off nodes that cannot run them.
+// Available returns devs narrowed to what is actually present on this node:
+// resources with no node left are dropped, and the rest keep only the nodes
+// that exist. atelet runs on every node, so advertising a resource only where
+// its device exists keeps pods requesting it off nodes that cannot run them.
 func Available(devs []HostDevice, devRoot string) []HostDevice {
 	out := make([]HostDevice, 0, len(devs))
 	for _, d := range devs {
-		if d.Present(devRoot) {
+		if nodes := d.present(devRoot); len(nodes) > 0 {
+			d.Nodes = nodes
 			out = append(out, d)
 		}
 	}
@@ -111,26 +174,44 @@ type Plugin struct {
 	dev     HostDevice
 	socket  string
 	devices []*pluginapi.Device
+	// nodeByID maps an advertised device ID to the host path Allocate hands
+	// back. Empty for a shared device, where every ID means the same node.
+	nodeByID map[string]string
 }
 
 var _ pluginapi.DevicePluginServer = (*Plugin)(nil)
 
 // New builds a Plugin for dev. Call Run to serve it.
 func New(dev HostDevice) *Plugin {
-	devices := make([]*pluginapi.Device, 0, deviceCount)
-	for i := range deviceCount {
-		devices = append(devices, &pluginapi.Device{
-			ID:     fmt.Sprintf("%s-%d", filepath.Base(dev.Path), i),
-			Health: pluginapi.Healthy,
-		})
-	}
-	return &Plugin{
+	p := &Plugin{
 		dev: dev,
 		// One socket per resource, in the directory kubelet watches. The name is
 		// derived from the resource so two plugins never collide.
-		socket:  filepath.Join(pluginapi.DevicePluginPath, socketName(dev.ResourceName)),
-		devices: devices,
+		socket: filepath.Join(pluginapi.DevicePluginPath, socketName(dev.ResourceName)),
 	}
+	if dev.Shared {
+		// Interchangeable units of one node: the ID exists only so kubelet has
+		// something to count.
+		base := filepath.Base(dev.Nodes[0])
+		p.devices = make([]*pluginapi.Device, 0, sharedDeviceCount)
+		for i := range sharedDeviceCount {
+			p.devices = append(p.devices, &pluginapi.Device{
+				ID:     fmt.Sprintf("%s-%d", base, i),
+				Health: pluginapi.Healthy,
+			})
+		}
+		return p
+	}
+	// One unit per node, named after it, so the ID kubelet allocates is what
+	// says which node the container gets.
+	p.devices = make([]*pluginapi.Device, 0, len(dev.Nodes))
+	p.nodeByID = make(map[string]string, len(dev.Nodes))
+	for _, node := range dev.Nodes {
+		id := filepath.Base(node)
+		p.devices = append(p.devices, &pluginapi.Device{ID: id, Health: pluginapi.Healthy})
+		p.nodeByID[id] = node
+	}
+	return p
 }
 
 // socketName maps a resource name to a socket filename ("ate.dev/kvm" ->
@@ -163,7 +244,8 @@ func (p *Plugin) Run(ctx context.Context) error {
 			continue
 		}
 		slog.InfoContext(ctx, "Device plugin registered",
-			slog.String("resource", p.dev.ResourceName), slog.String("device", p.dev.Path))
+			slog.String("resource", p.dev.ResourceName),
+			slog.String("devices", strings.Join(p.dev.Nodes, ",")))
 
 		p.waitForKubeletRestart(ctx, watcher)
 		srv.Stop()
@@ -264,25 +346,52 @@ func (p *Plugin) ListAndWatch(_ *pluginapi.Empty, stream pluginapi.DevicePlugin_
 	return nil
 }
 
-// Allocate returns the device node for each requested container. Kubelet turns
+// Allocate returns the device nodes for each requested container. Kubelet turns
 // each DeviceSpec into a device node plus a matching cgroup allow, so the
-// container gets this device and no other.
+// container gets those devices and no others.
+//
+// A shared device ignores the requested IDs, which are interchangeable names
+// for one node. An exclusive device must honor them: the ID is the only thing
+// that says which node kubelet reserved for this container, and handing back a
+// different one would give two containers the same device.
 func (p *Plugin) Allocate(_ context.Context, req *pluginapi.AllocateRequest) (*pluginapi.AllocateResponse, error) {
 	resp := &pluginapi.AllocateResponse{
 		ContainerResponses: make([]*pluginapi.ContainerAllocateResponse, 0, len(req.GetContainerRequests())),
 	}
-	for range req.GetContainerRequests() {
-		resp.ContainerResponses = append(resp.ContainerResponses, &pluginapi.ContainerAllocateResponse{
-			Devices: []*pluginapi.DeviceSpec{{
-				HostPath:      p.dev.Path,
-				ContainerPath: p.dev.Path,
-				// Read/write, but not mknod: the container is handed this node,
-				// not the ability to mint new ones.
+	for _, cr := range req.GetContainerRequests() {
+		nodes, err := p.nodesFor(cr.GetDevicesIds())
+		if err != nil {
+			return nil, err
+		}
+		specs := make([]*pluginapi.DeviceSpec, 0, len(nodes))
+		for _, node := range nodes {
+			specs = append(specs, &pluginapi.DeviceSpec{
+				HostPath:      node,
+				ContainerPath: node,
+				// Read/write, but not mknod: the container is handed these
+				// nodes, not the ability to mint new ones.
 				Permissions: "rw",
-			}},
-		})
+			})
+		}
+		resp.ContainerResponses = append(resp.ContainerResponses, &pluginapi.ContainerAllocateResponse{Devices: specs})
 	}
 	return resp, nil
+}
+
+// nodesFor maps the IDs kubelet allocated to the host paths to expose.
+func (p *Plugin) nodesFor(ids []string) ([]string, error) {
+	if p.dev.Shared {
+		return p.dev.Nodes[:1], nil
+	}
+	nodes := make([]string, 0, len(ids))
+	for _, id := range ids {
+		node, ok := p.nodeByID[id]
+		if !ok {
+			return nil, fmt.Errorf("%s: no device node for allocated id %q", p.dev.ResourceName, id)
+		}
+		nodes = append(nodes, node)
+	}
+	return nodes, nil
 }
 
 // sleepCtx waits for d, returning false if ctx is cancelled first.

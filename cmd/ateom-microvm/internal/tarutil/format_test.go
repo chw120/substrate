@@ -24,10 +24,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/agent-substrate/substrate/internal/deviceplugin"
 	"github.com/agent-substrate/substrate/internal/roottest"
 	"golang.org/x/sys/unix"
 )
@@ -574,4 +576,55 @@ func loopDeviceFor(path string) (string, error) {
 		}
 	}
 	return "", nil
+}
+
+// The granted set is whatever kubelet put in this worker's /dev, and
+// /dev/loop-control must not be read as one of them: it is the interface for
+// asking the kernel for a free device, which is exactly the privilege the grant
+// exists to replace.
+func TestGrantedLoopDevicesExcludesLoopControl(t *testing.T) {
+	dev := t.TempDir()
+	for _, name := range []string{"loop0", "loop1", "loop10", "loop-control", "kvm"} {
+		if err := os.WriteFile(filepath.Join(dev, name), nil, 0o600); err != nil {
+			t.Fatalf("setup: %v", err)
+		}
+	}
+	withLoopGlob(t, filepath.Join(dev, "loop[0-9]*"))
+
+	got, err := GrantedLoopDevices()
+	if err != nil {
+		t.Fatalf("GrantedLoopDevices: %v", err)
+	}
+	want := []string{
+		filepath.Join(dev, "loop0"),
+		filepath.Join(dev, "loop1"),
+		filepath.Join(dev, "loop10"),
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("GrantedLoopDevices() = %v, want %v", got, want)
+	}
+}
+
+// A worker with no loop device must say so, naming the resource whose absence
+// explains it. The alternative is a bare mount(8) failure, which reads as a
+// broken image or an erofs-less kernel and sends the next reader to the wrong
+// place — the pod simply did not ask for the device.
+func TestMountImageWithoutAGrantNamesTheResource(t *testing.T) {
+	withLoopGlob(t, filepath.Join(t.TempDir(), "loop[0-9]*"))
+
+	err := MountImage(t.Context(), filepath.Join(t.TempDir(), "img.erofs"), filepath.Join(t.TempDir(), "mnt"))
+	if err == nil {
+		t.Fatal("MountImage with no granted loop device = nil error, want failure")
+	}
+	if !strings.Contains(err.Error(), deviceplugin.ResourceLoop) {
+		t.Errorf("error does not name %s: %v", deviceplugin.ResourceLoop, err)
+	}
+}
+
+// withLoopGlob points the granted-device lookup at a directory the test owns.
+func withLoopGlob(t *testing.T, pattern string) {
+	t.Helper()
+	prev := loopDeviceGlob
+	loopDeviceGlob = pattern
+	t.Cleanup(func() { loopDeviceGlob = prev })
 }

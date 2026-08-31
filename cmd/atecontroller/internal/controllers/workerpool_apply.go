@@ -208,24 +208,24 @@ func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel ateomOTelSettin
 const ateomArchiveFormatEnv = "ATEOM_ARCHIVE_FORMAT"
 
 // ateomArchiveFormatErofs is the one value of ateomArchiveFormatEnv that costs
-// the worker its unprivileged pod; see erofsNeedsPrivilegedWorker.
+// the worker an extra device; see erofsNeedsLoopDevice.
 const ateomArchiveFormatErofs = "erofs"
 
-// erofsNeedsPrivilegedWorker reports whether the archive format this controller
-// propagates forces its micro-VM workers to run privileged.
+// erofsNeedsLoopDevice reports whether the archive format this controller
+// propagates makes its micro-VM workers need a loop device.
 //
 // Serving a durable dir from an erofs image means loop-mounting that image in
-// the worker, and a loop device is a block device: the unprivileged worker's
-// device cgroup denies opening one. MKNOD lets the worker create /dev/loopN,
-// but the open still fails with EPERM, and no capability grants it — the
-// allow-list is not something a container can widen from inside.
+// the worker, and a loop device is a block device: the worker's device cgroup
+// denies opening one whatever capabilities it holds, because the allow-list is
+// not something a container can widen from inside. The grant comes the same way
+// /dev/kvm does — atelet advertises the node's loop devices and kubelet writes
+// the allow rule for the one it reserves — so the worker stays unprivileged.
 //
-// So giving up the unprivileged worker is part of the format's price, not an
-// incidental detail. Advertising a loop device through atelet's device plugin,
-// the way /dev/kvm already reaches these pods, is the fix that would buy the
-// format back without it; until that exists the opt-in carries this with it. A
-// deployment that leaves ATEOM_ARCHIVE_FORMAT unset is unaffected.
-func erofsNeedsPrivilegedWorker() bool {
+// The request is conditional because the grant is not free: loop devices are a
+// small fixed pool per node (max_loop, commonly 8), so a pool that asks for one
+// it never uses caps how many other workers the node can take. A deployment
+// that leaves ATEOM_ARCHIVE_FORMAT unset requests nothing.
+func erofsNeedsLoopDevice() bool {
 	return os.Getenv(ateomArchiveFormatEnv) == ateomArchiveFormatErofs
 }
 
@@ -310,11 +310,11 @@ var ateomMicroVMCapabilities = slices.Concat(ateomGvisorCapabilities, []corev1.C
 })
 
 // ateomSecurityContext returns the ateom container security context for a sandbox
-// class. Neither class runs privileged by default; they differ in their
-// capability set and in seccomp. An empty class defaults to gVisor. The one
-// exception is a micro-VM worker under the erofs durable-dir opt-in, which needs
-// a block device the capability set cannot reach (see
-// erofsNeedsPrivilegedWorker).
+// class. Neither class runs privileged, whatever else the pool is configured
+// for; they differ in their capability set and in seccomp. An empty class
+// defaults to gVisor. Devices the capability set cannot reach are requested as
+// extended resources instead (see maybeApplyMicroVMPodShape), which is why
+// nothing here has to escalate.
 func ateomSecurityContext(class atev1alpha1.SandboxClass) *corev1ac.SecurityContextApplyConfiguration {
 	// Both runtimes mount inside the worker — runsc pivots root and the worker
 	// remounts /sys/fs/cgroup to nest per-actor cgroups; the micro-VM worker
@@ -340,7 +340,6 @@ func ateomSecurityContext(class atev1alpha1.SandboxClass) *corev1ac.SecurityCont
 		// with its own seccomp filter and nine capabilities, cloud-hypervisor with
 		// per-thread filters.
 		return sc.
-			WithPrivileged(erofsNeedsPrivilegedWorker()).
 			WithCapabilities(corev1ac.Capabilities().
 				WithDrop("ALL").
 				WithAdd(ateomMicroVMCapabilities...)).
@@ -383,6 +382,16 @@ func maybeApplyMicroVMPodShape(
 	// atelet advertises it only on nodes where the device exists, so the
 	// request also keeps the pod off nodes that cannot run a micro-VM.
 	addDeviceResourceLimits(containerAC, deviceplugin.ResourceKVM)
+
+	// Serving a durable dir from an erofs image loop-mounts it, and a loop
+	// device is a block device the worker's cgroup denies just as firmly as
+	// /dev/kvm — so it arrives the same way rather than by making the pod
+	// privileged. Only under the opt-in: the node's loop devices are a small
+	// fixed pool, so requesting one a pool will never mount would shrink how
+	// many workers the node can hold (see erofsNeedsLoopDevice).
+	if erofsNeedsLoopDevice() {
+		addDeviceResourceLimits(containerAC, deviceplugin.ResourceLoop)
+	}
 
 	// The runtime also opens /dev/net/tun to build the guest's tap, but that
 	// one needs no grant: it is in the runtime's default device allow-list, so

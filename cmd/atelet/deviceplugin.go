@@ -32,8 +32,13 @@ const hostDevRoot = "/host/dev"
 
 // startDevicePlugins advertises the sandbox host devices present on this node to
 // kubelet as extended resources, in the background for the lifetime of ctx. This
-// is what lets a worker be granted /dev/kvm without running privileged. atelet
-// already runs per node, so it hosts this rather than adding a second DaemonSet.
+// is what lets a worker be granted /dev/kvm and a loop device without running
+// privileged. atelet already runs per node, so it hosts this rather than adding
+// a second DaemonSet.
+//
+// Advertising is all atelet does with these: kubelet is what writes the cgroup
+// allow rule, so atelet keeps every capability dropped and never opens a device
+// itself.
 //
 // Failures are logged, never fatal: a node that cannot advertise devices still
 // runs every sandbox class that needs none.
@@ -46,7 +51,7 @@ func startDevicePlugins(ctx context.Context) {
 		return
 	}
 
-	devices := deviceplugin.Available(deviceplugin.SandboxDevices, hostDevRoot)
+	devices := deviceplugin.Available(deviceplugin.SandboxDevices(hostDevRoot), hostDevRoot)
 	if len(devices) == 0 {
 		slog.InfoContext(ctx, "No sandbox host devices present on this node; not advertising any",
 			slog.String("devRoot", hostDevRoot))

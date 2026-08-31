@@ -374,9 +374,9 @@ func TestMicroVMDeviceRequestsPreserveTemplateResources(t *testing.T) {
 // micro-VM class gives up the runtime's default seccomp profile, and only so
 // virtiofsd can keep its own sandbox. An empty class defaults to gVisor.
 func TestAteomSecurityContextByClass(t *testing.T) {
-	// The erofs opt-in is the one thing that would make this privileged, and it
-	// is read from the process environment; pin it off so a developer who has it
-	// exported does not silently pass a test asserting the opposite.
+	// The archive format is read from the process environment and decides what
+	// else the worker asks for; pin it off so a developer who has it exported
+	// does not get a different pod shape than CI does.
 	t.Setenv(ateomArchiveFormatEnv, "")
 	tests := []struct {
 		name     string
@@ -428,32 +428,45 @@ func TestAteomSecurityContextByClass(t *testing.T) {
 	}
 }
 
-// TestAteomSecurityContextErofsPrivilege pins the one escalation the erofs
-// durable-dir opt-in causes. Loop-mounting the image needs a block device the
-// worker's device cgroup denies, so the micro-VM worker goes privileged — and
-// only it, and only under that value, since the escalation is the format's cost
-// and must not reach a pool that did not ask for the format.
-func TestAteomSecurityContextErofsPrivilege(t *testing.T) {
+// TestErofsRequestsLoopDeviceNotPrivilege pins how the erofs durable-dir opt-in
+// pays for its block device: with a device grant, never with privilege. The
+// request is conditional because the node's loop pool is small — a pool that
+// asks for one it will not mount takes capacity from the workers that would.
+func TestErofsRequestsLoopDeviceNotPrivilege(t *testing.T) {
 	tests := []struct {
-		format string
-		want   bool
+		format   string
+		wantLoop bool
 	}{
-		{format: "", want: false},
-		{format: "tar", want: false},
-		{format: "erofs", want: true},
+		{format: "", wantLoop: false},
+		{format: "tar", wantLoop: false},
+		{format: "erofs", wantLoop: true},
 	}
 	for _, tt := range tests {
 		t.Run("format="+tt.format, func(t *testing.T) {
 			t.Setenv(ateomArchiveFormatEnv, tt.format)
-			sc := ateomSecurityContext(atev1alpha1.SandboxClassMicroVM)
-			if sc.Privileged == nil || *sc.Privileged != tt.want {
-				t.Errorf("micro-VM Privileged = %v, want %v", sc.Privileged, tt.want)
+			wp := testWorkerPoolApplyConfig(nil)
+			wp.Spec.SandboxClass = atev1alpha1.SandboxClassMicroVM
+			ps := buildDeploymentApplyConfig(wp, ateomOTelSettings{}).Spec.Template.Spec
+
+			qty, ok := deviceLimit(ps.Containers[0], deviceplugin.ResourceLoop)
+			if ok != tt.wantLoop {
+				t.Errorf("%s requested = %v, want %v", deviceplugin.ResourceLoop, ok, tt.wantLoop)
 			}
-			// gVisor does not serve durable dirs from an image, so it never pays
-			// this whatever the pool is configured to write.
-			gvisor := ateomSecurityContext(atev1alpha1.SandboxClassGvisor)
-			if gvisor.Privileged == nil || *gvisor.Privileged {
-				t.Errorf("gVisor Privileged = %v, want false", gvisor.Privileged)
+			if ok && qty != "1" {
+				t.Errorf("%s limit = %q, want 1", deviceplugin.ResourceLoop, qty)
+			}
+			// The whole point of the grant: whatever the format, the worker
+			// stays unprivileged.
+			if sc := ps.Containers[0].SecurityContext; sc == nil || sc.Privileged == nil || *sc.Privileged {
+				t.Errorf("micro-VM SecurityContext = %+v, want Privileged false", sc)
+			}
+			// gVisor does not serve durable dirs from an image, so it asks for
+			// nothing whatever the pool is configured to write.
+			gwp := testWorkerPoolApplyConfig(nil)
+			gwp.Spec.SandboxClass = atev1alpha1.SandboxClassGvisor
+			gc := buildDeploymentApplyConfig(gwp, ateomOTelSettings{}).Spec.Template.Spec.Containers[0]
+			if _, ok := deviceLimit(gc, deviceplugin.ResourceLoop); ok {
+				t.Errorf("gVisor requested %s", deviceplugin.ResourceLoop)
 			}
 		})
 	}

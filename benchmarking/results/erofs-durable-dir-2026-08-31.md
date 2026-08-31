@@ -34,11 +34,12 @@ with it above 64 MiB even though the p50s agree.
 | Load | 1 concurrent user, `--resume-mode explicit`, `--durdir-read-mode digest`, 1.0 s fixed wait |
 | Snapshot store | GCS, `snapshot-substrate-test-chenyiwang-gke-dev` |
 
-The erofs arm ran the worker privileged and the tar arm did not; see
-[The pod is not free](#the-pod-is-not-free). That is not a confound introduced
-for the measurement — it is a consequence of the format, applied by
-atecontroller from the same opt-in, so each arm ran the pod its format
-requires.
+The erofs arm ran the worker privileged and the tar arm did not. That was not a
+confound introduced for the measurement — it was a consequence of the format at
+the commit measured, applied by atecontroller from the same opt-in, so each arm
+ran the pod its format required. The worker no longer escalates: the loop device
+now arrives as a device-plugin grant, which does not change what any measured
+step does. See [The pod is not free](#the-pod-is-not-free).
 
 Every run finished with zero failures except erofs at 5 MiB, which had two out
 of 489 requests; see [Failures](#failures).
@@ -167,19 +168,23 @@ until it is.
 
 ### The pod is not free
 
-Loop-mounting the image requires a **privileged worker**. A loop device is a
-block device, and the unprivileged worker's device cgroup denies opening one:
-the pod holds `MKNOD` and can create `/dev/loopN`, but `losetup` on it returns
-`EPERM`, and no capability widens that allow-list from inside a container.
+Loop-mounting the image needs a **loop device**, and a loop device is a block
+device: the worker's device cgroup denies opening one whatever capabilities the
+pod holds, because a container cannot widen that allow-list from inside.
 Measured directly on the node — the same image mounts and reads back in a
 privileged pod and fails at `losetup` in the capability-only one.
 
-That is a real cost against a worker that `main` deliberately de-privileged. It
-is scoped to the opt-in (atecontroller applies it only for the micro-VM class
-and only when the format is `erofs`), but any pool that turns the format on
-gives it up. Advertising a loop device through atelet's device plugin, the way
-`/dev/kvm` already reaches these pods, is the change that would buy the format
-back without the escalation, and it should probably land before this does.
+The runs above bought that with `privileged: true`, which is a real cost against
+a worker `main` deliberately de-privileged. It is no longer how the worker gets
+there: atelet now advertises the node's loop devices to kubelet the way it
+already advertises `/dev/kvm`, atecontroller requests one `ate.dev/loop` under
+the same opt-in, and kubelet writes the cgroup allow rule. The worker stays
+unprivileged.
+
+What remains is a per-node ceiling. Loop devices are a small fixed pool —
+`max_loop` is 8 on this node — so at most that many workers per node can serve a
+durable dir from an image at once, which is why the request is conditional on
+the format rather than unconditional.
 
 The steady-state disk cost also roughly doubles: the image stays on disk for as
 long as the actor is resident, and the overlay upper accumulates alongside it,

@@ -39,13 +39,15 @@ package tarutil
 // only pays off where mounting works, so the unit to roll this out by is a node
 // pool, whose nodes share a kernel and a node image, not an individual node.
 //
-// Mounting the image is also what makes the format expensive in a way that has
-// nothing to do with speed: a loop device is a block device, and an
-// unprivileged worker's device cgroup denies opening one whatever capabilities
-// it holds. So the worker pod has to run privileged for as long as the image is
-// mounted this way, which atecontroller ties to the same opt-in. Handing the
-// worker a loop device through atelet's device plugin, the way /dev/kvm already
-// arrives, would remove that; until it exists, this is part of the trade.
+// Mounting the image needs a loop device, and a loop device is a block device:
+// the worker's device cgroup denies opening one whatever capabilities the pod
+// holds, because the cgroup allow-list is not something a container can widen
+// from inside. The worker gets one the same way it gets /dev/kvm — atelet
+// advertises the node's loop devices to kubelet, and kubelet writes the allow
+// rule for the one it reserves. So this costs a device grant, tied to the same
+// opt-in, and not the pod's unprivileged status. Loop devices are a small fixed
+// pool per node, which is the real ceiling on how many workers per node can
+// serve a durable dir this way.
 //
 // Turning it off is not the mirror image, and a rollback plan that assumes it
 // is will strand actors. Clearing the variable only changes what this node
@@ -68,9 +70,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/reaper"
+	"github.com/agent-substrate/substrate/internal/deviceplugin"
 	"golang.org/x/sys/unix"
 )
 
@@ -352,24 +356,67 @@ func collectSockets(ctx context.Context, srcDir string) ([]string, error) {
 	return sockets, nil
 }
 
+// loopDeviceGlob matches the loop devices this process has been granted. The
+// worker's /dev holds only what the runtime and kubelet's device manager put
+// there, so whatever this matches is exactly the set atelet's device plugin
+// reserved for this container — no other worker holds them and nothing else on
+// the node will take them while we do.
+//
+// A var only so tests can point it at a directory they control; nothing
+// reassigns it in production.
+var loopDeviceGlob = "/dev/loop[0-9]*"
+
+// GrantedLoopDevices lists the loop devices this worker may use, in a stable
+// order.
+//
+// A worker mounts one image at a time, so one device is enough; more than one
+// only matters if a grant is stale (a previous mount that outlived its unmount)
+// and the first choice is busy.
+func GrantedLoopDevices() ([]string, error) {
+	devs, err := filepath.Glob(loopDeviceGlob)
+	if err != nil {
+		// Glob only errors on a malformed pattern, which is a constant here.
+		return nil, fmt.Errorf("listing loop devices: %w", err)
+	}
+	sort.Strings(devs)
+	return devs, nil
+}
+
 // MountImage mounts the erofs image at imagePath read-only at mountpoint,
 // creating the mountpoint if needed. The caller owns the unmount.
 //
-// The loop device is set up by mount(8) rather than by a separate losetup, so
-// it carries LO_FLAGS_AUTOCLEAR and is released when the mount goes away. That
-// leaves only a stray MOUNT to clean up after a crash, which the sandbox sweep
-// already handles — an explicitly allocated loop device would be ours to leak.
+// The loop device comes from the ate.dev/loop grant rather than from the
+// kernel's free-device search: a worker is not privileged, so /dev/loop-control
+// is not open to it and it may only touch the nodes kubelet put in its /dev.
+// mount(8) still sets the device up, via -o loop=<dev>, which is what keeps
+// LO_FLAGS_AUTOCLEAR on it — the device is released when the mount goes away,
+// so a crash leaves only a stray MOUNT for the sandbox sweep and never a bound
+// loop device that would be ours to leak. Loop devices are a small fixed pool
+// per node (max_loop, commonly 8), so leaking one is not a private cost.
 func MountImage(ctx context.Context, imagePath, mountpoint string) error {
 	if err := os.MkdirAll(mountpoint, 0o755); err != nil {
 		return fmt.Errorf("creating erofs mountpoint %q: %w", mountpoint, err)
 	}
-	cmd := exec.CommandContext(ctx, "mount", "-t", "erofs", "-o", "ro,loop", imagePath, mountpoint)
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	if err := reaper.Run(cmd); err != nil {
-		return fmt.Errorf("mounting erofs image %q at %q: %w (%s)", imagePath, mountpoint, err, strings.TrimSpace(stderr.String()))
+	devs, err := GrantedLoopDevices()
+	if err != nil {
+		return err
 	}
-	return nil
+	if len(devs) == 0 {
+		return fmt.Errorf("mounting erofs image %q at %q: no loop device in this worker's /dev (the pod needs a %s request)",
+			imagePath, mountpoint, deviceplugin.ResourceLoop)
+	}
+	var errs []error
+	for _, dev := range devs {
+		cmd := exec.CommandContext(ctx, "mount", "-t", "erofs", "-o", "ro,loop="+dev, imagePath, mountpoint)
+		var stderr strings.Builder
+		cmd.Stderr = &stderr
+		if err := reaper.Run(cmd); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w (%s)", dev, err, strings.TrimSpace(stderr.String())))
+			continue
+		}
+		return nil
+	}
+	return fmt.Errorf("mounting erofs image %q at %q: %w", imagePath, mountpoint, errors.Join(errs...))
 }
 
 // fsckErofs unpacks an image without mounting it. It ships in the same
