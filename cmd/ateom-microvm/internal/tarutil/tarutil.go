@@ -225,12 +225,24 @@ func copyFileInto(tw *tar.Writer, path string) error {
 // same archive — are refused rather than followed. An entry that collides with
 // an existing path replaces it ("later entry wins", standard tar semantics),
 // except that an existing directory is kept when the entry is also a directory.
+//
+// Handed an erofs image (see FormatErofs) it fails rather than extracting.
+// archive/tar treats a missing trailer as a clean EOF, so anything that is not
+// a tar otherwise extracts SHORT BUT ERROR-FREE — an empty durable-dir that
+// looks like a successful restore. The check makes that case loud.
 func Extract(tarPath, dstDir string) error {
 	f, err := os.Open(tarPath)
 	if err != nil {
 		return fmt.Errorf("opening tar %q: %w", tarPath, err)
 	}
 	defer f.Close()
+
+	switch format, err := sniffFile(f, tarPath); {
+	case err != nil:
+		return err
+	case format != FormatTar:
+		return fmt.Errorf("cannot extract %q: it is a %s archive, not a tar", tarPath, format)
+	}
 
 	root, err := os.OpenRoot(dstDir)
 	if err != nil {
