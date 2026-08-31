@@ -17,6 +17,7 @@ package ateompath
 
 import (
 	"path/filepath"
+	"strings"
 )
 
 const (
@@ -194,9 +195,35 @@ func LocalSnapshotDir(actorUID, snapshotName string) string {
 // DurableDirTarFile is the snapshot file holding the tar of a micro-VM
 // actor's durable-dir volumes (entries are <volumeName>/... relative to
 // DurableDirVolumeMountsDir). Written by ateom-microvm at checkpoint; a DATA
-// snapshot consists of this file alone, so atelet uses the name to carve the
-// durable data out of a FULL snapshot's file set.
+// snapshot written this way consists of this file alone.
 const DurableDirTarFile = "durable-dir.tar"
+
+// DurableDirChainFile is the snapshot file holding the manifest of a micro-VM
+// actor's durable-dir qcow2 backing chain, when ateom serves durable data as a
+// disk image instead of a directory (ATEOM_DURABLE_BACKEND=qcow2). It names
+// the layers, base first, and its presence is what tells a restore which of
+// the two arrangements the snapshot was written in.
+const DurableDirChainFile = "durable-dir.chain.json"
+
+// DurableDirLayerPrefix begins the filename of each qcow2 layer in that chain,
+// which continues with a four-digit sequence number and ".qcow2". Unlike the
+// tar, durable data in this arrangement is SEVERAL files — one per layer — so
+// the carve below is by predicate rather than by a single name.
+const DurableDirLayerPrefix = "durable-dir.layer-"
+
+// DurableDirSnapshotFile reports whether a snapshot file holds micro-VM
+// durable-dir data, in either arrangement.
+//
+// atelet uses it to carve the durable data out of a FULL snapshot's file set
+// when uploading a paused checkpoint as DATA: what is left after the carve is
+// exactly what a DATA restore needs and nothing else. Both writers keep to
+// this naming for that reason — a durable file that the predicate misses is
+// data silently dropped from a DATA snapshot.
+func DurableDirSnapshotFile(name string) bool {
+	return name == DurableDirTarFile ||
+		name == DurableDirChainFile ||
+		strings.HasPrefix(name, DurableDirLayerPrefix)
+}
 
 // DurableDirVolumeMountsDir is the directory where individual durable-dir
 // volumes are mounted.

@@ -171,7 +171,7 @@ func TestBuildVMConfigConsole(t *testing.T) {
 	const id = "actor-1"
 	consoleLog := kata.ConsoleLogPath(id)
 
-	cfg := buildVMConfig(id, "/vmlinux", "/rootfs.img", "", consoleLog, 256, 1, true, false)
+	cfg := buildVMConfig(id, "/vmlinux", "/rootfs.img", "", "", consoleLog, 256, 1, true, false)
 	if cfg.Console == nil || cfg.Console.Mode != "File" || cfg.Console.File != consoleLog {
 		t.Errorf("Console = %+v, want File %q", cfg.Console, consoleLog)
 	}
@@ -185,12 +185,46 @@ func TestBuildVMConfigConsole(t *testing.T) {
 		t.Errorf("cmdline = %q, must not pay for earlycon outside debug mode", cfg.Payload.Cmdline)
 	}
 
-	dbg := buildVMConfig(id, "/vmlinux", "/rootfs.img", "", consoleLog, 256, 1, true, true)
+	dbg := buildVMConfig(id, "/vmlinux", "/rootfs.img", "", "", consoleLog, 256, 1, true, true)
 	if dbg.Serial == nil || dbg.Serial.Mode != "File" || dbg.Serial.File != kata.SerialLogPath(id) {
 		t.Errorf("debug Serial = %+v, want File %q", dbg.Serial, kata.SerialLogPath(id))
 	}
 	if !strings.Contains(dbg.Payload.Cmdline, "earlycon=") {
 		t.Errorf("debug cmdline = %q, want an earlycon", dbg.Payload.Cmdline)
+	}
+}
+
+// The guest finds its durable disk by enumeration order — kata.DurableDiskDevice
+// is /dev/vdb — so the disk list's shape is load-bearing: rootfs first and
+// read-only, the durable image second and writable. It has to be Qcow2 rather
+// than Raw, or cloud-hypervisor reads the top layer as a flat disk and the
+// backing chain under it disappears.
+func TestBuildVMConfigDurableDisk(t *testing.T) {
+	const id = "actor-1"
+	const durable = "/var/lib/ateom-gvisor/actors/actor-1/durable-qcow2/durable-dir.layer-0001.qcow2"
+	consoleLog := kata.ConsoleLogPath(id)
+
+	plain := buildVMConfig(id, "/vmlinux", "/rootfs.img", "", "", consoleLog, 256, 1, true, false)
+	if len(plain.Disks) != 1 {
+		t.Errorf("without a durable image, Disks = %+v, want the rootfs alone", plain.Disks)
+	}
+
+	cfg := buildVMConfig(id, "/vmlinux", "/rootfs.img", durable, "", consoleLog, 256, 1, true, false)
+	if len(cfg.Disks) != 2 {
+		t.Fatalf("Disks = %+v, want the rootfs and the durable image", cfg.Disks)
+	}
+	if got := cfg.Disks[0]; got.Path != "/rootfs.img" || !got.Readonly {
+		t.Errorf("Disks[0] = %+v, want the read-only rootfs first", got)
+	}
+	got := cfg.Disks[1]
+	if got.Path != durable {
+		t.Errorf("Disks[1].Path = %q, want %q", got.Path, durable)
+	}
+	if got.Readonly {
+		t.Error("Disks[1] is read-only; the actor cannot write its durable data")
+	}
+	if got.ImageType != "Qcow2" {
+		t.Errorf("Disks[1].ImageType = %q, want Qcow2 so the backing chain is followed", got.ImageType)
 	}
 }
 

@@ -29,6 +29,7 @@ import (
 
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/ch"
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/kata"
+	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/qcow2"
 	"github.com/agent-substrate/substrate/internal/ateompath"
 	"github.com/agent-substrate/substrate/internal/ateomstats"
 	"github.com/agent-substrate/substrate/internal/imagecache"
@@ -114,6 +115,30 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 		return nil, fmt.Errorf("while waiting for CH api-socket: %w", err)
 	}
 
+	// A durable DISK has to be flushed by the guest, and only a RUNNING guest
+	// can run anything — so this is the one capture step that happens before the
+	// pause rather than inside it. Writes the actor issues in the window between
+	// the flush and the pause are not covered; the actor is being suspended
+	// because it is idle, and the guest's commit=1 mount bounds what a write
+	// landing in that window can leave behind.
+	//
+	// Fatal, not best-effort: what a failed flush costs is the actor's most
+	// recent writes, silently. The directory arrangement needs none of this —
+	// virtiofsd is write-through, so pausing is enough.
+	durableDisk := durable && durableQcow2Active(actorUID)
+	var dFlush time.Duration
+	if durableDisk {
+		if ra == nil || len(ra.workloadIDs) == 0 {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"actor %s serves durable-dir volumes from a disk but has no running container to flush the guest through", actorUID)
+		}
+		var err error
+		dFlush, err = flushGuestFilesystems(ctx, ra.guestAgent, ra.workloadIDs[0])
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	tPause := time.Now()
 	if err := client.Pause(ctx); err != nil {
 		return nil, fmt.Errorf("while pausing guest: %w", err)
@@ -140,8 +165,10 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	//     since nothing will reattach to the frozen virtio-fs lower: at restore
 	//     the actor cold-boots from the OCI image (or, under an OnGolden data
 	//     resume policy, is combined with the golden snapshot's guest state).
-	//   - Durable-dir tar (any scope, when declared): host-backed, so pausing
-	//     the write-through share makes the tar coherent.
+	//   - Durable-dir data (any scope, when declared): a tar of the host
+	//     directory, made coherent by pausing the write-through share — or, on
+	//     the disk arrangement, the sealed backing chain, which is metadata only
+	//     and so barely registers in the paused window at all.
 	//   - Rootfs upper tar (Full only): host-backed like the durable volumes —
 	//     the memory snapshot does not carry rootfs writes. Under Data the
 	//     workload cold-starts on restore, discarding rootfs state.
@@ -154,10 +181,17 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 			return err
 		})
 	}
+	var durableChain qcow2.Manifest
 	if durable {
 		g.Go(func() error {
 			t := time.Now()
-			if err := tarDurableVolumes(gctx, ateompath.DurableDirVolumeMountsDir(actorUID), checkpointDir); err != nil {
+			if durableDisk {
+				m, err := sealDurableQcow2(gctx, actorUID, checkpointDir)
+				if err != nil {
+					return err
+				}
+				durableChain = m
+			} else if err := tarDurableVolumes(gctx, ateompath.DurableDirVolumeMountsDir(actorUID), checkpointDir); err != nil {
 				return err
 			}
 			dDurable = time.Since(t)
@@ -198,14 +232,33 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	dTeardown := time.Since(tTeardown)
 
 	s.actorLogger.EmitLifecycleLog(ctx, "Actor checkpointed", attribution)
-	slog.InfoContext(ctx, "Actor checkpointed", slog.String("id", actorUID), slog.Any("snapshot_files", snapshotFiles),
-		slog.String("scope", scope.String()), slog.Duration("pause", dPause),
+	attrs := []slog.Attr{
+		slog.String("id", actorUID), slog.Any("snapshot_files", snapshotFiles),
+		slog.String("scope", scope.String()),
+		// The guest flush precedes the pause and so adds to suspend latency
+		// outright, where everything after it is inside the paused window. It is
+		// logged next to the memory snapshot because that is what it competes
+		// with: a flush that costs more than the snapshot it saved would undo
+		// the point of the arrangement.
+		slog.Duration("guest_flush", dFlush),
+		slog.Duration("pause", dPause),
 		slog.Duration("snapshot", dSnapshot),
-		// The tars run while the guest is paused, CONCURRENTLY with the CH
-		// snapshot: the paused window costs max(snapshot, durable_dir,
-		// rootfs_upper), and the tar durations scale with the actor's data.
+		// The durable + upper captures run while the guest is paused,
+		// CONCURRENTLY with the CH snapshot: the paused window costs
+		// max(snapshot, durable_dir, rootfs_upper). The tar durations scale with
+		// the actor's data; sealing a chain does not.
 		slog.Duration("durable_dir", dDurable), slog.Duration("rootfs_upper", dUpper),
-		slog.Duration("teardown", dTeardown))
+		slog.Duration("teardown", dTeardown),
+	}
+	if durableDisk {
+		// Per-layer bytes, so the part a delta-aware upload could skip is
+		// visible: today atelet ships the whole chain every time.
+		attrs = append(attrs,
+			slog.Int("durable_layers", len(durableChain.Layers)),
+			slog.Int64("durable_bytes", durableChain.TotalBytes()),
+			slog.Int64("durable_top_bytes", topLayerBytes(durableChain)))
+	}
+	slog.LogAttrs(ctx, slog.LevelInfo, "Actor checkpointed", attrs...)
 	return &ateompb.CheckpointWorkloadResponse{SnapshotFiles: snapshotFiles}, nil
 }
 

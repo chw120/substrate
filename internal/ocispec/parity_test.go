@@ -123,6 +123,30 @@ func TestShapeMicroVM_TranslatesSourcesIntoTheShare(t *testing.T) {
 	}
 }
 
+// With a durable disk, the durable volumes come from the filesystem the guest
+// mounted on it rather than from the share — nothing is served over virtio-fs
+// for them, so a bind still pointing into the share would find an empty
+// directory. Every other volume is host-assembled and reaches the guest the
+// same way either way.
+func TestShapeMicroVM_DurableDiskRoutesOffTheShare(t *testing.T) {
+	spec := Build(parityOptions)
+	if err := ShapeMicroVM(spec, MicroVMOptions{ActorUID: testActorUID, ContainerID: "app", DurableDisk: true}); err != nil {
+		t.Fatalf("ShapeMicroVM() = %v", err)
+	}
+	if got, want := mountFor(t, spec, "/var/data").Source, GuestDurableDir+"/data"; got != want {
+		t.Errorf("/var/data source = %q, want %q", got, want)
+	}
+	for _, tc := range []struct{ dest, wantSource string }{
+		{"/run/ate", GuestSharedDir + "/" + ShareSystemInfo + "/sysinfo"},
+		{"/mnt/csi", GuestSharedDir + "/" + ShareCSI + "/csi"},
+		{"/ate", GuestSharedDir + "/app/" + ShareVolumes + "/agent"},
+	} {
+		if got := mountFor(t, spec, tc.dest).Source; got != tc.wantSource {
+			t.Errorf("%s source = %q, want %q", tc.dest, got, tc.wantSource)
+		}
+	}
+}
+
 // ShapeMicroVM errors on a bind that is not staged into the share.
 func TestShapeMicroVM_UnstagedSourceIsAnError(t *testing.T) {
 	spec := Build(Options{ActorUID: testActorUID, ContainerName: "app", Args: []string{"/app"}})

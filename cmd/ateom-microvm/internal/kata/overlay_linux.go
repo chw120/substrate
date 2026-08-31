@@ -349,14 +349,14 @@ func ReconstructSharedDirFromImage(ctx context.Context, bundleRootfs, restoreID,
 	return nil
 }
 
-type CreateSandboxOpts struct {
-	SandboxID string
-	Hostname  string
-}
-
 // CreateSandboxForActor creates the guest sandbox with the kataShared virtio-fs mount
-// (the merged rootfs trees, durable volumes, CSI volumes, and system-info
-// volumes every container runs on). Mirrors kata startSandbox.
+// (the merged rootfs trees, CSI volumes, and system-info volumes every
+// container runs on), plus — when the actor's durable data is a disk rather
+// than a share — the ext4 on that disk. Mirrors kata startSandbox.
+//
+// Storage order is the mount order, and the durable disk goes last: it is
+// mounted outside the share, so nothing about it depends on the share being
+// there, while a failure to mount it must not take the share down with it.
 func (a *AgentClient) CreateSandboxForActor(ctx context.Context, opts CreateSandboxOpts) error {
 	storages := []*agentpb.Storage{{
 		Driver:     virtioFSDriver,
@@ -364,6 +364,9 @@ func (a *AgentClient) CreateSandboxForActor(ctx context.Context, opts CreateSand
 		Fstype:     typeVirtioFS,
 		MountPoint: guestSharedDir,
 	}}
+	if opts.DurableDisk {
+		storages = append(storages, durableDiskStorage())
+	}
 	return a.CreateSandbox(ctx, &agentpb.CreateSandboxRequest{
 		Hostname:  opts.Hostname,
 		SandboxId: opts.SandboxID,

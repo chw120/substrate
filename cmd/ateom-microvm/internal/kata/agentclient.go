@@ -229,6 +229,43 @@ func (a *AgentClient) WaitProcess(ctx context.Context, containerID, execID strin
 	return resp.GetStatus(), nil
 }
 
+// ExecProcess starts an additional process inside an already-running
+// container, identified for later Wait/Signal calls by execID. Mirrors
+// grpc.AgentService/ExecProcess (returns google.protobuf.Empty).
+func (a *AgentClient) ExecProcess(ctx context.Context, containerID, execID string, process *agentpb.Process) error {
+	req := &agentpb.ExecProcessRequest{ContainerId: containerID, ExecId: execID, Process: process}
+	if err := a.client.Call(ctx, "grpc.AgentService", "ExecProcess", req, &emptypb.Empty{}); err != nil {
+		return fmt.Errorf("agent ExecProcess: %w", err)
+	}
+	return nil
+}
+
+// RunToCompletion execs argv in a running container and blocks until it exits,
+// failing on a non-zero status.
+//
+// No stdio is wired up: the agent buffers a stream per exec id and nothing
+// reads these, so the process must be one whose output does not matter. It is
+// meant for asking the guest to DO something — flush its filesystems before a
+// suspend — rather than for collecting an answer.
+//
+// The binary comes from the container's own rootfs, so what argv can name is
+// whatever the actor's image happens to ship. A caller that needs this to work
+// on any image cannot rely on it, and has to treat "no such file" as a
+// possible outcome rather than a bug.
+func (a *AgentClient) RunToCompletion(ctx context.Context, containerID, execID string, argv []string) error {
+	if err := a.ExecProcess(ctx, containerID, execID, &agentpb.Process{Args: argv, Cwd: "/"}); err != nil {
+		return err
+	}
+	status, err := a.WaitProcess(ctx, containerID, execID)
+	if err != nil {
+		return err
+	}
+	if status != 0 {
+		return fmt.Errorf("%v in container %q exited %d", argv, containerID, status)
+	}
+	return nil
+}
+
 // ReadStdout reads up to max bytes from the container process's stdout. It is a
 // unary RPC (NOT a server stream): each call returns whatever bytes the agent has
 // buffered (up to max), so callers loop until it returns an error — the agent

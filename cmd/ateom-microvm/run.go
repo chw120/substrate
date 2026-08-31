@@ -318,6 +318,10 @@ type actorBootParams struct {
 	// memory); a container's own cgroup limit comes from its declared resources.
 	// Zero fields keep the kata defaults.
 	size sizing.SandboxSize
+	// durableRestored says the actor's durable-dir data was already
+	// materialized from a snapshot, so the boot must serve it in whichever
+	// arrangement the snapshot was written in rather than choosing one.
+	durableRestored bool
 }
 
 // actorAttribution regroups the actor fields that arrived on the Run/Restore
@@ -441,9 +445,18 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 		return err
 	}
 
+	// Settle which arrangement serves the actor's durable-dir volumes before
+	// anything that depends on it: the container specs' bind sources, the VM's
+	// disk list, the share staging, and the agent's sandbox storages all have to
+	// agree, and only this decides.
+	durableDisk, err := prepareDurableVolumes(ctx, p)
+	if err != nil {
+		return err
+	}
+
 	// Prepare each container's OCI spec + record its bundle rootfs (the overlay
 	// lower the host merges under the container's writable upper).
-	ctrs, err := s.buildActorContainers(actorUID, containers)
+	ctrs, err := s.buildActorContainers(actorUID, containers, durableDisk)
 	if err != nil {
 		return err
 	}
@@ -477,7 +490,7 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 	// host upper, mounted into the shared dir) + durable-dir and CSI volumes (if any),
 	// and start the ONE virtiofsd that serves them all. CH connects to it at vm.create
 	// and demand-pages for the actor's lifetime, so ateom owns the process (killed in teardownActor).
-	vfsdCmd, err := s.stageMergedRootfs(ctx, rr, actorUID, ctrs, containers)
+	vfsdCmd, err := s.stageMergedRootfs(ctx, rr, actorUID, ctrs, containers, durableDisk)
 	if err != nil {
 		return err
 	}
@@ -507,11 +520,19 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 	}()
 
 	// Assemble the CH VmConfig (kata-compatible cmdline, RO kata image on /dev/vda +
-	// the virtio-fs device; no actor virtio-blk disks — rootfs writes land in the
-	// host-side overlay upper through the shared mount). The console log is also read
-	// on a failed agent dial below, so keep it here.
+	// the virtio-fs device; rootfs writes land in the host-side overlay upper through
+	// the shared mount, so the only other disk an actor can have is its durable-dir
+	// image). The console log is also read on a failed agent dial below, so keep it
+	// here.
 	consoleLog := kata.ConsoleLogPath(actorUID)
-	vmCfg := buildVMConfig(actorUID, kernel, image, kparams, consoleLog, memMiB, vcpus,
+	var durableImage string
+	if durableDisk {
+		durableImage, _, err = durableQcow2Top(actorUID)
+		if err != nil {
+			return err
+		}
+	}
+	vmCfg := buildVMConfig(actorUID, kernel, image, durableImage, kparams, consoleLog, memMiB, vcpus,
 		agentInit(ctx, client.Info()), s.kataDebug)
 	if err := client.CreateVM(ctx, vmCfg); err != nil {
 		return fmt.Errorf("while creating VM: %w", err)
@@ -569,7 +590,7 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 	}()
 
 	// Post-boot kata-agent setup: sandbox, guest networking, start each container.
-	if err := s.startActorContainers(ctx, ac, actorUID, vsockPath, ctrs); err != nil {
+	if err := s.startActorContainers(ctx, ac, actorUID, vsockPath, ctrs, durableDisk); err != nil {
 		return err
 	}
 	tContainers := time.Now()
@@ -620,7 +641,11 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 // and records the bundle rootfs that backs the overlay's RO lower. No host disk is
 // mounted here — the merged overlays are assembled in stageMergedRootfs after the
 // sandbox state is clean. Both RunWorkload and RestoreWorkload go through here.
-func (s *AteomService) buildActorContainers(actorUID string, containers []*ateompb.Container) ([]actorContainer, error) {
+//
+// durableDisk says the actor's durable-dir volumes reach the guest on a block
+// device rather than through the share, which changes where the shaped specs'
+// binds point (see ocispec.MicroVMOptions).
+func (s *AteomService) buildActorContainers(actorUID string, containers []*ateompb.Container, durableDisk bool) ([]actorContainer, error) {
 	ctrs := make([]actorContainer, len(containers))
 	for i, c := range containers {
 		cn := c.GetName()
@@ -629,7 +654,7 @@ func (s *AteomService) buildActorContainers(actorUID string, containers []*ateom
 		if err != nil {
 			return nil, fmt.Errorf("while reading the OCI spec for %q: %w", cn, err)
 		}
-		if err := ocispec.ShapeMicroVM(spec, ocispec.MicroVMOptions{ActorUID: actorUID, ContainerID: cn}); err != nil {
+		if err := ocispec.ShapeMicroVM(spec, ocispec.MicroVMOptions{ActorUID: actorUID, ContainerID: cn, DurableDisk: durableDisk}); err != nil {
 			return nil, fmt.Errorf("while shaping the OCI spec for %q: %w", cn, err)
 		}
 		// Compose the bundle rootfs from the node's cached image layers (an
@@ -669,7 +694,7 @@ func (s *AteomService) buildActorContainers(actorUID string, containers []*ateom
 // upper contents). The returned virtiofsd cmd outlives this call (CH
 // demand-pages from it); the caller owns it (tracked on runningActor, killed
 // in teardownActor).
-func (s *AteomService) stageMergedRootfs(ctx context.Context, rr resolvedRuntime, id string, ctrs []actorContainer, containers []*ateompb.Container) (*exec.Cmd, error) {
+func (s *AteomService) stageMergedRootfs(ctx context.Context, rr resolvedRuntime, id string, ctrs []actorContainer, containers []*ateompb.Container, durableDisk bool) (*exec.Cmd, error) {
 	upperBase := rootfsUpperDir(id)
 	for _, c := range ctrs {
 		if err := kata.StageMergedRootfs(ctx, c.bundleRootfs, upperBase, id, c.name); err != nil {
@@ -682,7 +707,10 @@ func (s *AteomService) stageMergedRootfs(ctx context.Context, rr resolvedRuntime
 			}
 		}
 	}
-	if hasDurableVolumes(containers) {
+	// Nothing to stage for a durable DISK: the volumes live inside a filesystem
+	// the guest mounts itself, and virtiofsd must not be serving a second view
+	// of them.
+	if hasDurableVolumes(containers) && !durableDisk {
 		if err := s.stageDurableVolumes(ctx, id); err != nil {
 			return nil, fmt.Errorf("while staging durable-dir volumes: %w", err)
 		}
@@ -781,8 +809,9 @@ func initParams(agentInit bool) string {
 
 // buildVMConfig assembles the cloud-hypervisor VmConfig. The console is arch-specific:
 // ttyAMA0 on arm64, ttyS0 on amd64. /dev/vda is the RO guest image; the actor rootfs's RO
-// lower is the virtio-fs device on PCI segment 1 (hence num_pci_segments=2), with no
-// actor disks.
+// lower is the virtio-fs device on PCI segment 1 (hence num_pci_segments=2). A non-empty
+// durableImage adds the actor's durable-dir qcow2 as a second disk; the rootfs never has
+// one.
 //
 // init=kataAgentPath boots the kata agent as PID 1 instead of systemd. The agent detects
 // that it is PID 1 and does the init work itself: it mounts /proc, /sys, devtmpfs /dev,
@@ -809,7 +838,7 @@ func initParams(agentInit bool) string {
 // the earliest messages: hvc0 only exists once virtio-console probes, so the memory
 // map, CPU features and ACPI lines never reach the log. kataDebug adds the UART back
 // with earlycon (and pays the ~800ms) for diagnosing a guest that dies before then.
-func buildVMConfig(id, kernel, image, kparams, consoleLog string, memMiB, vcpus int, agentInit, debug bool) ch.VmConfig {
+func buildVMConfig(id, kernel, image, durableImage, kparams, consoleLog string, memMiB, vcpus int, agentInit, debug bool) ch.VmConfig {
 	cmdline := "root=/dev/vda1 rootflags=data=ordered,errors=remount-ro ro rootfstype=ext4 " +
 		"panic=1 no_timer_check noreplace-smp console=hvc0 " +
 		initParams(agentInit)
@@ -821,13 +850,24 @@ func buildVMConfig(id, kernel, image, kparams, consoleLog string, memMiB, vcpus 
 		cmdline += " " + earlyconParam()
 		serial = &ch.ConsoleConfig{Mode: "File", File: kata.SerialLogPath(id)}
 	}
+	disks := []ch.DiskConfig{
+		{Path: image, Readonly: true, ImageType: "Raw", NumQueues: int32(vcpus), QueueSize: 1024},
+	}
+	if durableImage != "" {
+		// The actor's durable-dir image, writable, as /dev/vdb (see
+		// kata.DurableDiskDevice — the guest finds it by enumeration order, so
+		// this must stay second). Qcow2 rather than Raw: the image is the top of
+		// a backing chain, and CH has to follow the header's backing pointers
+		// rather than read the file as a flat disk.
+		disks = append(disks, ch.DiskConfig{
+			Path: durableImage, ImageType: "Qcow2", NumQueues: int32(vcpus), QueueSize: 1024,
+		})
+	}
 	return ch.VmConfig{
-		Cpus:    ch.CpusConfig{BootVcpus: int32(vcpus), MaxVcpus: int32(vcpus)},
-		Memory:  ch.MemoryConfig{Size: int64(memMiB) * 1024 * 1024, Shared: true},
-		Payload: ch.PayloadConfig{Kernel: kernel, Cmdline: cmdline},
-		Disks: []ch.DiskConfig{
-			{Path: image, Readonly: true, ImageType: "Raw", NumQueues: int32(vcpus), QueueSize: 1024},
-		},
+		Cpus:     ch.CpusConfig{BootVcpus: int32(vcpus), MaxVcpus: int32(vcpus)},
+		Memory:   ch.MemoryConfig{Size: int64(memMiB) * 1024 * 1024, Shared: true},
+		Payload:  ch.PayloadConfig{Kernel: kernel, Cmdline: cmdline},
+		Disks:    disks,
 		Fs:       buildFsConfigs(id),
 		Platform: &ch.PlatformConfig{NumPciSegments: 2},
 		Rng:      &ch.RngConfig{Src: "/dev/urandom"},
@@ -861,15 +901,17 @@ func buildFsConfigs(id string) []ch.FsConfig {
 // does at boot: establish the sandbox once (mounting the kataShared virtio-fs base),
 // configure guest networking (eth0 IP/MAC/MTU + routes) once, then start each
 // container on its own overlay rootfs. On failure it dumps guest diagnostics.
-func (s *AteomService) startActorContainers(ctx context.Context, ac *kata.AgentClient, id, vsockPath string, ctrs []actorContainer) error {
+func (s *AteomService) startActorContainers(ctx context.Context, ac *kata.AgentClient, id, vsockPath string, ctrs []actorContainer, durableDisk bool) error {
 	// Establish the agent sandbox + the kataShared virtio-fs mount (every
 	// container's merged rootfs, durable volumes, CSI volumes, and system-info
-	// volumes). All containers share it, so use the first container's hostname.
+	// volumes) and, with durableDisk, the guest's own mount of the durable-dir
+	// image. All containers share it, so use the first container's hostname.
 	tStart := time.Now()
 	sbCtx, sbCancel := context.WithTimeout(ctx, 20*time.Second)
 	err := ac.CreateSandboxForActor(sbCtx, kata.CreateSandboxOpts{
-		SandboxID: id,
-		Hostname:  ctrs[0].spec.Hostname,
+		SandboxID:   id,
+		Hostname:    ctrs[0].spec.Hostname,
+		DurableDisk: durableDisk,
 	})
 	sbCancel()
 	if err != nil {

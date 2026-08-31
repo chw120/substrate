@@ -914,18 +914,25 @@ func (s *AteomHerder) uploadLocalCheckpointDir(ctx context.Context, req *ateletp
 }
 
 // narrowFullCaptureToData rewrites rec so a FULL capture uploads as a DATA
-// snapshot. Each sandbox class owns one branch: micro-VM durable data is a
-// self-contained tar that can be carved out of the full file set; gVisor's
-// full checkpoint is monolithic until split checkpoints land.
+// snapshot. Each sandbox class owns one branch: micro-VM durable data is
+// self-contained and can be carved out of the full file set; gVisor's full
+// checkpoint is monolithic until split checkpoints land.
 func narrowFullCaptureToData(rec *sandboxAssetsRecord) error {
 	switch atev1alpha1.SandboxClass(rec.SandboxClass) {
 	case atev1alpha1.SandboxClassMicroVM:
-		if !slices.Contains(rec.SnapshotFiles, ateompath.DurableDirTarFile) {
+		// Durable data is one tar, or — when ateom serves it from a qcow2
+		// image — a chain manifest plus one file per layer. Both name
+		// themselves so the carve is a filter rather than a fixed name; see
+		// ateompath.DurableDirSnapshotFile.
+		durable := slices.DeleteFunc(slices.Clone(rec.SnapshotFiles), func(f string) bool {
+			return !ateompath.DurableDirSnapshotFile(f)
+		})
+		if len(durable) == 0 {
 			// No durable-dir volumes were attached at pause: this snapshot
 			// holds no data, and never will — not retryable.
-			return status.Errorf(codes.FailedPrecondition, "full micro-VM capture has no %s; the actor has no durable data to upload as %s", ateompath.DurableDirTarFile, ateattr.SnapshotScopeData)
+			return status.Errorf(codes.FailedPrecondition, "full micro-VM capture has no durable-dir data (no %s and no %s); the actor has no durable data to upload as %s", ateompath.DurableDirTarFile, ateompath.DurableDirChainFile, ateattr.SnapshotScopeData)
 		}
-		rec.SnapshotFiles = []string{ateompath.DurableDirTarFile}
+		rec.SnapshotFiles = durable
 		rec.Scope = ateattr.SnapshotScopeData
 		return nil
 

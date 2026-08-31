@@ -34,6 +34,10 @@ package main
 // virtiofsd serves the share write-through (no --writeback), so once the guest
 // is paused every completed guest write is already visible on the host and the
 // tar is complete.
+//
+// durableqcow2.go implements a second arrangement, which hands the guest a
+// disk image instead. prepareDurableVolumes and restoreDurableVolumes below are
+// where an activation ends up on one or the other.
 
 import (
 	"context"
@@ -42,6 +46,7 @@ import (
 	"path/filepath"
 
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/kata"
+	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/qcow2"
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/tarutil"
 	"github.com/agent-substrate/substrate/internal/ateompath"
 	"github.com/agent-substrate/substrate/internal/ocispec"
@@ -63,6 +68,55 @@ func hasDurableVolumes(containers []*ateompb.Container) bool {
 		}
 	}
 	return false
+}
+
+// prepareDurableVolumes settles which arrangement serves this boot's durable-dir
+// volumes, doing whatever setup that arrangement needs, and reports whether it is
+// the disk one.
+//
+// The order of the cases is the policy. An arrangement that already exists wins
+// over the node's setting, because converting between them means rewriting the
+// actor's data and there is no boot at which that is the right thing to do
+// quietly. Only an actor with nothing yet — a cold boot that is not a restore —
+// is placed by the setting.
+func prepareDurableVolumes(ctx context.Context, p actorBootParams) (bool, error) {
+	switch {
+	case !hasDurableVolumes(p.containers):
+		return false, nil
+	case durableQcow2Active(p.actorUID):
+		// A restore landed a chain, or a retried boot already built one.
+		return true, nil
+	case p.durableRestored:
+		// A tar snapshot was extracted into the host directory. Building a
+		// chain now would hand the guest an empty one and strand that data.
+		return false, nil
+	case qcow2.Enabled():
+		if err := initDurableQcow2(ctx, p.actorUID); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+// restoreDurableVolumes re-materializes the actor's durable-dir data from a
+// snapshot that atelet has downloaded into snapshotDir. It must run before
+// anything can observe the data: for Full before the share's virtiofsd starts
+// and before the VM is created, for Data before the workload cold-starts.
+//
+// Which arrangement to restore into is read off the snapshot rather than the
+// node's setting — a chain manifest means a chain, anything else means the tar
+// — so an actor keeps working when it lands on a node configured the other way.
+func restoreDurableVolumes(ctx context.Context, actorUID, durableDir, snapshotDir string) error {
+	if _, err := os.Stat(filepath.Join(snapshotDir, ateompath.DurableDirChainFile)); err == nil {
+		return landDurableQcow2(ctx, actorUID, snapshotDir)
+	}
+	// Drop any chain a previous activation of this actor left on the node, so
+	// the extracted directory is unambiguously what this boot serves.
+	if err := resetDurableQcow2State(actorUID); err != nil {
+		return err
+	}
+	return untarDurableVolumes(durableDir, snapshotDir)
 }
 
 // stageDurableVolumes bind-mounts the actor's host durable-dir directory

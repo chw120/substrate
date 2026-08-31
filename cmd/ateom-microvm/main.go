@@ -39,6 +39,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/compute/metadata"
+	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/qcow2"
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/reaper"
 	"github.com/agent-substrate/substrate/internal/actorlog"
 	"github.com/agent-substrate/substrate/internal/ateinterceptors"
@@ -164,6 +165,20 @@ func do(ctx context.Context) error {
 	// under their own wait (which would surface as "waitid: no child processes").
 	reaper.Start()
 	slog.InfoContext(ctx, "Child process reaper launched")
+
+	// If this node is configured to serve durable-dir volumes from qcow2 images,
+	// prove the tools that build them work HERE, before an actor depends on
+	// them. A no-op when the backend is off.
+	//
+	// Fatal on failure rather than falling back to the directory arrangement: a
+	// node that quietly serves the other arrangement produces actors whose
+	// snapshots are the other format, which is a rollout that has half converted
+	// itself and no signal that anything went wrong. Refusing to start is the
+	// loud version, and it happens before the ateom accepts any actor.
+	if err := qcow2.Preflight(ctx); err != nil {
+		return fmt.Errorf("while checking durable-dir qcow2 support (%s=%s): %w",
+			qcow2.BackendEnvVar, qcow2.BackendQcow2, err)
+	}
 
 	// kata's virtio-fs sharing depends on mount propagation: it slave-binds
 	// .../shared (served by virtiofsd) from .../mounts and expects the later

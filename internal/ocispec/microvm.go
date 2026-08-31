@@ -24,6 +24,15 @@ import (
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
+// GuestDurableDir is where the kata agent mounts the actor's durable-dir DISK
+// in the guest, when durable data is served as a qcow2 image rather than
+// through the share. Each volume is a top-level directory beneath it, so the
+// tree matches the one under ShareDurable and only its origin differs.
+//
+// Deliberately not under GuestSharedDir: virtiofsd owns that subtree on the
+// host and would be serving a mount it knows nothing about.
+const GuestDurableDir = "/run/kata-containers/durable"
+
 // Sub-share names inside the micro-VM virtio-fs share.
 const (
 	// GuestSharedDir is where the kata agent mounts the share in the guest.
@@ -41,6 +50,11 @@ const (
 type MicroVMOptions struct {
 	ActorUID    string
 	ContainerID string
+	// DurableDisk says the actor's durable-dir volumes reach the guest as a
+	// mounted disk at GuestDurableDir rather than through the share. It
+	// changes only where the container's binds point; the per-volume layout
+	// beneath is the same either way.
+	DurableDisk bool
 }
 
 // ShapeMicroVM replaces host system mounts with guest mounts, repoints volume
@@ -54,7 +68,7 @@ func ShapeMicroVM(spec *specs.Spec, o MicroVMOptions) error {
 		if m.Type != "bind" {
 			continue
 		}
-		src, err := guestVolumeSource(m.Source, o.ActorUID, o.ContainerID)
+		src, err := guestVolumeSource(m.Source, o)
 		if err != nil {
 			return fmt.Errorf("mount %q: %w", m.Destination, err)
 		}
@@ -108,9 +122,18 @@ func mergeKataResources(from *specs.LinuxResources) *specs.LinuxResources {
 }
 
 // guestVolumeSource maps a volume's host directory to its guest path.
-func guestVolumeSource(hostPath, actorUID, containerID string) (string, error) {
+func guestVolumeSource(hostPath string, o MicroVMOptions) (string, error) {
+	actorUID, containerID := o.ActorUID, o.ContainerID
+	// Durable volumes are the one entry whose guest side is not fixed: with a
+	// durable disk they come from the filesystem the guest mounted on it, and
+	// otherwise from the share. Everything else is host-assembled and reaches
+	// the guest through virtio-fs whatever durable data is doing.
+	durable := path.Join(GuestSharedDir, ShareDurable)
+	if o.DurableDisk {
+		durable = GuestDurableDir
+	}
 	for _, staged := range []struct{ host, guest string }{
-		{ateompath.DurableDirVolumeMountsDir(actorUID), path.Join(GuestSharedDir, ShareDurable)},
+		{ateompath.DurableDirVolumeMountsDir(actorUID), durable},
 		{ateompath.VolumesDir(actorUID), path.Join(GuestSharedDir, ShareCSI)},
 		{ateompath.SystemInfoVolumeRootsDir(actorUID), path.Join(GuestSharedDir, ShareSystemInfo)},
 		{ateompath.ImageVolumeMountPath(actorUID, containerID, ""), path.Join(GuestSharedDir, containerID, ShareVolumes)},

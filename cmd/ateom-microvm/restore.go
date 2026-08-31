@@ -108,7 +108,6 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 		size:          sizing.FromLimits(req.GetCpuMilli(), req.GetMemoryBytes()),
 	}
 	restoreDir := ateompath.RestoreStateDir(p.actorUID)
-	durableDir := ateompath.DurableDirVolumeMountsDir(p.actorUID)
 	tStart := time.Now()
 
 	attribution := p.actorAttribution()
@@ -126,13 +125,15 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	}()
 
 	// Restore the durable-dir volumes before anything can observe them: for Full
-	// that means before the share's virtiofsd starts, for Data before the workload
-	// cold-starts. The snapshot must carry them — the actor declares the volume, and
-	// every scope captures it.
+	// that means before the share's virtiofsd starts and before the VM is
+	// created, for Data before the workload cold-starts. The snapshot must carry
+	// them — the actor declares the volume, and every scope captures it.
 	if hasDurableVolumes(p.containers) {
-		if err := untarDurableVolumes(durableDir, restoreDir); err != nil {
+		durableDir := ateompath.DurableDirVolumeMountsDir(p.actorUID)
+		if err := restoreDurableVolumes(ctx, p.actorUID, durableDir, restoreDir); err != nil {
 			return nil, err
 		}
+		p.durableRestored = true
 	}
 
 	switch scope := req.GetScope(); scope {
@@ -236,7 +237,11 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 	if len(containers) > maxActorContainers {
 		return status.Errorf(codes.Unimplemented, "ateom-microvm supports at most %d containers, got %d", maxActorContainers, len(containers))
 	}
-	ctrs, err := s.buildActorContainers(actorUID, containers)
+	// The resumed guest keeps whatever durable arrangement it was snapshotted
+	// with; the caller has already landed the data for it, so read the answer
+	// off the actor's own state rather than deciding it here.
+	durableDisk := durableQcow2Active(actorUID)
+	ctrs, err := s.buildActorContainers(actorUID, containers, durableDisk)
 	if err != nil {
 		return err
 	}
@@ -250,7 +255,7 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 		return untarErr
 	}
 	tUpper := time.Now()
-	vfsdCmd, err := s.stageMergedRootfs(ctx, rr, actorUID, ctrs, containers)
+	vfsdCmd, err := s.stageMergedRootfs(ctx, rr, actorUID, ctrs, containers, durableDisk)
 	if err != nil {
 		return err
 	}
@@ -436,12 +441,12 @@ func (s *AteomService) restoreFullScope(ctx context.Context, p actorBootParams, 
 	return nil
 }
 
-// rewriteSnapshotSocketPaths repoints the snapshot config.json's per-VMDir paths from
-// the source actor's VMDir to the restoring actor's: the hybrid-vsock socket, the
-// File serial console, and each virtio-fs socket, so the sockets/files we create are
-// the ones CH reopens. The kernel and /dev/vda kata image are content-addressed static
-// files with identical paths on every node, so they need no rewrite, and the overlay
-// has no per-actor disk to repoint.
+// rewriteSnapshotSocketPaths repoints the snapshot config.json's per-actor paths from
+// the source actor's to the restoring actor's: the hybrid-vsock socket, the File serial
+// console, each virtio-fs socket, and the durable-dir disk, so the sockets/files we
+// create are the ones CH reopens. The kernel and /dev/vda kata image are
+// content-addressed static files with identical paths on every node, so they need no
+// rewrite, and the overlay rootfs has no disk at all.
 func rewriteSnapshotSocketPaths(snapshotDir, id string) error {
 	cfgPath := filepath.Join(snapshotDir, "config.json")
 	b, err := os.ReadFile(cfgPath)
@@ -487,6 +492,37 @@ func rewriteSnapshotSocketPaths(snapshotDir, id string) error {
 				return fmt.Errorf("snapshot config %q has fs device with unknown tag %q", cfgPath, tag)
 			}
 		}
+	}
+	// The durable-dir disk is the one per-actor file among the disks. Its path
+	// names the source actor's layer directory, and this actor's chain — landed
+	// by restoreDurableVolumes before we got here — lives under its own.
+	durableDisks := 0
+	if disks, ok := cfg["disks"].([]any); ok {
+		for _, d := range disks {
+			dm, ok := d.(map[string]any)
+			if !ok {
+				return fmt.Errorf("snapshot config %q has a malformed disk", cfgPath)
+			}
+			p, _ := dm["path"].(string)
+			if !isDurableQcow2Path(p) {
+				continue
+			}
+			top, _, err := durableQcow2Top(id)
+			if err != nil {
+				return fmt.Errorf("snapshot config %q has a durable-dir disk but no chain was landed for this actor: %w", cfgPath, err)
+			}
+			dm["path"] = top
+			durableDisks++
+		}
+	}
+	// The guest resuming from this snapshot has the durable filesystem mounted
+	// in its restored memory, from a device that either is or is not in the
+	// config — there is no repairing a mismatch here, so refuse it. It means a
+	// golden captured on one arrangement is being resumed over an actor's data
+	// written in the other.
+	if got := durableQcow2Active(id); got != (durableDisks > 0) {
+		return fmt.Errorf("snapshot config %q has %d durable-dir disks but this actor's durable data is %s",
+			cfgPath, durableDisks, map[bool]string{true: "a qcow2 chain", false: "a host directory"}[got])
 	}
 	out, err := json.Marshal(cfg)
 	if err != nil {
