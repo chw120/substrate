@@ -86,6 +86,17 @@ message WriteDiskRequest {
   int32 size = 2;
 
   WriteMode write_mode = 3;
+
+  // How compressible the written bytes should be, as a target zstd ratio.
+  // 0 and 1 both mean "incompressible": the file is crypto/rand, which is what
+  // the snapshot transport sees as its worst case. A value above 1 makes the
+  // content compress to roughly 1/compress_ratio of its logical size, which is
+  // what a payload resembling real actor data does.
+  //
+  // The benchmark's default of 0 keeps the incompressible baseline reproducible
+  // byte for byte; only a run that is deliberately measuring the transport on
+  // compressible data sets this.
+  double compress_ratio = 4;
 }
 
 message WriteDiskResponse {

@@ -431,6 +431,9 @@ func (s *gluttonService) WriteDisk(ctx context.Context, req *glutton.WriteDiskRe
 	if req.GetSize() < 0 {
 		return nil, status.Error(codes.InvalidArgument, "size must be non-negative")
 	}
+	if r := req.GetCompressRatio(); r != 0 && r < 1 {
+		return nil, status.Errorf(codes.InvalidArgument, "compress_ratio %v must be 0 or at least 1", r)
+	}
 
 	path := filepath.Join(s.dataDir, req.GetKey())
 
@@ -453,7 +456,7 @@ func (s *gluttonService) WriteDisk(ctx context.Context, req *glutton.WriteDiskRe
 
 	h := sha256.New()
 	size := int64(req.GetSize())
-	if err := streamRandomBytes(io.MultiWriter(f, h), size); err != nil {
+	if err := streamBytes(io.MultiWriter(f, h), size, req.GetCompressRatio()); err != nil {
 		return nil, status.Errorf(codes.Internal, "write %s: %v", path, err)
 	}
 
@@ -673,6 +676,70 @@ func randomBytes(n int) ([]byte, error) {
 // streamRandomBytesChunk caps per-syscall random fill and write size so a
 // multi-gigabyte WriteDisk doesn't have to materialize in RAM.
 const streamRandomBytesChunk = 1 << 20 // 1 MiB
+
+// compressibleBlock is the unit the compressible generator works in. It has to
+// be well under zstd's match window so the repeated span of one block is still
+// in reach when the next one is compressed.
+const compressibleBlock = 4096
+
+// streamBytes writes total bytes to w, compressible to roughly ratio under the
+// snapshot transport's zstd settings. A ratio of 0 or 1 writes crypto/rand,
+// which is the incompressible worst case and the benchmark's baseline.
+//
+// Above 1, each block is 1/ratio fresh random bytes followed by a fixed filler.
+// The filler repeats at a distance of one block, which is the only pattern
+// zstd.SpeedFastest reliably finds: a pool of random blocks drawn at random —
+// the obvious way to write this — compresses to 1.01 even at a target of 3,
+// because the repeats land outside the window. Decompression throughput is the
+// same for either shape and for crypto/rand, so the filler's regularity does
+// not flatter the decode side of a transport measurement.
+func streamBytes(w io.Writer, total int64, ratio float64) error {
+	if ratio > 1 {
+		return streamCompressibleBytes(w, total, ratio)
+	}
+	return streamRandomBytes(w, total)
+}
+
+// streamCompressibleBytes writes total bytes whose zstd ratio is about ratio.
+func streamCompressibleBytes(w io.Writer, total int64, ratio float64) error {
+	if total <= 0 {
+		return nil
+	}
+	// Never zero: a run of zeros would take the snapshot transport's
+	// sparse-extent path, which measures how fast holes ship rather than how
+	// fast compressible data does.
+	filler := make([]byte, compressibleBlock)
+	for i := range filler {
+		filler[i] = byte(i%251) + 1
+	}
+	unique := int(float64(compressibleBlock) / ratio)
+
+	buf := make([]byte, streamRandomBytesChunk)
+	for off := 0; off < len(buf); off += compressibleBlock {
+		copy(buf[off+unique:off+compressibleBlock], filler[unique:])
+	}
+	var written int64
+	for written < total {
+		chunk := buf
+		if remaining := total - written; remaining < int64(len(chunk)) {
+			chunk = buf[:remaining]
+		}
+		// Refresh only the unique prefix of each block; the filler behind it
+		// stays put from one iteration to the next.
+		for off := 0; off < len(chunk); off += compressibleBlock {
+			end := min(off+unique, len(chunk))
+			if _, err := rand.Read(chunk[off:end]); err != nil {
+				return fmt.Errorf("generate random bytes: %w", err)
+			}
+		}
+		n, err := w.Write(chunk)
+		if err != nil {
+			return err
+		}
+		written += int64(n)
+	}
+	return nil
+}
 
 // streamRandomBytes writes total random bytes to w sequentially, in
 // streamRandomBytesChunk-sized chunks. The caller is responsible for the

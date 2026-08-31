@@ -18,17 +18,20 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
 	"github.com/agent-substrate/substrate/internal/ateinterceptors"
 	"github.com/agent-substrate/substrate/internal/proto/glutton"
+	"github.com/klauspost/compress/zstd"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -450,4 +453,105 @@ func TestHTTPRoutes(t *testing.T) {
 		t.Errorf("POST /readdisk bad key status: got %d, want 400", res.StatusCode)
 	}
 	res.Body.Close()
+}
+
+// zstdRatio compresses b with the settings the snapshot transport uses
+// (cmd/atelet/internal/ategcs.plainZstd) and reports logical/compressed. The
+// generator's whole purpose is to land on a target under these settings, so
+// measuring it under any other level would prove nothing.
+func zstdRatio(t *testing.T, b []byte) float64 {
+	t.Helper()
+	var out bytes.Buffer
+	zw, err := zstd.NewWriter(&out,
+		zstd.WithEncoderLevel(zstd.SpeedFastest),
+		zstd.WithEncoderConcurrency(runtime.GOMAXPROCS(0)))
+	if err != nil {
+		t.Fatalf("zstd.NewWriter: %v", err)
+	}
+	if _, err := zw.Write(b); err != nil {
+		t.Fatalf("zstd write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("zstd close: %v", err)
+	}
+	return float64(len(b)) / float64(out.Len())
+}
+
+func TestStreamBytesHitsTheRequestedRatio(t *testing.T) {
+	const size = 16 << 20
+
+	tests := []struct {
+		ratio float64
+		want  float64
+	}{
+		// The baseline every existing benchmark row was measured on. It must
+		// stay crypto/rand, or the control stops being a control.
+		{ratio: 0, want: 1},
+		{ratio: 1, want: 1},
+		{ratio: 2, want: 2},
+		{ratio: 3, want: 3},
+		{ratio: 4, want: 4},
+	}
+	for _, tc := range tests {
+		t.Run(fmt.Sprintf("ratio=%v", tc.ratio), func(t *testing.T) {
+			var buf bytes.Buffer
+			if err := streamBytes(&buf, size, tc.ratio); err != nil {
+				t.Fatalf("streamBytes: %v", err)
+			}
+			if buf.Len() != size {
+				t.Fatalf("wrote %d bytes, want %d", buf.Len(), size)
+			}
+			got := zstdRatio(t, buf.Bytes())
+			// 5% covers the framing overhead and the rounding in unique;
+			// anything wider would let the pool-of-blocks failure mode
+			// (ratio 1.01 at a target of 3) through.
+			if got < tc.want*0.95 || got > tc.want*1.05 {
+				t.Errorf("zstd ratio = %.2f, want %.2f ±5%%", got, tc.want)
+			}
+		})
+	}
+}
+
+// A run of zeros would send the upload down the sparse-extent path, which
+// measures how fast holes ship rather than how fast compressible data does —
+// a different question from the one this generator exists to ask.
+func TestStreamBytesWritesNoZeroRuns(t *testing.T) {
+	var buf bytes.Buffer
+	if err := streamBytes(&buf, 1<<20, 3); err != nil {
+		t.Fatalf("streamBytes: %v", err)
+	}
+	if i := bytes.Index(buf.Bytes(), make([]byte, 64)); i >= 0 {
+		t.Errorf("64 zero bytes at offset %d; the sparse path would trigger on this", i)
+	}
+}
+
+// The unique prefix is what carries the entropy, so a second call must not
+// reproduce the first: identical payloads across rounds would fake a dedup rate
+// the transport has not earned.
+func TestStreamBytesVariesBetweenCalls(t *testing.T) {
+	var a, b bytes.Buffer
+	for _, w := range []*bytes.Buffer{&a, &b} {
+		if err := streamBytes(w, 1<<20, 3); err != nil {
+			t.Fatalf("streamBytes: %v", err)
+		}
+	}
+	if bytes.Equal(a.Bytes(), b.Bytes()) {
+		t.Error("two streamBytes calls produced identical content")
+	}
+}
+
+func TestWriteDiskRejectsRatioBelowOne(t *testing.T) {
+	s, err := newGluttonService(t.TempDir())
+	if err != nil {
+		t.Fatalf("newGluttonService: %v", err)
+	}
+	_, err = s.WriteDisk(t.Context(), &glutton.WriteDiskRequest{
+		Key:           "f",
+		Size:          1024,
+		WriteMode:     glutton.WriteMode_WRITE_MODE_TRUNCATE,
+		CompressRatio: 0.5,
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("WriteDisk with compress_ratio 0.5 = %v, want InvalidArgument", err)
+	}
 }

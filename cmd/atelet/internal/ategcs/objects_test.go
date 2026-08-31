@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // memStore is an in-memory ObjectStorage for round-trip tests.
@@ -504,5 +505,51 @@ func TestCopyZstdSparseClearsStaleData(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("stale data not cleared / wrong size: len(got)=%d len(want)=%d", len(got), len(want))
+	}
+}
+
+// slowReader hands back one byte at a time after a fixed delay, so a test can
+// tell blocked-on-the-wire time apart from the rest of a download.
+type slowReader struct {
+	data  []byte
+	off   int
+	delay time.Duration
+}
+
+func (s *slowReader) Read(p []byte) (int, error) {
+	if s.off >= len(s.data) {
+		return 0, io.EOF
+	}
+	time.Sleep(s.delay)
+	p[0] = s.data[s.off]
+	s.off++
+	return 1, nil
+}
+
+// A download's logical size says nothing about what crossed the network, and a
+// single duration cannot say whether a slow one was the link or the CPU. The
+// meter is what separates them, so it has to count the compressed bytes and
+// charge only the reads to the wire.
+func TestWireMeterSeparatesTheWireFromTheDecode(t *testing.T) {
+	const delay = time.Millisecond
+	payload := []byte("twelve bytes")
+	src := &slowReader{data: payload, delay: delay}
+	w := &wireMeter{r: src}
+
+	n, err := io.Copy(io.Discard, w)
+	if err != nil {
+		t.Fatalf("io.Copy: %v", err)
+	}
+	if n != int64(len(payload)) {
+		t.Fatalf("copied %d bytes, want %d", n, len(payload))
+	}
+	if w.bytes != int64(len(payload)) {
+		t.Errorf("wireMeter.bytes = %d, want %d", w.bytes, len(payload))
+	}
+	// Each of the len(payload) reads sleeps at least delay, so the blocked
+	// total cannot be below that and a meter that forgot to accumulate would
+	// report zero.
+	if want := time.Duration(len(payload)) * delay; w.blocked < want {
+		t.Errorf("wireMeter.blocked = %v, want at least %v", w.blocked, want)
 	}
 }

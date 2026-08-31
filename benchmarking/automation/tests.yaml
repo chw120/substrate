@@ -402,6 +402,105 @@ tests:
       - "1.0"
       - "--max-wait-time"
       - "1.0"
+  # The four rows below are one experiment: how much of a resume is the
+  # download, once the payload is something zstd can actually compress. Every
+  # durable-dir number so far was measured on crypto/rand, which is the
+  # transport's worst case, and the answer decides whether shipping less data
+  # beats landing it faster. Keep them together and run them as a set; a
+  # ratio=1.0 row on its own is only the existing baseline under a new name,
+  # and the compressible rows mean nothing without it.
+  - name: durdir_compress_64mb_r1
+    type: locust
+    description: "DurDir download leg (64 MiB, incompressible): control for durdir_compress_64mb_r3"
+    targetCluster: dev
+    file: /app/tests/durdir.py
+    duration: 20m
+    users: 1
+    workerCount: 1
+    flags:
+      - "--durdir-template"
+      - "glutton-durdir-data"
+      - "--resume-mode"
+      - "explicit"
+      - "--durdir-read-mode"
+      - "digest"
+      - "--durdir-file-size-bytes"
+      - "67108864"
+      - "--durdir-compress-ratio"
+      - "1.0"
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
+  - name: durdir_compress_64mb_r3
+    type: locust
+    description: "DurDir download leg (64 MiB, zstd ratio 3): payload resembling real actor data"
+    targetCluster: dev
+    file: /app/tests/durdir.py
+    duration: 20m
+    users: 1
+    workerCount: 1
+    flags:
+      - "--durdir-template"
+      - "glutton-durdir-data"
+      - "--resume-mode"
+      - "explicit"
+      - "--durdir-read-mode"
+      - "digest"
+      - "--durdir-file-size-bytes"
+      - "67108864"
+      - "--durdir-compress-ratio"
+      - "3.0"
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
+  - name: durdir_compress_1gb_r1
+    type: locust
+    description: "DurDir download leg (1 GiB, incompressible): control for durdir_compress_1gb_r3"
+    targetCluster: dev
+    file: /app/tests/durdir.py
+    duration: 30m
+    users: 1
+    workerCount: 1
+    flags:
+      - "--durdir-template"
+      - "glutton-durdir-data"
+      - "--resume-mode"
+      - "explicit"
+      - "--durdir-read-mode"
+      - "digest"
+      - "--durdir-file-size-bytes"
+      - "1073741824"
+      - "--durdir-compress-ratio"
+      - "1.0"
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
+  - name: durdir_compress_1gb_r3
+    type: locust
+    description: "DurDir download leg (1 GiB, zstd ratio 3): the size where the download leg was measured at 2692 ms"
+    targetCluster: dev
+    file: /app/tests/durdir.py
+    duration: 30m
+    users: 1
+    workerCount: 1
+    flags:
+      - "--durdir-template"
+      - "glutton-durdir-data"
+      - "--resume-mode"
+      - "explicit"
+      - "--durdir-read-mode"
+      - "digest"
+      - "--durdir-file-size-bytes"
+      - "1073741824"
+      - "--durdir-compress-ratio"
+      - "3.0"
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
   - name: ingress_routercap_envoy_2cpu
     description: "Router capacity: Nighthawk adaptive max-RPS search under a 25ms tail-latency SLO, Envoy at 2 CPUs"
     type: nighthawk-ingress

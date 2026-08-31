@@ -299,7 +299,7 @@ func (u *durDirUser) step(ctx context.Context, dynCfg dynconfig.Config) {
 	}
 
 	// 5. Overwrite file with fresh random bytes
-	if err := u.writeDisk(ctx, "DurDirOverwrite", fileSize, gluttonpb.WriteMode_WRITE_MODE_TRUNCATE); err != nil {
+	if err := u.writeDisk(ctx, "DurDirOverwrite", fileSize, gluttonpb.WriteMode_WRITE_MODE_TRUNCATE, dynCfg.DurDirCompressRatio); err != nil {
 		return
 	}
 }
@@ -312,7 +312,7 @@ func (u *durDirUser) bootstrap(ctx context.Context, dynCfg dynconfig.Config) err
 	}
 
 	// Initial write to create DurDir file
-	if err := u.writeDisk(ctx, "DurDirWrite", fileSize, gluttonpb.WriteMode_WRITE_MODE_TRUNCATE); err != nil {
+	if err := u.writeDisk(ctx, "DurDirWrite", fileSize, gluttonpb.WriteMode_WRITE_MODE_TRUNCATE, dynCfg.DurDirCompressRatio); err != nil {
 		return fmt.Errorf("initial WriteDisk failed: %w", err)
 	}
 
@@ -324,11 +324,12 @@ func (u *durDirUser) bootstrap(ctx context.Context, dynCfg dynconfig.Config) err
 	return nil
 }
 
-func (u *durDirUser) writeDisk(ctx context.Context, metricName string, size int64, mode gluttonpb.WriteMode) error {
+func (u *durDirUser) writeDisk(ctx context.Context, metricName string, size int64, mode gluttonpb.WriteMode, compressRatio float64) error {
 	req := &gluttonpb.WriteDiskRequest{
-		Key:       durDirTestFile,
-		Size:      int32(size),
-		WriteMode: mode,
+		Key:           durDirTestFile,
+		Size:          int32(size),
+		WriteMode:     mode,
+		CompressRatio: compressRatio,
 	}
 	body, err := proto.Marshal(req)
 	if err != nil {

@@ -105,6 +105,17 @@ func TestParseInvalidValues(t *testing.T) {
 			name: "invalid read mode",
 			json: `{"durdir_read_mode": "invalid_read"}`,
 		},
+		{
+			// Asking for content that grows under compression. 0 is the only
+			// value below 1 the generator can honor, and it means "leave the
+			// incompressible baseline alone".
+			name: "compress ratio between 0 and 1",
+			json: `{"durdir_compress_ratio": 0.5}`,
+		},
+		{
+			name: "negative compress ratio",
+			json: `{"durdir_compress_ratio": -3}`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -244,5 +255,29 @@ func TestStartPollZeroInterval(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if hits.Load() != 0 {
 		t.Errorf("StartPoll with interval 0 made %d requests", hits.Load())
+	}
+}
+
+func TestParseCompressRatio(t *testing.T) {
+	tests := []struct {
+		name string
+		json string
+		want float64
+	}{
+		{name: "unset leaves the incompressible baseline", json: `{}`, want: 0},
+		{name: "explicit zero", json: `{"durdir_compress_ratio": 0}`, want: 0},
+		{name: "one is incompressible too", json: `{"durdir_compress_ratio": 1}`, want: 1},
+		{name: "three", json: `{"durdir_compress_ratio": 3}`, want: 3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := Parse([]byte(tt.json), Config{})
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			if got.DurDirCompressRatio != tt.want {
+				t.Errorf("DurDirCompressRatio = %v, want %v", got.DurDirCompressRatio, tt.want)
+			}
+		})
 	}
 }

@@ -236,8 +236,18 @@ type WriteDiskRequest struct {
 	// name of the file to be written to
 	Key string `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
 	// size of bytes to be written
-	Size          int32     `protobuf:"varint,2,opt,name=size,proto3" json:"size,omitempty"`
-	WriteMode     WriteMode `protobuf:"varint,3,opt,name=write_mode,json=writeMode,proto3,enum=glutton.WriteMode" json:"write_mode,omitempty"`
+	Size      int32     `protobuf:"varint,2,opt,name=size,proto3" json:"size,omitempty"`
+	WriteMode WriteMode `protobuf:"varint,3,opt,name=write_mode,json=writeMode,proto3,enum=glutton.WriteMode" json:"write_mode,omitempty"`
+	// How compressible the written bytes should be, as a target zstd ratio.
+	// 0 and 1 both mean "incompressible": the file is crypto/rand, which is what
+	// the snapshot transport sees as its worst case. A value above 1 makes the
+	// content compress to roughly 1/compress_ratio of its logical size, which is
+	// what a payload resembling real actor data does.
+	//
+	// The benchmark's default of 0 keeps the incompressible baseline reproducible
+	// byte for byte; only a run that is deliberately measuring the transport on
+	// compressible data sets this.
+	CompressRatio float64 `protobuf:"fixed64,4,opt,name=compress_ratio,json=compressRatio,proto3" json:"compress_ratio,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -291,6 +301,13 @@ func (x *WriteDiskRequest) GetWriteMode() WriteMode {
 		return x.WriteMode
 	}
 	return WriteMode_WRITE_MODE_TRUNCATE
+}
+
+func (x *WriteDiskRequest) GetCompressRatio() float64 {
+	if x != nil {
+		return x.CompressRatio
+	}
+	return 0
 }
 
 type WriteDiskResponse struct {
@@ -776,12 +793,13 @@ const file_glutton_proto_rawDesc = "" +
 	"\x04size\x18\x02 \x01(\tR\x04size\x121\n" +
 	"\n" +
 	"write_mode\x18\x03 \x01(\x0e2\x12.glutton.WriteModeR\twriteMode\"\x12\n" +
-	"\x10WriteRAMResponse\"k\n" +
+	"\x10WriteRAMResponse\"\x92\x01\n" +
 	"\x10WriteDiskRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x12\n" +
 	"\x04size\x18\x02 \x01(\x05R\x04size\x121\n" +
 	"\n" +
-	"write_mode\x18\x03 \x01(\x0e2\x12.glutton.WriteModeR\twriteMode\"?\n" +
+	"write_mode\x18\x03 \x01(\x0e2\x12.glutton.WriteModeR\twriteMode\x12%\n" +
+	"\x0ecompress_ratio\x18\x04 \x01(\x01R\rcompressRatio\"?\n" +
 	"\x11WriteDiskResponse\x12\x12\n" +
 	"\x04size\x18\x01 \x01(\x03R\x04size\x12\x16\n" +
 	"\x06sha256\x18\x02 \x01(\fR\x06sha256\"S\n" +

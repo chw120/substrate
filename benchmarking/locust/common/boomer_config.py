@@ -52,6 +52,7 @@ _FLAGS = {
     "--durdir-file-size-bytes": int,
     "--resume-mode": str,
     "--durdir-read-mode": str,
+    "--durdir-compress-ratio": float,
     "--durdir-template": str,
     "--mem-target": str,
     "--mem-churn": str,

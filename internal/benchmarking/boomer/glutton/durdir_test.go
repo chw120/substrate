@@ -82,7 +82,7 @@ func TestDurDirUsesConfiguredFileSize(t *testing.T) {
 	srv := &fake.Server{Data: make([]byte, configuredSize)}
 	du := newTestDurDirUser(t, srv, nil)
 
-	if err := du.writeDisk(context.Background(), "TestConfiguredSize", configuredSize, gluttonpb.WriteMode_WRITE_MODE_TRUNCATE); err != nil {
+	if err := du.writeDisk(context.Background(), "TestConfiguredSize", configuredSize, gluttonpb.WriteMode_WRITE_MODE_TRUNCATE, 0); err != nil {
 		t.Fatalf("writeDisk failed: %v", err)
 	}
 
@@ -268,5 +268,58 @@ func TestDurDirShutdownSuspendsBeforeDelete(t *testing.T) {
 	calls := fakeCtrl.recordedCalls()
 	if len(calls) < 2 || calls[len(calls)-2] != "SuspendActor" || calls[len(calls)-1] != "DeleteActor" {
 		t.Errorf("recordedCalls must end with [SuspendActor, DeleteActor], got %v", calls)
+	}
+}
+
+// The compressibility of the payload is the one knob that decides what the
+// snapshot transport has to ship, so a run that sets it and silently writes
+// crypto/rand anyway would answer the wrong question while looking correct.
+func TestDurDirCompressRatioSentOnWire(t *testing.T) {
+	srv := &fake.Server{Data: make([]byte, 1024)}
+	cfg := newTestConfig(t, srv, &userclass.Config{
+		APIStub: &fakeControlClient{},
+		Dyn: dynconfig.NewHolder(dynconfig.Config{
+			DurDirFileSize:      int64(len(srv.Data)),
+			DurDirCompressRatio: 3,
+		}),
+	})
+
+	rt := &durDirRuntime{cfg: cfg}
+	if _, err := rt.startUser(context.Background(), cfg.Dyn.Load()); err != nil {
+		t.Fatalf("startUser failed: %v", err)
+	}
+
+	ratios := srv.RecordedWriteRatios()
+	if len(ratios) == 0 {
+		t.Fatal("no /writedisk calls recorded")
+	}
+	for i, got := range ratios {
+		if got != 3 {
+			t.Errorf("write %d: wire compress_ratio = %v, want 3", i, got)
+		}
+	}
+}
+
+// The default has to stay the incompressible baseline: every existing
+// benchmark row was measured on crypto/rand, and a nonzero default would
+// silently invalidate them all as a control.
+func TestDurDirDefaultsToIncompressible(t *testing.T) {
+	srv := &fake.Server{Data: make([]byte, 1024)}
+	cfg := newTestConfig(t, srv, &userclass.Config{
+		APIStub: &fakeControlClient{},
+		Dyn: dynconfig.NewHolder(dynconfig.Config{
+			DurDirFileSize: int64(len(srv.Data)),
+		}),
+	})
+
+	rt := &durDirRuntime{cfg: cfg}
+	if _, err := rt.startUser(context.Background(), cfg.Dyn.Load()); err != nil {
+		t.Fatalf("startUser failed: %v", err)
+	}
+
+	for i, got := range srv.RecordedWriteRatios() {
+		if got != 0 {
+			t.Errorf("write %d: wire compress_ratio = %v, want 0", i, got)
+		}
 	}
 }

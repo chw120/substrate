@@ -53,9 +53,12 @@ type Config struct {
 	DurDirFileSize   int64  // bytes
 	ResumeMode       string // ResumeModeExplicit | ResumeModeImplicit
 	DurDirReadMode   string // ReadModeData | ReadModeDigest
-	DurDirTemplate   string // ActorTemplate name
-	MemTarget        string // resident RAM the GluttonUser fills via WriteRAM, suffixed (e.g. "2Gi"); "" disables
-	MemChurn         string // RAM re-randomized in place each cycle via WriteRAM overwrite, suffixed (e.g. "64Mi"); "" disables
+	// DurDirCompressRatio is the zstd ratio the durable-dir payload should
+	// compress to. 0 (and 1) keep the incompressible crypto/rand baseline.
+	DurDirCompressRatio float64
+	DurDirTemplate      string // ActorTemplate name
+	MemTarget           string // resident RAM the GluttonUser fills via WriteRAM, suffixed (e.g. "2Gi"); "" disables
+	MemChurn            string // RAM re-randomized in place each cycle via WriteRAM overwrite, suffixed (e.g. "64Mi"); "" disables
 }
 
 // Holder lets readers Load() the current Config and writers Store() a new
@@ -86,15 +89,16 @@ type ProbabilityUpdater interface {
 // /boomer-config endpoint, so master + Python runner + Go worker share one
 // vocabulary for the boomer's runtime-tunable knobs.
 type payload struct {
-	TraceProbability *float64 `json:"trace_probability"`
-	MinWaitTime      *float64 `json:"min_wait_time"`
-	MaxWaitTime      *float64 `json:"max_wait_time"`
-	DurDirFileSize   *float64 `json:"durdir_file_size_bytes"`
-	ResumeMode       *string  `json:"resume_mode"`
-	DurDirReadMode   *string  `json:"durdir_read_mode"`
-	DurDirTemplate   *string  `json:"durdir_template"`
-	MemTarget        *string  `json:"mem_target"`
-	MemChurn         *string  `json:"mem_churn"`
+	TraceProbability    *float64 `json:"trace_probability"`
+	MinWaitTime         *float64 `json:"min_wait_time"`
+	MaxWaitTime         *float64 `json:"max_wait_time"`
+	DurDirFileSize      *float64 `json:"durdir_file_size_bytes"`
+	ResumeMode          *string  `json:"resume_mode"`
+	DurDirReadMode      *string  `json:"durdir_read_mode"`
+	DurDirCompressRatio *float64 `json:"durdir_compress_ratio"`
+	DurDirTemplate      *string  `json:"durdir_template"`
+	MemTarget           *string  `json:"mem_target"`
+	MemChurn            *string  `json:"mem_churn"`
 }
 
 // Parse decodes a JSON blob (typically from a CLI flag) and merges its
@@ -167,6 +171,12 @@ func (c Config) Validate() error {
 	if c.DurDirReadMode != "" && c.DurDirReadMode != ReadModeData && c.DurDirReadMode != ReadModeDigest {
 		return fmt.Errorf("invalid durdir_read_mode %q: must be %q or %q", c.DurDirReadMode, ReadModeData, ReadModeDigest)
 	}
+	// A ratio between 0 and 1 would ask for content that grows under
+	// compression, which the generator cannot produce; 0 means "leave the
+	// baseline alone" and is the only value below 1 that means anything.
+	if c.DurDirCompressRatio != 0 && c.DurDirCompressRatio < 1 {
+		return fmt.Errorf("durdir_compress_ratio must be 0 or at least 1.0, got: %v", c.DurDirCompressRatio)
+	}
 	// MemTarget and MemChurn are passed to glutton verbatim, which owns the
 	// parse; invalid values fail loudly there as GluttonFillRAM /
 	// GluttonChurnRAM errors.
@@ -195,6 +205,9 @@ func (p payload) merge(current Config) Config {
 	}
 	if p.DurDirReadMode != nil {
 		out.DurDirReadMode = *p.DurDirReadMode
+	}
+	if p.DurDirCompressRatio != nil {
+		out.DurDirCompressRatio = *p.DurDirCompressRatio
 	}
 	if p.DurDirTemplate != nil {
 		out.DurDirTemplate = *p.DurDirTemplate
@@ -269,6 +282,7 @@ func StartPoll(
 					slog.Int64("durdir_file_size_bytes", next.DurDirFileSize),
 					slog.String("resume_mode", next.ResumeMode),
 					slog.String("durdir_read_mode", next.DurDirReadMode),
+					slog.Float64("durdir_compress_ratio", next.DurDirCompressRatio),
 					slog.String("durdir_template", next.DurDirTemplate),
 					slog.String("mem_target", next.MemTarget),
 					slog.String("mem_churn", next.MemChurn),
@@ -304,6 +318,7 @@ func SubscribeSpawn(url string, holder *Holder, sampler ProbabilityUpdater, fetc
 			slog.Int64("durdir_file_size_bytes", next.DurDirFileSize),
 			slog.String("resume_mode", next.ResumeMode),
 			slog.String("durdir_read_mode", next.DurDirReadMode),
+			slog.Float64("durdir_compress_ratio", next.DurDirCompressRatio),
 			slog.String("durdir_template", next.DurDirTemplate),
 			slog.String("mem_target", next.MemTarget),
 			slog.String("mem_churn", next.MemChurn),

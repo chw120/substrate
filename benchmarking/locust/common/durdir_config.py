@@ -36,6 +36,14 @@ def add_durdir_arguments(parser: LocustArgumentParser) -> None:
         "'digest' returns only size+sha256 for reduced network overhead",
     )
     group.add_argument(
+        "--durdir-compress-ratio",
+        type=float,
+        default=0.0,
+        help="Target zstd ratio for the DurDir payload. 0 (default) writes crypto/rand, "
+        "the incompressible baseline; a value above 1 writes content that compresses to "
+        "roughly 1/ratio, which is what the snapshot transport sees for realistic actor data",
+    )
+    group.add_argument(
         "--durdir-template",
         type=str,
         default="glutton-durdir-data",

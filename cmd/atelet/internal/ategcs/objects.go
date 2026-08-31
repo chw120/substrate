@@ -346,15 +346,47 @@ func fetchFromGCSWithZstd(ctx context.Context, client ObjectStorage, gsURL strin
 		}
 	}()
 
+	// Count and time the wire side separately from the decode. Logical bytes
+	// alone cannot say whether a slow download was the network or the CPU, and
+	// they hide the compression ratio the payload actually achieved.
+	wire := &wireMeter{r: rc}
+
 	t0 := time.Now()
-	res, err := decodeContent(out, rc)
+	res, err := decodeContent(out, wire)
 	if err != nil {
 		return err
 	}
 	slog.InfoContext(ctx, "Decompressed zstd download",
 		slog.Bool("sparse", res.sparse), slog.Int64("logical_bytes", res.logicalBytes),
-		slog.Int64("written_bytes", res.writtenBytes), slog.Duration("took", time.Since(t0)))
+		slog.Int64("written_bytes", res.writtenBytes),
+		slog.Int64("compressed_bytes", wire.bytes), slog.Duration("wire_stalled", wire.blocked),
+		slog.Duration("took", time.Since(t0)))
 	return nil
+}
+
+// wireMeter counts the bytes a download reads and the time the decode spends
+// blocked waiting for them.
+//
+// The blocked time is a stall, not a transfer time: anything past one chunk
+// arrives as parallel ranges prefetched ahead of the reader (see rangedget.go),
+// so a download whose ranges keep up reports near-zero stall no matter how many
+// bytes crossed the network. That is the number worth having. Stall plus decode
+// is the whole duration, so a download dominated by stall is network-bound and
+// one dominated by the remainder is decompression-bound — which is the question
+// compressing the payload is meant to answer. Dividing bytes by the stall to get
+// a throughput is not: the denominator is not the transfer.
+type wireMeter struct {
+	r       io.Reader
+	bytes   int64
+	blocked time.Duration
+}
+
+func (w *wireMeter) Read(p []byte) (int, error) {
+	t0 := time.Now()
+	n, err := w.r.Read(p)
+	w.blocked += time.Since(t0)
+	w.bytes += int64(n)
+	return n, err
 }
 
 // decodeContentResult reports what decodeContent decompressed.

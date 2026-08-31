@@ -59,6 +59,7 @@ type Server struct {
 	mu            sync.Mutex
 	paths         []string
 	writeSizes    []int32
+	writeRatios   []float64
 	readModes     []gluttonpb.ReadMode
 	ramWriteSizes []string
 	ramWriteModes []gluttonpb.WriteMode
@@ -96,6 +97,13 @@ func (s *Server) RecordedWriteSizes() []int32 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]int32(nil), s.writeSizes...)
+}
+
+// RecordedWriteRatios returns each /writedisk request's compress_ratio.
+func (s *Server) RecordedWriteRatios() []float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]float64(nil), s.writeRatios...)
 }
 
 func (s *Server) RecordedReadModes() []gluttonpb.ReadMode {
@@ -154,6 +162,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		s.mu.Lock()
 		s.writeSizes = append(s.writeSizes, req.GetSize())
+		s.writeRatios = append(s.writeRatios, req.GetCompressRatio())
 		s.mu.Unlock()
 
 		resp, _ := proto.Marshal(&gluttonpb.WriteDiskResponse{
