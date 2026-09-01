@@ -317,11 +317,15 @@ func BackingChain(ctx context.Context, path string) ([]ImageInfo, error) {
 // with the actor's data, which is why what triggers it (MaxChain) is a policy
 // question rather than a detail.
 //
-// -c compresses the result. Compressed clusters are read-only in qcow2, so
-// this is only ever right for something that will be a BASE: a delta stacked
-// on top takes the writes.
+// The convert is deliberately not compressed. It runs on the restore path, so
+// every millisecond it takes is resume latency, and no coroutine count recovers
+// what deflate costs: measured against a durable-dir chain, -c took 6.6x the
+// wall time and returned an image of exactly the same size, because the payload
+// was incompressible. A workload whose data does compress would trade that CPU
+// for a smaller image and a smaller upload; if that case ever needs serving it
+// wants to be a choice rather than the default.
 func Flatten(ctx context.Context, src, dst string) error {
-	if out, err := run(ctx, qemuImg, "convert", "-f", "qcow2", "-O", "qcow2", "-c", src, dst); err != nil {
+	if out, err := run(ctx, qemuImg, "convert", "-f", "qcow2", "-O", "qcow2", src, dst); err != nil {
 		return fmt.Errorf("flattening the qcow2 chain at %q into %q: %w (%s)", src, dst, err, out)
 	}
 	return nil

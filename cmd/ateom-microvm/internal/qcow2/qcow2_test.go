@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -288,6 +289,61 @@ func TestFlattenProducesASelfContainedBase(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
 			t.Errorf("Flatten() removed %q: %v", name, err)
 		}
+	}
+}
+
+// allocationRE and compressionRE pull the two figures this file cares about out
+// of `qemu-img check`, whose summary line reads
+// "128/1024 = 12.50% allocated, 0.00% fragmented, 0.00% compressed clusters".
+var (
+	allocationRE  = regexp.MustCompile(`(\d+)/\d+ = [\d.]+% allocated`)
+	compressionRE = regexp.MustCompile(`([\d.]+)% compressed clusters`)
+)
+
+// The flatten must not compress. It runs on the restore path, where its cost is
+// resume latency: compressing a durable-dir chain measured 6.6x slower for an
+// image of identical size, since the data an actor writes does not generally
+// deflate. Assert on the image rather than on the argv so the property survives
+// someone rewriting how the convert is invoked.
+func TestFlattenLeavesTheBaseUncompressed(t *testing.T) {
+	requireTools(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	base := "durable-dir.layer-0000.qcow2"
+	delta := "durable-dir.layer-0001.qcow2"
+	if err := CreateBase(ctx, filepath.Join(dir, base), probeSizeBytes); err != nil {
+		t.Fatalf("CreateBase() = %v", err)
+	}
+	if err := CreateDelta(ctx, filepath.Join(dir, delta), base); err != nil {
+		t.Fatalf("CreateDelta() = %v", err)
+	}
+
+	flat := filepath.Join(dir, "flat.qcow2")
+	if err := Flatten(ctx, filepath.Join(dir, delta), flat); err != nil {
+		t.Fatalf("Flatten() = %v", err)
+	}
+
+	out, err := exec.CommandContext(ctx, qemuImg, "check", "-f", "qcow2", flat).CombinedOutput()
+	if err != nil {
+		t.Fatalf("qemu-img check on the flattened image = %v (%s)", err, out)
+	}
+	// A wholly unallocated image reports 0% compressed too, which would pass
+	// this test without proving anything. The base carries an ext4, so it has
+	// clusters; check that before reading the compression figure.
+	alloc := allocationRE.FindSubmatch(out)
+	if alloc == nil {
+		t.Fatalf("qemu-img check reported no allocation figure: %s", out)
+	}
+	if string(alloc[1]) == "0" {
+		t.Fatalf("the flattened image has no allocated clusters, so its compression says nothing: %s", out)
+	}
+	compressed := compressionRE.FindSubmatch(out)
+	if compressed == nil {
+		t.Fatalf("qemu-img check reported no compression figure: %s", out)
+	}
+	if got := string(compressed[1]); got != "0.00" {
+		t.Errorf("the flattened image is %s%% compressed clusters, want 0.00%%: %s", got, out)
 	}
 }
 

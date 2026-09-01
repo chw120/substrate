@@ -126,9 +126,7 @@ func resetDurableQcow2State(actorUID string) error {
 // yet: an empty ext4 base with a writable delta on top.
 //
 // The delta is not optional. Writing into the base would make the actor's
-// first suspend ship a full image where every later one ships a delta, and —
-// once flattening starts producing bases — would write into a compressed
-// image, which qcow2 does not allow.
+// first suspend ship a full image where every later one ships a delta.
 func initDurableQcow2(ctx context.Context, actorUID string) error {
 	if err := resetDurableQcow2State(actorUID); err != nil {
 		return err
@@ -240,7 +238,7 @@ func landDurableQcow2(ctx context.Context, actorUID, snapshotDir string) error {
 	return nil
 }
 
-// flattenDurableQcow2 collapses the chain into a single compressed base and
+// flattenDurableQcow2 collapses the chain into a single self-contained base and
 // returns the layer list that replaces it.
 //
 // Nothing is removed until the new base is in place under its final name, and
