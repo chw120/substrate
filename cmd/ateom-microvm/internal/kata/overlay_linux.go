@@ -61,6 +61,12 @@ func SharedDir(id string) string {
 	return filepath.Join("/run/kata-containers/shared/sandboxes", id, "shared")
 }
 
+// MergedRootfsPath is where StageMergedRootfs puts one container's merged tree,
+// and so the host side of the rootfs that container runs on in the guest.
+func MergedRootfsPath(id, containerID string) string {
+	return filepath.Join(SharedDir(id), containerID, "rootfs")
+}
+
 // VirtiofsdSocketPath is the vhost-user-fs socket CH connects to for the fs device.
 func VirtiofsdSocketPath(id string) string { return filepath.Join(VMDir(id), "virtiofsd.sock") }
 
@@ -204,7 +210,7 @@ func StageMergedRootfs(ctx context.Context, bundleRootfs, upperBase, restoreID, 
 	if cid == "" {
 		return fmt.Errorf("StageMergedRootfs: empty container id")
 	}
-	dst := filepath.Join(SharedDir(restoreID), cid, "rootfs")
+	dst := MergedRootfsPath(restoreID, cid)
 	upper, work := UpperWorkDirs(upperBase, cid)
 	// Drop any stale mount first (lazy if busy), then ensure clean mountpoints.
 	if err := reaper.Run(exec.Command("umount", dst)); err != nil {
@@ -257,7 +263,7 @@ func StageMergedRootfs(ctx context.Context, bundleRootfs, upperBase, restoreID, 
 // failure paths; lazy fallback if busy). Best-effort like the rest of teardown —
 // CleanupSandboxState's sweep catches stragglers on the next boot.
 func UnmountMergedRootfs(restoreID, cid string) {
-	dst := filepath.Join(SharedDir(restoreID), cid, "rootfs")
+	dst := MergedRootfsPath(restoreID, cid)
 	if err := reaper.Run(exec.Command("umount", dst)); err != nil {
 		_ = reaper.Run(exec.Command("umount", "-l", dst))
 	}
@@ -317,7 +323,7 @@ func ReconstructSharedDirFromImage(ctx context.Context, bundleRootfs, restoreID,
 	if cid == "" {
 		return fmt.Errorf("ReconstructSharedDirFromImage: empty container id")
 	}
-	dst := filepath.Join(SharedDir(restoreID), cid, "rootfs")
+	dst := MergedRootfsPath(restoreID, cid)
 	// Drop any stale bind first (lazy if busy), then ensure a clean mountpoint. Not
 	// RemoveAll: that would chase a live bind into bundleRootfs.
 	if err := reaper.Run(exec.Command("umount", dst)); err != nil {

@@ -18,6 +18,7 @@ package qcow2
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"slices"
@@ -81,7 +82,7 @@ func TestManifestReadWrite(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "chain.json")
 	m := Manifest{
-		Layers:           []Layer{{File: "a.qcow2", SizeBytes: 1, SHA256: "aa"}, {File: "b.qcow2", SizeBytes: 2, SHA256: "bb"}},
+		Layers:           []Layer{{File: "a.qcow2", SizeBytes: 1}, {File: "b.qcow2", SizeBytes: 2}},
 		VirtualSizeBytes: 1 << 30,
 	}
 	if err := WriteManifest(path, m); err != nil {
@@ -153,6 +154,23 @@ func TestVerifyPresent(t *testing.T) {
 	})
 }
 
+// A manifest records sizes and no content digest, and this is a guard on that
+// rather than a description of it. DescribeChain runs inside the pause window
+// of every suspend; anything added here that has to read a layer's bytes turns
+// the O(metadata) seal the arrangement exists for back into a full read of the
+// actor's data, and it would do so silently.
+func TestManifestCarriesNoContentDigest(t *testing.T) {
+	b, err := json.Marshal(Manifest{Layers: []Layer{{File: "a.qcow2", SizeBytes: 1}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"sha256", "sha512", "md5", "digest", "checksum"} {
+		if strings.Contains(string(b), field) {
+			t.Errorf("the manifest encodes a %q field: computing it would read every byte of the chain during the pause", field)
+		}
+	}
+}
+
 // The layer names are what a directory listing and a checkpoint's file set are
 // read through, so they have to sort in chain order.
 func TestNextLayerNameSortsInChainOrder(t *testing.T) {
@@ -196,8 +214,8 @@ func TestDescribeChain(t *testing.T) {
 		t.Errorf("DescribeChain() virtual size = %d, want %d", m.VirtualSizeBytes, probeSizeBytes)
 	}
 	for _, l := range m.Layers {
-		if l.SizeBytes == 0 || l.SHA256 == "" {
-			t.Errorf("DescribeChain() layer %q = %+v, want a size and a digest", l.File, l)
+		if l.SizeBytes == 0 {
+			t.Errorf("DescribeChain() layer %q = %+v, want a size", l.File, l)
 		}
 	}
 	if err := m.VerifyPresent(dir); err != nil {

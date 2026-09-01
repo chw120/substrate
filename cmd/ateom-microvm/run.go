@@ -700,6 +700,14 @@ func (s *AteomService) stageMergedRootfs(ctx context.Context, rr resolvedRuntime
 		if err := kata.StageMergedRootfs(ctx, c.bundleRootfs, upperBase, id, c.name); err != nil {
 			return nil, fmt.Errorf("while staging merged rootfs for %q: %w", c.name, err)
 		}
+		if durableDisk {
+			// Every container, not just the one the suspend happens to exec in:
+			// which container that is depends on the actor's spec, and the
+			// helper is a few hundred bytes.
+			if err := stageGuestSync(kata.MergedRootfsPath(id, c.name)); err != nil {
+				return nil, fmt.Errorf("while staging the guest sync helper for %q: %w", c.name, err)
+			}
+		}
 		for _, vm := range c.imageMounts {
 			src := ateompath.ImageVolumeMountPath(id, c.name, vm.GetVolumeName())
 			if err := kata.StageImageVolume(ctx, src, id, c.name, vm.GetVolumeName()); err != nil {

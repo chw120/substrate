@@ -98,6 +98,15 @@ const defaultSizeGiB = 32
 // next restore flattens it. Every extra layer is another indirection a guest
 // read of a cold cluster may have to walk, and another file that must be
 // present before the image will open at all.
+//
+// It is also the setting that decides what a benchmark measures, so set it
+// deliberately when running one. A chain of depth N holds up to N copies of
+// every cluster the actor has rewritten since its last flatten, so against a
+// tar baseline — which holds exactly one copy — a workload that rewrites the
+// same bytes every cycle makes the chain look N times larger while telling you
+// nothing about the arrangement. Depth 1 flattens at every restore and gives
+// the comparable number; the default is for production, where deduplication
+// across cycles is the point.
 const MaxChainEnvVar = "ATEOM_DURABLE_QCOW2_MAX_CHAIN"
 
 // defaultMaxChain is the chain depth that triggers a flatten. Deliberately

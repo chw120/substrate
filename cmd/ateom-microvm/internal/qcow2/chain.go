@@ -36,12 +36,9 @@ package qcow2
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 )
@@ -66,9 +63,13 @@ type Layer struct {
 	// valid across the move.
 	File string `json:"file"`
 	// SizeBytes is the layer file's size on disk.
+	//
+	// A size and not a digest. Everything a manifest is read for — is the layer
+	// here, is it the whole layer, which one is the top, how much did this
+	// suspend add — a size answers, and a digest of the chain would cost a full
+	// read of every byte in it inside the pause window this design exists to
+	// keep short. Detecting bit rot is the object store's job, not the pause's.
 	SizeBytes int64 `json:"size_bytes"`
-	// SHA256 is the layer's content digest, hex-encoded.
-	SHA256 string `json:"sha256"`
 }
 
 // Top returns the manifest's top layer, the one to hand to cloud-hypervisor.
@@ -153,11 +154,7 @@ func DescribeChain(ctx context.Context, topPath string) (Manifest, error) {
 		if err != nil {
 			return m, fmt.Errorf("stat-ing chain layer %q: %w", path, err)
 		}
-		sum, err := digest(path)
-		if err != nil {
-			return m, err
-		}
-		m.Layers = append(m.Layers, Layer{File: name, SizeBytes: st.Size(), SHA256: sum})
+		m.Layers = append(m.Layers, Layer{File: name, SizeBytes: st.Size()})
 	}
 	m.VirtualSizeBytes = chain[len(chain)-1].VirtualSize
 	return m, nil
@@ -200,20 +197,6 @@ func (m Manifest) LayerFiles() []string {
 		out = append(out, l.File)
 	}
 	return out
-}
-
-// digest hashes a file's contents.
-func digest(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = f.Close() }()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", fmt.Errorf("hashing %q: %w", path, err)
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // NextLayerName returns the filename for the layer that goes on top of a chain

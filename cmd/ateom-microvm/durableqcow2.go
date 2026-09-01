@@ -241,9 +241,13 @@ func landDurableQcow2(ctx context.Context, actorUID, snapshotDir string) error {
 }
 
 // flattenDurableQcow2 collapses the chain into a single compressed base and
-// returns the layer list that replaces it. The old layers are removed only
-// after the new base is complete, so an interrupted flatten leaves the
-// original chain usable.
+// returns the layer list that replaces it.
+//
+// Nothing is removed until the new base is in place under its final name, and
+// the manifest — the marker for the whole arrangement — is not written until
+// after this returns. So an interrupted flatten leaves a directory that does
+// not look active, which the retried restore clears and re-adopts from the
+// checkpoint it is landing.
 //
 // It runs at restore rather than at suspend because suspend is the measured
 // window and this is the one operation here that still scales with the actor's
@@ -259,14 +263,22 @@ func flattenDurableQcow2(ctx context.Context, actorUID string, layers []string) 
 		_ = os.Remove(tmp)
 		return nil, err
 	}
+	// Install first, then drop what it replaced. The new base takes the old
+	// one's name, and rename over it is atomic, so at no point is there a
+	// directory in which the base is absent or half-written. Reversing these
+	// two would open a window in which the actor's data existed only under a
+	// dotfile name no other code path looks for.
 	base := qcow2.NextLayerName(ateompath.DurableDirLayerPrefix, 0)
+	if err := os.Rename(tmp, filepath.Join(dir, base)); err != nil {
+		return nil, fmt.Errorf("installing the flattened durable-dir base: %w", err)
+	}
 	for _, name := range layers {
+		if name == base {
+			continue // Replaced in place by the rename above.
+		}
 		if err := os.Remove(filepath.Join(dir, name)); err != nil {
 			return nil, fmt.Errorf("removing flattened layer %q: %w", name, err)
 		}
-	}
-	if err := os.Rename(tmp, filepath.Join(dir, base)); err != nil {
-		return nil, fmt.Errorf("installing the flattened durable-dir base: %w", err)
 	}
 	st, err := os.Stat(filepath.Join(dir, base))
 	if err != nil {
@@ -356,7 +368,9 @@ func adoptFile(src, dst string) error {
 // There is no kata-agent RPC for "sync". What there is, is the ability to run
 // a process in a container, and sync(2) is not namespaced — it flushes every
 // filesystem the guest kernel has mounted, whichever container asks. So this
-// execs sync in the actor's first container and waits for it.
+// execs a helper in the actor's first container and waits for it. The helper is
+// ateom's own (see guestsync.go), not the image's: most actor images are
+// distroless and have no sync in them at all.
 //
 // Best-effort by return value, not by intent: the caller decides whether a
 // failed flush should fail the suspend. An image is not corrupted by a missed
@@ -371,7 +385,7 @@ func flushGuestFilesystems(ctx context.Context, ac *kata.AgentClient, containerI
 		return 0, errors.New("no kata-agent connection to flush the guest through")
 	}
 	t := time.Now()
-	if err := ac.RunToCompletion(ctx, containerID, "ate-durable-sync", []string{"/bin/sync"}); err != nil {
+	if err := ac.RunToCompletion(ctx, containerID, "ate-durable-sync", []string{guestSyncPath}); err != nil {
 		return time.Since(t), fmt.Errorf("while flushing guest filesystems: %w", err)
 	}
 	return time.Since(t), nil
