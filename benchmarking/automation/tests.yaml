@@ -533,6 +533,53 @@ tests:
       - "1.0"
       - "--max-wait-time"
       - "1.0"
+  # 128 and 256 MiB bracket the point where the tar and qcow2 durable-dir
+  # arrangements cross over on end-to-end suspend cost: tar wins at 64 MiB and
+  # below, qcow2 wins at 500 MiB. A size-based default has to sit in here.
+  - name: durdir_size_128mb_microvm
+    type: locust
+    description: "DurDir file size sweep (128 MiB) on micro-VM: 1 concurrent user, digest read mode"
+    targetCluster: dev
+    sandboxClass: microvm
+    file: /app/tests/durdir.py
+    duration: 10m
+    users: 1
+    workerCount: 1
+    flags:
+      - "--durdir-template"
+      - "glutton-durdir-data"
+      - "--resume-mode"
+      - "explicit"
+      - "--durdir-read-mode"
+      - "digest"
+      - "--durdir-file-size-bytes"
+      - "134217728"
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
+  - name: durdir_size_256mb_microvm
+    type: locust
+    description: "DurDir file size sweep (256 MiB) on micro-VM: 1 concurrent user, digest read mode"
+    targetCluster: dev
+    sandboxClass: microvm
+    file: /app/tests/durdir.py
+    duration: 15m
+    users: 1
+    workerCount: 1
+    flags:
+      - "--durdir-template"
+      - "glutton-durdir-data"
+      - "--resume-mode"
+      - "explicit"
+      - "--durdir-read-mode"
+      - "digest"
+      - "--durdir-file-size-bytes"
+      - "268435456"
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
   - name: durdir_size_500mb_microvm
     type: locust
     description: "DurDir file size sweep (500 MiB) on micro-VM: 1 concurrent user, digest read mode"

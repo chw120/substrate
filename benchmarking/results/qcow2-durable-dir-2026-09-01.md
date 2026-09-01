@@ -144,11 +144,18 @@ and which runs with the guest live. `n` is the number of checkpoints.
 | 5 MiB | `durdir_size_5mb_microvm` | 08:26:19Z | 07:24:59Z | 3m |
 | 10 MiB | `durdir_size_10mb_microvm` | 08:29:40Z | 07:28:20Z | 3m |
 | 64 MiB | `durdir_size_64mb_microvm` | 08:33:01Z | 07:31:51Z | 5m |
+| 128 MiB | `durdir_size_128mb_microvm` | 10:18:57Z | 10:03:24Z | 6m |
+| 256 MiB | `durdir_size_256mb_microvm` | 10:25:27Z | 10:10:15Z | 8m |
 | 500 MiB | `durdir_size_500mb_microvm` | 08:38:29Z | 07:37:18Z | 10m |
 | 1 GiB | `durdir_size_1gb_microvm` | 08:48:49Z | 07:47:39Z | 12m |
 
 Durations are the overrides used, not the durations committed in `tests.yaml`.
 See [Caveats](#caveats).
+
+The 128 and 256 MiB steps ran ~1.5 h after the rest, as their own pair of arms
+with their own golden rebuilds, and with the router's route timeout already
+raised to 5m. Neither size writes for anywhere near 10 s, so the raised timeout
+cannot have changed them; everything else about the cluster was unchanged.
 
 ## What the numbers say
 
@@ -162,8 +169,9 @@ the data supports it without qualification.
 **But the cost moves rather than disappears, and it stays inside the RPC.**
 The qcow2 arrangement has to `sync(2)` the guest before it pauses, and that
 `guest_flush` is charged to the same `SuspendActor` call. End to end, tar wins
-at 5, 10, and 64 MiB and qcow2 wins at 500 MiB; the crossover is somewhere
-between 64 and 500 MiB. What the arrangement buys below the crossover is not a
+at 5, 10, and 64 MiB and qcow2 wins at 500 MiB; the crossover sits at ~128 MiB
+(see [The crossover](#the-crossover-and-where-the-flatten-cost-actually-comes-from)).
+What the arrangement buys below the crossover is not a
 faster suspend but a shorter *stall* — 5.7 ms versus 310 ms of frozen guest at
 64 MiB — which matters for a workload holding a connection open, and does not
 show up in `SuspendActor` at all.
@@ -231,6 +239,76 @@ the restore path to a background job, which needs an answer for a suspend that
 arrives mid-flatten; or flatten at seal instead and give back part of the
 constant-time pause the arrangement exists to provide.
 
+## The crossover, and where the flatten cost actually comes from
+
+The 128 and 256 MiB steps were added to find where the two arrangements cross
+over on end-to-end suspend cost. Both arms, both sizes, zero failures. p50 in
+milliseconds, with the surrounding sizes from the main sweep for context:
+
+| Size | SuspendActor tar | SuspendActor qcow2 | Winner |
+|---|---|---|---|
+| 5 MiB | 380 | 740 | tar |
+| 10 MiB | 450 | 970 | tar |
+| 64 MiB | 1 500 | 3 300 | tar |
+| **128 MiB** | **2 300** | **2 400** | **tied** |
+| **256 MiB** | **3 500** | **2 200** | **qcow2** |
+| 500 MiB | 5 400 | 3 800 | qcow2 |
+
+**The crossover is at ~128 MiB**, where the two are within 4% of each other.
+Below it the pre-pause guest sync costs more than the tar pack it replaces;
+above it the tar pack runs away and the sync does not.
+
+The rest of the 128 / 256 MiB p50s:
+
+| Size | Arm | ResumeActor | SuspendActor | ServeAfterResume | ServeWarm | Overwrite | n |
+|---|---|---|---|---|---|---|---|
+| 128 MiB | tar | 1 600 | 2 300 | 1 400 | 540 | 1 500 | 42 |
+| 128 MiB | qcow2 | 15 000 | 2 400 | 1 300 | 440 | 840 | 18 |
+| 256 MiB | tar | 2 600 | 3 500 | 2 900 | 1 100 | 2 400 | 34 |
+| 256 MiB | qcow2 | 11 000 | 2 200 | 2 500 | 860 | 1 800 | 24 |
+
+ateom-side, same two steps:
+
+| Size | Arm | n | guest_flush | pause | durable | restore total | flatten | chain landed |
+|---|---|---|---|---|---|---|---|---|
+| 128 MiB | tar | 43 | 0 | 2.35 | 734.15 | 1.05 s | — | — |
+| 128 MiB | qcow2 | 19 | 273.2 | 2.61 | **5.52** | 13.60 s | 12 390 ms | 507 MiB |
+| 256 MiB | tar | 35 | 0 | 2.36 | 1 480.89 | 1.56 s | — | — |
+| 256 MiB | qcow2 | 25 | 39.4 | 2.57 | **5.35** | 9.99 s | 8 732 ms | 515 MiB |
+
+The seal stays flat — 5.52 and 5.35 ms — extending the constant-time result to
+the middle of the range.
+
+But look at the two chain sizes: 507 MiB for a 128 MiB durable dir, 515 MiB for
+a 256 MiB one. Nearly identical, and both far above the live data. **The image
+grows to a plateau that has little to do with the file in it**, and because the
+flatten reads the whole image, the resume cost tracks the plateau rather than
+the workload. That is why qcow2's 128 MiB resume (15 s) is *worse* than its
+256 MiB resume (11 s), and why the regression looked super-linear in the main
+sweep.
+
+Chain size per cycle, in MiB, over the life of one actor:
+
+```
+128 MiB:  131  259  387  387  387  507  507  507 ... 507   (top layer: 129 throughout)
+256 MiB:  259  515  515  515  515  515  515  515 ... 515   (top layer: 257 throughout)
+```
+
+Each cycle overwrites the whole file, and each overwrite adds a fresh set of
+clusters to the image while the clusters it replaced are never released — so the
+image climbs until ext4 starts reusing blocks and then plateaus, at ~4× the live
+data for 128 MiB and ~2× for 256 MiB. The top layer, which is what the *seal*
+touches, stays exactly at the file size; only the base accumulates.
+
+The direct reading is that nothing punches the freed blocks back out: the guest
+does not discard, and the disk is not configured to pass discards through. If
+that is right, mounting with `discard` (or a periodic `fstrim`) plus
+`DiskConfig` discard support would hold the image near the live data and take
+most of the flatten cost with it. That inference is not tested — no discard
+experiment has been run — but it is the cheapest thing to try before any of the
+flatten-policy options above, because it shrinks the input rather than
+rescheduling the work.
+
 ## Caveats
 
 * **Durations are shorter than the committed ones.** `tests.yaml` runs the two
@@ -255,15 +333,17 @@ constant-time pause the arrangement exists to provide.
 
 ## Follow-ups
 
-1. Settle the flatten policy. This is what blocks making qcow2 the default:
+1. Try discard. The flatten reads an image that plateaus at 2–4× the live data
+   because nothing releases the clusters an overwrite replaces. Shrinking the
+   input is cheaper than rescheduling the flatten, and it would help the upload
+   and the download too.
+2. Settle the flatten policy. This is what blocks making qcow2 the default:
    with `MAX_CHAIN=1` it costs 19.6 s of `qemu-img convert -c` on every
    500 MiB resume. Measuring the uncompressed convert is the cheapest first
    step.
-2. Re-run the two largest steps at their committed 20m and 30m durations, now
+3. Re-run the two largest steps at their committed 20m and 30m durations, now
    that the route timeout no longer caps a write at 10 s. Until then the sweep
    has no valid data point above 500 MiB.
-3. Find the crossover between 64 and 500 MiB, which is where a size-based
-   default would have to sit.
 4. Instrument the landing step. `Landed the durable-dir chain` records the
    chain's size but not how long the download took, which is the one part of
    the restore path still unaccounted for.
