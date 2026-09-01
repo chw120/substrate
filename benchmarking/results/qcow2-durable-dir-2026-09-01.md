@@ -76,6 +76,11 @@ checkpoint in the qcow2 arm reports two.
 >
 > The 1 GiB row is reproduced below for completeness and is excluded from every
 > conclusion. The other four steps are clean in both arms.
+>
+> The cause is Envoy's route timeout, which defaults to 10 s and which
+> `hack/install-ate.sh` had no way to raise, so the router on this cluster ran
+> without `--route-timeout` at all. The script now takes `--route-timeout`; see
+> [REPRODUCING.md](REPRODUCING.md).
 
 ## Results
 
@@ -169,22 +174,62 @@ show up in `SuspendActor` at all.
 rather than a virtio-fs share, and the guest page cache does the rest. This is
 a real benefit that Proposal 5 does not claim.
 
-**`ResumeActor` regresses 1.9–4.1× and is not explained by ateom's own
-accounting.** 1 200 → 2 300 ms at 5 MiB, 1 400 → 9 500 ms at 64 MiB, 5 900 →
-24 000 ms at 500 MiB. Yet ateom's boot decomposition is nearly identical between
-the arms: `since_boot` sits at roughly 1.0 s in both at 500 MiB, and
-`Actor restore phases` reports `durable: 0` in both, because both arms take the
-cold-boot path for durable-dir actors rather than a memory restore. So the extra
-time is spent before ateom starts working — most plausibly queuing for a worker,
-since the qcow2 arm completes only 60–65% as many cycles per unit time
-(16 vs 25 at 500 MiB) with a single-replica pool. That is a hypothesis, not a
-measurement: the resume path is not instrumented finely enough to attribute it,
-and closing this gap is the main follow-up.
+**`ResumeActor` regresses 1.9–4.1×, and the whole regression is the flatten on
+the restore path.** See [the next section](#where-the-resumeactor-regression-goes).
 
-**One flatten failed.** The qcow2 arm logged a single
-`Failed to flatten the durable-dir chain; continuing on the deep chain` in the
-500 MiB scenario, out of 16 checkpoints. The fallback behaved as intended — the
-actor kept running on the unflattened chain — but the cause is unknown.
+**One flatten failed, at the end of the scenario.** The qcow2 arm logged a
+single `Failed to flatten the durable-dir chain; continuing on the deep chain`
+in the 500 MiB run, with `err: signal: killed`. The restore it belonged to
+started at 07:47:19.813Z and returned `context canceled` after 11.84 s; the
+500 MiB scenario's 10-minute window closed at ~07:47:18Z. So the harness tore
+down while a flatten was in flight, the `RestoreWorkload` context was canceled,
+and `qemu-img convert` was killed with it. This is an artifact of stopping the
+run, not a defect — and the fallback did the right thing, leaving the arriving
+chain intact and mountable.
+
+## Where the ResumeActor regression goes
+
+Not queuing. `flattenDurableQcow2` runs on the **restore** path
+([`durableqcow2.go:214`](../../cmd/ateom-microvm/durableqcow2.go)), and its own
+`took` accounts for nearly all of the gap:
+
+| Size | ResumeActor tar → qcow2 | Difference | Flatten p50 | Restore total tar → qcow2 | Chain landed |
+|---|---|---|---|---|---|
+| 5 MiB | 1 200 → 2 300 | +1 100 | 810 | 0.97 s → 1.95 s | 33 MiB |
+| 10 MiB | 1 200 → 2 800 | +1 600 | 1 194 | 0.97 s → 2.38 s | 53 MiB |
+| 64 MiB | 1 400 → 9 500 | +8 100 | 7 491 | 1.00 s → 8.68 s | 315 MiB |
+| 500 MiB | 5 900 → 24 000 | +18 100 | 19 559 | 3.91 s → 21.10 s | 1 123 MiB |
+
+Two things compound:
+
+1. **`MAX_CHAIN=1` makes the flatten fire on every single restore.** The guard
+   is `len(layers) >= qcow2.MaxChain()`, and a landed chain always has at least
+   one layer. The code comment describes the cost as "one restore in every
+   `MaxChain()`" — true at the default of 8, but at 1 it is every restore. This
+   setting is what makes the *seal* comparable between the arms, so the
+   comparison above is honest about the paused window and simultaneously shows
+   the resume path at its worst case. Both readings are correct; they are just
+   about different halves of the cycle.
+2. **`qcow2.Flatten` runs `qemu-img convert -c`**, i.e. zlib. At 500 MiB it
+   compresses a 1 123 MiB chain down to a 622 MiB base in 19.6 s, about
+   57 MiB/s — CPU-bound and linear in the data, which is exactly the shape of
+   the regression.
+
+Two hypotheses this rules out:
+
+* **Queuing for a worker.** The load is one serial user against a one-replica
+  pool, and the regression grows with size; queuing has neither property. The
+  earlier reading of this data blamed queuing, and that was wrong.
+* **The qcow2 image bloating with the ext4 free space.** The flattened base is
+  622 MiB for 500 MiB of data. Sparseness is working; the chain is 2.2× the
+  data because `MAX_CHAIN=1` keeps a full base plus a full delta, and the
+  workload rewrites the whole file every cycle, so the delta dedupes to nothing.
+
+The fix is a flatten policy, not an instrumentation gap. The options, none of
+them measured yet: drop `-c` and trade image size for CPU; move the flatten off
+the restore path to a background job, which needs an answer for a suspend that
+arrives mid-flatten; or flatten at seal instead and give back part of the
+constant-time pause the arrangement exists to provide.
 
 ## Caveats
 
@@ -210,13 +255,15 @@ actor kept running on the unflattened chain — but the cause is unknown.
 
 ## Follow-ups
 
-1. Fix the 1 GiB `DurDirWrite` timeout — raise the client timeout or split the
-   write — and re-run the two largest steps at their committed 20m and 30m
-   durations. Until then the sweep has no valid data point above 500 MiB.
-2. Instrument the resume path finely enough to attribute the `ResumeActor`
-   regression. If it is queuing, it is a throughput artifact of a
-   single-replica pool and not a property of the arrangement; if it is not,
-   it blocks making qcow2 the default.
+1. Settle the flatten policy. This is what blocks making qcow2 the default:
+   with `MAX_CHAIN=1` it costs 19.6 s of `qemu-img convert -c` on every
+   500 MiB resume. Measuring the uncompressed convert is the cheapest first
+   step.
+2. Re-run the two largest steps at their committed 20m and 30m durations, now
+   that the route timeout no longer caps a write at 10 s. Until then the sweep
+   has no valid data point above 500 MiB.
 3. Find the crossover between 64 and 500 MiB, which is where a size-based
    default would have to sit.
-4. Investigate the single flatten failure at 500 MiB.
+4. Instrument the landing step. `Landed the durable-dir chain` records the
+   chain's size but not how long the download took, which is the one part of
+   the restore path still unaccounted for.
