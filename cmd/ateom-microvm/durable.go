@@ -44,6 +44,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/kata"
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/qcow2"
@@ -68,6 +69,21 @@ func hasDurableVolumes(containers []*ateompb.Container) bool {
 		}
 	}
 	return false
+}
+
+// durableVolumeNames returns the actor's durable-dir volume names, sorted and
+// deduplicated. On the disk arrangement each one is a top-level directory of
+// the filesystem in the image, and the guest has to create them (see
+// kata.CreateSandboxOpts.DurableVolumes).
+func durableVolumeNames(containers []*ateompb.Container) []string {
+	var names []string
+	for _, c := range containers {
+		for _, m := range c.GetDurableDirVolumeMounts() {
+			names = append(names, m.GetVolumeName())
+		}
+	}
+	slices.Sort(names)
+	return slices.Compact(names)
 }
 
 // prepareDurableVolumes settles which arrangement serves this boot's durable-dir

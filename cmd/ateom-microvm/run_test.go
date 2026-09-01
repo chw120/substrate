@@ -226,6 +226,10 @@ func TestBuildVMConfigDurableDisk(t *testing.T) {
 	if got.ImageType != "Qcow2" {
 		t.Errorf("Disks[1].ImageType = %q, want Qcow2 so the backing chain is followed", got.ImageType)
 	}
+	if !got.BackingFiles {
+		t.Error("Disks[1].BackingFiles is false; cloud-hypervisor rejects a qcow2 with a backing " +
+			"file as \"Maximum disk nesting depth exceeded\"")
+	}
 }
 
 // The SIGTERM path signals these ids over ttrpc, and the agent rejects an id it

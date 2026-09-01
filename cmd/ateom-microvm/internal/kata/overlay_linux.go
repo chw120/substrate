@@ -371,7 +371,7 @@ func (a *AgentClient) CreateSandboxForActor(ctx context.Context, opts CreateSand
 		MountPoint: guestSharedDir,
 	}}
 	if opts.DurableDisk {
-		storages = append(storages, durableDiskStorage())
+		storages = append(storages, durableDiskStorages(opts.DurableVolumes)...)
 	}
 	return a.CreateSandbox(ctx, &agentpb.CreateSandboxRequest{
 		Hostname:  opts.Hostname,

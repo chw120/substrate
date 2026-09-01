@@ -290,8 +290,14 @@ type ImageInfo struct {
 // before handing the top of a chain to cloud-hypervisor: a chain with a hole
 // in it must not mount, because what the guest would see is a filesystem whose
 // missing clusters read as zeroes.
+//
+// -U because a sealing suspend reads the chain of a disk cloud-hypervisor still
+// has open — pausing the guest does not drop CH's write lock on the image, and
+// without it qemu-img refuses with "Failed to lock byte 201". Safe here: this
+// only reads headers, and the guest is paused, so what it reads cannot change
+// under it.
 func BackingChain(ctx context.Context, path string) ([]ImageInfo, error) {
-	out, err := run(ctx, qemuImg, "info", "--output=json", "--backing-chain", "-f", "qcow2", path)
+	out, err := run(ctx, qemuImg, "info", "-U", "--output=json", "--backing-chain", "-f", "qcow2", path)
 	if err != nil {
 		return nil, fmt.Errorf("reading the qcow2 backing chain of %q: %w (%s)", path, err, out)
 	}

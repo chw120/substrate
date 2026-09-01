@@ -94,7 +94,10 @@ if qemu-img create -q -f qcow2 -F qcow2 -b base.qcow2 "$work/delta.qcow2" 2>/dev
 else
   bad "qemu-img create rejects -F; this version is too old to record the backing format, and CH will probe it instead"
 fi
-if [[ "$(cd "$work" && qemu-img info --output=json --backing-chain -f qcow2 delta.qcow2 | grep -c '"filename"')" == 2 ]]; then
+# One "image:" line per image in the chain. The plain output rather than the
+# JSON: qemu-img 10 reports each image's protocol child as a nested object with
+# its own "filename", so counting that key in the JSON overcounts.
+if [[ "$(cd "$work" && qemu-img info --backing-chain -f qcow2 delta.qcow2 | grep -c '^image:')" == 2 ]]; then
   ok "--backing-chain walks the chain"
 else
   bad "qemu-img info --backing-chain did not report both layers"

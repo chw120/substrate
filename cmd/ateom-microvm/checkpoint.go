@@ -215,6 +215,15 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 		})
 	}
 	if err := g.Wait(); err != nil {
+		// Leave the guest running rather than paused. A paused guest still looks
+		// alive to everything outside it, but nothing in it can run — and on the
+		// disk arrangement the next suspend's pre-pause flush is an exec into
+		// that guest, which then blocks until its deadline. One failed capture
+		// would cost the actor every later suspend.
+		if rerr := client.Resume(ctx); rerr != nil {
+			slog.WarnContext(ctx, "failed to resume guest after a failed capture",
+				slog.String("actorUID", actorUID), slog.Any("err", rerr))
+		}
 		return nil, err
 	}
 

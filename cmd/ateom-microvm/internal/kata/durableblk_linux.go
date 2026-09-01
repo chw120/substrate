@@ -27,6 +27,8 @@ package kata
 // is under the share — only its origin differs.
 
 import (
+	"path"
+
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/third_party/kata/agentpb"
 	"github.com/agent-substrate/substrate/internal/ocispec"
 )
@@ -36,6 +38,10 @@ const (
 	// Source that already starts with /dev the agent uses the device node as
 	// given, rather than resolving a PCI path to one.
 	virtioBlkDriver = "blk"
+	// localDriver is the agent storage driver that only creates its mount point.
+	// Nothing is mounted; the agent mkdir -p's the directory and applies the
+	// mode from the options.
+	localDriver = "local"
 	// typeExt4 is the filesystem inside a durable image (see qcow2.CreateBase).
 	typeExt4 = "ext4"
 )
@@ -70,15 +76,37 @@ type CreateSandboxOpts struct {
 	// actor on the virtio-fs arrangement, where durable volumes arrive through
 	// the shared filesystem and the guest mounts nothing extra.
 	DurableDisk bool
+	// DurableVolumes are the actor's durable-dir volume names. Each becomes a
+	// top-level directory of the mounted filesystem. Only used with
+	// DurableDisk.
+	DurableVolumes []string
 }
 
-// durableDiskStorage is the agent storage entry that mounts it.
-func durableDiskStorage() *agentpb.Storage {
-	return &agentpb.Storage{
+// durableDiskStorages are the agent storage entries for the durable disk: the
+// ext4 mount itself, then one directory per volume inside it.
+//
+// The per-volume directories have to be created here because nobody else can.
+// On the virtio-fs arrangement atelet mkdir's them on the host before the share
+// is bound, and the guest sees them through virtiofsd; on this one the
+// filesystem lives inside the image and the host never mounts it. Without them
+// a container's bind mount has no source and the agent fails CreateContainer
+// with ENOENT.
+func durableDiskStorages(volumes []string) []*agentpb.Storage {
+	out := []*agentpb.Storage{{
 		Driver:     virtioBlkDriver,
 		Source:     DurableDiskDevice,
 		Fstype:     typeExt4,
 		Options:    DurableDiskMountOptions,
 		MountPoint: ocispec.GuestDurableDir,
+	}}
+	for _, v := range volumes {
+		out = append(out, &agentpb.Storage{
+			Driver: localDriver,
+			// 0700: the host side is atelet's 0o700 durable volume directory,
+			// and the workload reaches it as root inside the guest.
+			Options:    []string{"mode=0700"},
+			MountPoint: path.Join(ocispec.GuestDurableDir, v),
+		})
 	}
+	return out
 }

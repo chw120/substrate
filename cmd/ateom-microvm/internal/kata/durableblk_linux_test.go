@@ -27,7 +27,11 @@ import (
 // position buildVMConfig gives the disk; the mount point must be the directory
 // the container specs bind their durable volumes out of.
 func TestDurableDiskStorage(t *testing.T) {
-	s := durableDiskStorage()
+	all := durableDiskStorages(nil)
+	if len(all) != 1 {
+		t.Fatalf("durableDiskStorages(nil) = %v, want the disk mount alone", all)
+	}
+	s := all[0]
 	if s.GetDriver() != virtioBlkDriver {
 		t.Errorf("Driver = %q, want %q", s.GetDriver(), virtioBlkDriver)
 	}
@@ -52,5 +56,35 @@ func TestDurableDiskStorage(t *testing.T) {
 	}
 	if !slices.Contains(s.GetOptions(), "commit=1") {
 		t.Error("the durable disk is mounted without commit=1; a suspend could lose seconds of writes")
+	}
+}
+
+// The per-volume directories live inside the image, so the host cannot create
+// them the way atelet does for the virtio-fs arrangement. If the guest does not
+// create them either, a container's durable bind mount has no source and the
+// agent fails CreateContainer with ENOENT.
+func TestDurableDiskStoragesCreateVolumeDirs(t *testing.T) {
+	got := durableDiskStorages([]string{"data", "cache"})
+	if len(got) != 3 {
+		t.Fatalf("durableDiskStorages(2 volumes) returned %d entries, want the mount plus one per volume", len(got))
+	}
+	// The mount has to come first: the directories are created inside it.
+	if got[0].GetDriver() != virtioBlkDriver {
+		t.Errorf("entry 0 driver = %q, want the disk mount %q first", got[0].GetDriver(), virtioBlkDriver)
+	}
+	for i, want := range []string{
+		ocispec.GuestDurableDir + "/data",
+		ocispec.GuestDurableDir + "/cache",
+	} {
+		e := got[i+1]
+		if e.GetDriver() != localDriver {
+			t.Errorf("entry %d driver = %q, want %q", i+1, e.GetDriver(), localDriver)
+		}
+		if e.GetMountPoint() != want {
+			t.Errorf("entry %d MountPoint = %q, want %q", i+1, e.GetMountPoint(), want)
+		}
+		if e.GetSource() != "" || e.GetFstype() != "" {
+			t.Errorf("entry %d = %+v, want no source or fstype: nothing is mounted", i+1, e)
+		}
 	}
 }

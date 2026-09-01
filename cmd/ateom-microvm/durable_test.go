@@ -19,6 +19,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/agent-substrate/substrate/internal/proto/ateompb"
@@ -52,6 +53,28 @@ func TestHasDurableVolumes(t *testing.T) {
 				t.Errorf("hasDurableVolumes() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// The names drive the directories the guest creates inside the durable image,
+// so two containers sharing a volume must not produce it twice, and the order
+// has to be stable for the storage list to be.
+func TestDurableVolumeNames(t *testing.T) {
+	got := durableVolumeNames([]*ateompb.Container{
+		{Name: "app", DurableDirVolumeMounts: []*ateompb.DurableDirVolumeMount{
+			{VolumeName: "state", MountPath: "/var/state"},
+			{VolumeName: "data", MountPath: "/var/data"},
+		}},
+		{Name: "sidecar", DurableDirVolumeMounts: []*ateompb.DurableDirVolumeMount{
+			{VolumeName: "data", MountPath: "/mnt/data"},
+		}},
+		{Name: "plain"},
+	})
+	if want := []string{"data", "state"}; !slices.Equal(got, want) {
+		t.Errorf("durableVolumeNames() = %v, want %v", got, want)
+	}
+	if got := durableVolumeNames(nil); len(got) != 0 {
+		t.Errorf("durableVolumeNames(nil) = %v, want empty", got)
 	}
 }
 

@@ -590,7 +590,8 @@ func (s *AteomService) coldBootActor(ctx context.Context, p actorBootParams) (re
 	}()
 
 	// Post-boot kata-agent setup: sandbox, guest networking, start each container.
-	if err := s.startActorContainers(ctx, ac, actorUID, vsockPath, ctrs, durableDisk); err != nil {
+	if err := s.startActorContainers(ctx, ac, actorUID, vsockPath, ctrs, durableDisk,
+		durableVolumeNames(containers)); err != nil {
 		return err
 	}
 	tContainers := time.Now()
@@ -866,9 +867,11 @@ func buildVMConfig(id, kernel, image, durableImage, kparams, consoleLog string, 
 		// kata.DurableDiskDevice — the guest finds it by enumeration order, so
 		// this must stay second). Qcow2 rather than Raw: the image is the top of
 		// a backing chain, and CH has to follow the header's backing pointers
-		// rather than read the file as a flat disk.
+		// rather than read the file as a flat disk. BackingFiles is what permits
+		// that; without it CH refuses the image outright.
 		disks = append(disks, ch.DiskConfig{
-			Path: durableImage, ImageType: "Qcow2", NumQueues: int32(vcpus), QueueSize: 1024,
+			Path: durableImage, ImageType: "Qcow2", BackingFiles: true,
+			NumQueues: int32(vcpus), QueueSize: 1024,
 		})
 	}
 	return ch.VmConfig{
@@ -909,7 +912,7 @@ func buildFsConfigs(id string) []ch.FsConfig {
 // does at boot: establish the sandbox once (mounting the kataShared virtio-fs base),
 // configure guest networking (eth0 IP/MAC/MTU + routes) once, then start each
 // container on its own overlay rootfs. On failure it dumps guest diagnostics.
-func (s *AteomService) startActorContainers(ctx context.Context, ac *kata.AgentClient, id, vsockPath string, ctrs []actorContainer, durableDisk bool) error {
+func (s *AteomService) startActorContainers(ctx context.Context, ac *kata.AgentClient, id, vsockPath string, ctrs []actorContainer, durableDisk bool, durableVolumes []string) error {
 	// Establish the agent sandbox + the kataShared virtio-fs mount (every
 	// container's merged rootfs, durable volumes, CSI volumes, and system-info
 	// volumes) and, with durableDisk, the guest's own mount of the durable-dir
@@ -917,9 +920,10 @@ func (s *AteomService) startActorContainers(ctx context.Context, ac *kata.AgentC
 	tStart := time.Now()
 	sbCtx, sbCancel := context.WithTimeout(ctx, 20*time.Second)
 	err := ac.CreateSandboxForActor(sbCtx, kata.CreateSandboxOpts{
-		SandboxID:   id,
-		Hostname:    ctrs[0].spec.Hostname,
-		DurableDisk: durableDisk,
+		SandboxID:      id,
+		Hostname:       ctrs[0].spec.Hostname,
+		DurableDisk:    durableDisk,
+		DurableVolumes: durableVolumes,
 	})
 	sbCancel()
 	if err != nil {

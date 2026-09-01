@@ -82,6 +82,12 @@ type DiskConfig struct {
 	NumQueues int32  `json:"num_queues,omitempty"`
 	QueueSize int32  `json:"queue_size,omitempty"`
 	ImageType string `json:"image_type,omitempty"`
+	// BackingFiles lets CH follow a qcow2 header's backing pointer. It defaults
+	// to false, and a qcow2 with a backing file then fails to open with
+	// "Maximum disk nesting depth exceeded". CH also force-disables it when
+	// ImageType is left empty and the type is autodetected, so the two fields
+	// have to be set together.
+	BackingFiles bool `json:"backing_files,omitempty"`
 }
 
 // RngConfig sets the entropy source (kata uses /dev/urandom).

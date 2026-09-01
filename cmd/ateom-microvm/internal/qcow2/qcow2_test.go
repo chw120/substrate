@@ -18,11 +18,14 @@ package qcow2
 
 import (
 	"context"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // probeSizeBytes is the virtual size the tests build images at: above
@@ -189,6 +192,23 @@ func TestChainRoundTrip(t *testing.T) {
 	}
 	if err := Check(ctx, top); err != nil {
 		t.Errorf("Check() = %v", err)
+	}
+
+	// Sealing a suspend reads the chain of a disk cloud-hypervisor still holds
+	// open — pausing the guest does not drop its image lock. Byte 201 is the one
+	// qemu names in "Failed to lock byte 201", so holding it reproduces exactly
+	// what a live VM does to a chain walk.
+	f, err := os.OpenFile(top, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	lock := unix.Flock_t{Type: unix.F_WRLCK, Whence: io.SeekStart, Start: 201, Len: 1}
+	if err := unix.FcntlFlock(f.Fd(), unix.F_OFD_SETLK, &lock); err != nil {
+		t.Fatalf("locking byte 201 of %q: %v", top, err)
+	}
+	if _, err := BackingChain(ctx, top); err != nil {
+		t.Errorf("BackingChain() on an image a running VM holds open = %v", err)
 	}
 }
 
