@@ -75,6 +75,7 @@ function usage() {
   echo "  --atenet-router=envoy|agentgateway     Select the ingress and egress dataplane (default: envoy)"
   echo "  --podcert-workers-per-signer N         Concurrent workers per podcertificate-controller signer (default: 1)"
   echo "  --rollout-timeout DURATION             Per-workload readiness wait timeout, kubectl-style Go duration (default: 60s)"
+  echo "  --route-timeout DURATION               Envoy's end-to-end timeout on the workload route, Go duration (default: the router's own 10s). Raise it for actors whose turns or writes legitimately run long; at the default they come back as a 504"
   echo "  --otlp-endpoint URL                    Send all control plane telemetry to URL, not to the cluster default (see benchmarking/telemetry/README.md)"
   echo ""
   echo "Experiments:"
@@ -194,6 +195,15 @@ rollout_timeout() {
   local timeout="${ATE_INSTALL_ROLLOUT_TIMEOUT:-60s}"
   if ! [[ "${timeout}" =~ ^(0|([0-9]+(h|m|s))+)$ ]]; then
     echo "Error: --rollout-timeout must be a Go duration like 300s, 10m, or 1h30m (or 0 for no timeout), got '${timeout}'" >&2
+    exit 1
+  fi
+  echo "${timeout}"
+}
+
+route_timeout() {
+  local timeout="${ATE_INSTALL_ROUTE_TIMEOUT:-}"
+  if ! [[ "${timeout}" =~ ^([0-9]+(h|m|s|ms))+$ ]]; then
+    echo "Error: --route-timeout must be a Go duration like 5m, 300s, or 1h30m, got '${timeout}'" >&2
     exit 1
   fi
   echo "${timeout}"
@@ -484,6 +494,66 @@ apply_podcert_workers_override() {
     WORKERS_PER_SIGNER="${workers}"
 }
 
+# apply_route_timeout_override raises Envoy's end-to-end timeout on the
+# workload route. At the 10s default a request whose response legitimately
+# takes longer -- a large DurableDir write, an LLM completion relayed through a
+# harness -- comes back as a 504 that looks like the actor failed.
+#
+# It patches the Deployment after the apply rather than templating the arg into
+# the manifest: the envoy router ships as one plain YAML resolved through ko,
+# with no overlay to hook, and the value has to survive both the whole-directory
+# apply and --deploy-atenet.
+#
+# Raising this does not stretch shutdown. drainTimeout() derives from the
+# DEFAULT route timeout on purpose, so a long ceiling cannot push the drain past
+# terminationGracePeriodSeconds. Pair it with an explicit --drain-timeout only
+# if long turns should also survive a router restart.
+apply_route_timeout_override() {
+  if [[ -z "${ATE_INSTALL_ROUTE_TIMEOUT:-}" ]]; then
+    return 0
+  fi
+
+  if [[ "$(atenet_router)" != "envoy" ]]; then
+    echo "Error: --route-timeout requires --atenet-router=envoy; the agentgateway dataplane is statically configured" >&2
+    exit 1
+  fi
+
+  local timeout=""
+  timeout="$(route_timeout)"
+  local arg="--route-timeout=${timeout}"
+
+  local current=""
+  current="$(run_kubectl -n ate-system get deployment/atenet-router \
+    -o jsonpath='{range .spec.template.spec.containers[0].args[*]}{@}{"\n"}{end}' 2>/dev/null || true)"
+  if [[ -z "${current}" ]]; then
+    echo "Error: --route-timeout: deployment/atenet-router has no args to patch" >&2
+    exit 1
+  fi
+
+  # An add at "-" would stack a second copy on a re-run, and Envoy would take
+  # whichever pflag saw last rather than erroring, so replace in place when the
+  # flag is already there.
+  local path="/spec/template/spec/containers/0/args/-"
+  local op="add"
+  local idx=0
+  local line=""
+  while IFS= read -r line; do
+    if [[ "${line}" == "${arg}" ]]; then
+      return 0
+    fi
+    if [[ "${line}" == --route-timeout=* ]]; then
+      op="replace"
+      path="/spec/template/spec/containers/0/args/${idx}"
+      break
+    fi
+    idx=$((idx + 1))
+  done <<<"${current}"
+
+  echo "Overriding the atenet-router route timeout with ${timeout}"
+  run_kubectl -n ate-system patch deployment/atenet-router --type=json \
+    -p "[{\"op\":\"${op}\",\"path\":\"${path}\",\"value\":\"${arg}\"}]"
+}
+
 create_api_authentication_config() {
   log_step "create_api_authentication_config"
   run_kubectl create namespace ate-system --dry-run=client -o yaml \
@@ -591,6 +661,7 @@ deploy_ate_system() {
   # variant of each.
   ensure_egress_mitm_ca_pool_secret
   apply_atenet_egress
+  apply_route_timeout_override
 
   log_step "Waiting for ATE system components to be ready..."
   run_kubectl rollout status statefulset/postgres -n ate-system --timeout="$(rollout_timeout)"
@@ -679,6 +750,7 @@ deploy_atenet() {
 
   ensure_egress_mitm_ca_pool_secret
   apply_atenet_egress
+  apply_route_timeout_override
   run_ko apply -f manifests/ate-install/atenet-dns.yaml
   run_kubectl rollout status deployment/atenet-router -n ate-system --timeout="$(rollout_timeout)"
   run_kubectl rollout status deployment/atenet-egress -n ate-system --timeout="$(rollout_timeout)"
@@ -988,6 +1060,14 @@ for ((i = 0; i < ${#prescan_args[@]}; i++)); do
       fi
       ATE_INSTALL_ROLLOUT_TIMEOUT="${prescan_args[$((i + 1))]}"
       ;;
+    --route-timeout=*) ATE_INSTALL_ROUTE_TIMEOUT="${prescan_args[i]#*=}" ;;
+    --route-timeout)
+      if (( i + 1 >= ${#prescan_args[@]} )); then
+        echo "Error: --route-timeout requires a Go duration (e.g. 5m, 300s)" >&2
+        exit 1
+      fi
+      ATE_INSTALL_ROUTE_TIMEOUT="${prescan_args[$((i + 1))]}"
+      ;;
     --benchmark-worker-count)
       BENCHMARK_WORKER_COUNT="${prescan_args[i+1]:-1}"
       ;;
@@ -1037,6 +1117,9 @@ case "${BENCHMARK_SANDBOX_CLASS}" in
 esac
 podcert_workers_per_signer >/dev/null
 rollout_timeout >/dev/null
+if [[ -n "${ATE_INSTALL_ROUTE_TIMEOUT:-}" ]]; then
+  route_timeout >/dev/null
+fi
 
 while [[ "$#" -gt 0 ]]; do
   # Run ${demo}_cmdline if it exists. If it returns 0, then we successfully
@@ -1083,6 +1166,15 @@ while [[ "$#" -gt 0 ]]; do
         exit 1
       fi
       ATE_INSTALL_ROLLOUT_TIMEOUT="$1"
+      ;;
+    --route-timeout=*) ATE_INSTALL_ROUTE_TIMEOUT="${1#*=}" ;;
+    --route-timeout)
+      shift
+      if [[ "$#" -eq 0 ]]; then
+        echo "Error: --route-timeout requires a Go duration (e.g. 5m, 300s)" >&2
+        exit 1
+      fi
+      ATE_INSTALL_ROUTE_TIMEOUT="$1"
       ;;
 
     --deploy-ate-system) deploy_ate_system ;;

@@ -173,17 +173,24 @@ Envoy's route timeout defaults to 10 s (`defaultRouteTimeout` in
 `DurDirOverwrite` ~11 s, so without this every iteration returns
 `HTTP 504: upstream request timeout`.
 
+Pass it to the installer, which applies it to `deployment/atenet-router` after
+the manifest lands and re-applies it on every `--deploy-atenet`:
+
+```bash
+./hack/install-ate.sh --route-timeout 5m --deploy-ate-system
+```
+
+Against a cluster that is already up and that you do not want to reinstall, the
+same patch by hand:
+
 ```bash
 kubectl -n ate-system patch deploy atenet-router --type=json \
   -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--route-timeout=5m"}]'
 kubectl -n ate-system rollout status deploy/atenet-router --timeout=300s
 ```
 
-This is imperative and will not survive `--delete-ate-system` or an
-orchestrator redeploy. `hack/install-ate.sh` has no `--route-timeout`
-passthrough, so the per-test `ateArgs` hook in `tests.yaml` cannot express it
-either; adding one (following the existing `patch_atenet_egress_manifest`
-idiom) is the fix that would make the 1 GiB scenarios runnable unattended.
+The hand patch is imperative and will not survive `--delete-ate-system` or an
+orchestrator redeploy; the flag will.
 
 Sizes up to 500 MiB do not need this — but 500 MiB writes land at ~6.9 s
 against a 10 s ceiling, which is close enough that a slow day could flake.
