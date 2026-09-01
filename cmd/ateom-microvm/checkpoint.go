@@ -133,8 +133,14 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 				"actor %s serves durable-dir volumes from a disk but has no running container to flush the guest through", actorUID)
 		}
 		var err error
-		dFlush, err = flushGuestFilesystems(ctx, ra.guestAgent, ra.workloadIDs[0])
+		dFlush, err = flushGuestFilesystems(ctx, ra.guestAgent, actorUID, ra.workloadIDs)
 		if err != nil {
+			// Fatal, and it keeps the actor on this worker until something
+			// evicts it. The alternative is a suspend that reports success
+			// having dropped whatever the guest had not written back, which is
+			// worse: an actor that cannot suspend is visible, and one that
+			// suspends lossily is not. Which of the two a hostile actor gets to
+			// choose is the open question in flushGuestFilesystems.
 			return nil, err
 		}
 	}

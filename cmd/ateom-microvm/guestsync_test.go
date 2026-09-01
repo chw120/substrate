@@ -113,8 +113,8 @@ func TestGuestSyncHelperRuns(t *testing.T) {
 		t.Errorf("the helper wrote %q; it must be silent", out)
 	}
 
-	// Staged again over itself, as every boot does — including over an inode a
-	// previous guest may still hold open.
+	// Staged again over itself, as every boot and every flush does — including
+	// over an inode a previous guest may still hold open.
 	if err := stageGuestSync(dir); err != nil {
 		t.Errorf("stageGuestSync() a second time = %v", err)
 	}
@@ -123,6 +123,53 @@ func TestGuestSyncHelperRuns(t *testing.T) {
 	}
 	if _, err := os.Stat(path + ".tmp"); err == nil {
 		t.Error("stageGuestSync() left its temporary file in the actor's rootfs")
+	}
+}
+
+// The helper sits in a filesystem the ACTOR can write to, and a failed flush
+// fails the suspend — so anything the actor can leave at that path and not have
+// replaced is a way for it to pin itself to a worker. Deleting it is the
+// accidental case (an image that tidies /); a directory is the one that would
+// otherwise stick, since rename cannot replace one.
+func TestStageGuestSyncReplacesWhateverTheActorLeft(t *testing.T) {
+	if _, ok := syncProgram[runtime.GOARCH]; !ok {
+		t.Skipf("no guest sync helper for %s", runtime.GOARCH)
+	}
+	for name, sabotage := range map[string]func(t *testing.T, path string){
+		"deleted": func(t *testing.T, path string) {
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"replaced by a directory": func(t *testing.T, path string) {
+			if err := os.RemoveAll(path); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Join(path, "busy"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"replaced by a script": func(t *testing.T, path string) {
+			if err := os.WriteFile(path, []byte("#!/nope\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := stageGuestSync(dir); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, guestSyncName)
+			sabotage(t, path)
+
+			if err := stageGuestSync(dir); err != nil {
+				t.Fatalf("stageGuestSync() after the actor %s it = %v", name, err)
+			}
+			if err := exec.Command(path).Run(); err != nil {
+				t.Errorf("the restaged helper = %v", err)
+			}
+		})
 	}
 }
 

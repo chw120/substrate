@@ -154,6 +154,12 @@ func stageGuestSync(rootfs string) error {
 	if err := os.WriteFile(tmp, elf, 0o555); err != nil {
 		return fmt.Errorf("writing the guest sync helper to %q: %w", tmp, err)
 	}
+	// Whatever is at the destination goes, including a directory: rename over
+	// one fails, and an actor that made a directory there would otherwise have
+	// made itself permanently unsuspendable with a single mkdir.
+	if err := os.RemoveAll(path); err != nil {
+		return fmt.Errorf("clearing %q for the guest sync helper: %w", path, err)
+	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("installing the guest sync helper at %q: %w", path, err)

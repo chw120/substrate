@@ -118,12 +118,16 @@ func TestAdoptFileLinks(t *testing.T) {
 	}
 }
 
-// A guest with no agent connection cannot be flushed, and a suspend that
-// silently skipped the flush would lose the actor's most recent writes. It has
-// to be an error.
-func TestFlushGuestFilesystemsNeedsAnAgent(t *testing.T) {
-	if _, err := flushGuestFilesystems(context.Background(), nil, "app"); err == nil {
-		t.Fatal("flushGuestFilesystems() with no agent = nil, want an error")
+// A guest that cannot be flushed cannot be suspended: skipping the flush would
+// lose whatever the actor had not written back, and losing it silently is the
+// one outcome worse than failing. Both ways of having nothing to flush through
+// have to be errors.
+func TestFlushGuestFilesystemsNeedsSomewhereToRun(t *testing.T) {
+	if _, err := flushGuestFilesystems(context.Background(), nil, "actor", []string{"app"}); err == nil {
+		t.Error("flushGuestFilesystems() with no agent = nil, want an error")
+	}
+	if _, err := flushGuestFilesystems(context.Background(), nil, "actor", nil); err == nil {
+		t.Error("flushGuestFilesystems() with no containers = nil, want an error")
 	}
 }
 

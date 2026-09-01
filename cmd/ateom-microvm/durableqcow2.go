@@ -368,9 +368,19 @@ func adoptFile(src, dst string) error {
 // There is no kata-agent RPC for "sync". What there is, is the ability to run
 // a process in a container, and sync(2) is not namespaced — it flushes every
 // filesystem the guest kernel has mounted, whichever container asks. So this
-// execs a helper in the actor's first container and waits for it. The helper is
-// ateom's own (see guestsync.go), not the image's: most actor images are
-// distroless and have no sync in them at all.
+// execs a helper and waits for it. The helper is ateom's own (see
+// guestsync.go), not the image's: most actor images are distroless and have no
+// sync in them at all.
+//
+// The helper lives in the actor's own rootfs, which the actor can write to, so
+// it re-stages before each attempt and works down the containers rather than
+// betting the suspend on the first one. That covers an actor that removed it —
+// an image whose entrypoint tidies /, most likely. It does NOT cover one that
+// removes it in a loop: the file is unlinkable between the restage and the
+// exec, and closing that needs it to be a read-only bind mount instead, where
+// the unlink returns EBUSY. That is the fix this wants before production; it
+// needs a guest to test against, since nothing else in the micro-VM path binds
+// a file rather than a directory.
 //
 // Best-effort by return value, not by intent: the caller decides whether a
 // failed flush should fail the suspend. An image is not corrupted by a missed
@@ -380,13 +390,25 @@ func adoptFile(src, dst string) error {
 // Its cost is the top unmeasured quantity in this proposal, which is why
 // the duration comes back rather than being logged in here: the suspend log
 // puts it beside the memory snapshot it has to compete with.
-func flushGuestFilesystems(ctx context.Context, ac *kata.AgentClient, containerID string) (time.Duration, error) {
+func flushGuestFilesystems(ctx context.Context, ac *kata.AgentClient, actorUID string, containerIDs []string) (time.Duration, error) {
 	if ac == nil {
 		return 0, errors.New("no kata-agent connection to flush the guest through")
 	}
-	t := time.Now()
-	if err := ac.RunToCompletion(ctx, containerID, "ate-durable-sync", []string{guestSyncPath}); err != nil {
-		return time.Since(t), fmt.Errorf("while flushing guest filesystems: %w", err)
+	if len(containerIDs) == 0 {
+		return 0, errors.New("no running container to flush the guest through")
 	}
-	return time.Since(t), nil
+	t := time.Now()
+	var errs []error
+	for _, cid := range containerIDs {
+		if err := stageGuestSync(kata.MergedRootfsPath(actorUID, cid)); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if err := ac.RunToCompletion(ctx, cid, "ate-durable-sync", []string{guestSyncPath}); err != nil {
+			errs = append(errs, fmt.Errorf("in container %q: %w", cid, err))
+			continue
+		}
+		return time.Since(t), nil
+	}
+	return time.Since(t), fmt.Errorf("while flushing guest filesystems: %w", errors.Join(errs...))
 }
