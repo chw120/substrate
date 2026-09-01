@@ -184,6 +184,11 @@ a real benefit that Proposal 5 does not claim.
 
 **`ResumeActor` regresses 1.9–4.1×, and the whole regression is the flatten on
 the restore path.** See [the next section](#where-the-resumeactor-regression-goes).
+Most of that flatten is the `-c` in the `qemu-img convert` it runs, which on
+this workload costs 6.6× and saves nothing — see
+[The cost of `-c`](#the-cost-of--c). Strip the flatten out and landing a chain
+is constant-time too, and beats tar's unpack above ~200 MiB; see
+[The restore path without the flatten](#the-restore-path-without-the-flatten).
 
 **One flatten failed, at the end of the scenario.** The qcow2 arm logged a
 single `Failed to flatten the durable-dir chain; continuing on the deep chain`
@@ -233,9 +238,9 @@ Two hypotheses this rules out:
   data because `MAX_CHAIN=1` keeps a full base plus a full delta, and the
   workload rewrites the whole file every cycle, so the delta dedupes to nothing.
 
-The fix is a flatten policy, not an instrumentation gap. The options, none of
-them measured yet: drop `-c` and trade image size for CPU; move the flatten off
-the restore path to a background job, which needs an answer for a suspend that
+The fix is a flatten policy, not an instrumentation gap. The options: drop `-c`,
+measured in [The cost of `-c`](#the-cost-of--c) below; move the flatten off the
+restore path to a background job, which needs an answer for a suspend that
 arrives mid-flatten; or flatten at seal instead and give back part of the
 constant-time pause the arrangement exists to provide.
 
@@ -301,13 +306,136 @@ data for 128 MiB and ~2× for 256 MiB. The top layer, which is what the *seal*
 touches, stays exactly at the file size; only the base accumulates.
 
 The direct reading is that nothing punches the freed blocks back out: the guest
-does not discard, and the disk is not configured to pass discards through. If
-that is right, mounting with `discard` (or a periodic `fstrim`) plus
-`DiskConfig` discard support would hold the image near the live data and take
-most of the flatten cost with it. That inference is not tested — no discard
-experiment has been run — but it is the cheapest thing to try before any of the
-flatten-policy options above, because it shrinks the input rather than
-rescheduling the work.
+does not discard, and the disk is not configured to pass discards through.
+Mounting with `discard` (or a periodic `fstrim`) plus `DiskConfig` discard
+support would hold the image near the live data. That inference is not tested —
+no discard experiment has been run.
+
+How much it would buy, if the image fell all the way to the floor of one base
+plus one full top layer, is bounded by how far each size sits above that floor
+today:
+
+| Size | Chain now | Floor | Bloat | Flatten now | Flatten at the floor |
+|---|---|---|---|---|---|
+| 5 MiB | 33 MiB | ~10 MiB | 3.3× | 810 | ~240 |
+| 10 MiB | 53 MiB | ~20 MiB | 2.6× | 1 194 | ~450 |
+| 64 MiB | 315 MiB | ~130 MiB | 2.4× | 7 491 | ~3 100 |
+| 128 MiB | 507 MiB | ~258 MiB | 2.0× | 12 390 | ~6 300 |
+| 256 MiB | 515 MiB | ~514 MiB | **1.0×** | 8 732 | ~8 700 |
+| 500 MiB | 1 123 MiB | ~1 002 MiB | **1.1×** | 19 559 | ~17 400 |
+
+The bloat is a small-file effect, and it inverts the intuition: ext4's allocator
+roams when the file is small relative to the free space, so it takes many cycles
+to wrap around and start reusing LBAs, and every cycle until then adds clusters.
+A 500 MiB file in the same 32 GiB image wraps almost immediately and barely
+bloats at all. So discard would help most exactly where the absolute resume cost
+is already smallest, and would do nothing for the 256 and 500 MiB steps that
+dominate the regression. It is a storage-and-transfer argument — 507 MiB down to
+258 MiB is halved upload, download, and GCS footprint — not a latency one.
+
+## The cost of `-c`
+
+`Flatten` runs `qemu-img convert -f qcow2 -O qcow2 -c`. What the `-c` costs was
+measured directly, on the same worker node, against a synthetic chain built to
+match the 500 MiB arm's landed chain: 32 GiB virtual (the ateom default), a
+622 MiB compressed base standing in for a previous flatten's output, and a
+506 MiB uncompressed top standing in for the cycle's fresh guest writes —
+1 129 MiB in total against the real chain's 1 123 MiB. The payload is
+`crypto/rand`, because that is what the workload writes: `WriteDisk` fills the
+file from `crypto/rand`, so none of it compresses.
+
+The synthetic chain reproduces the measured cost. Times in ms, `qemu-img`
+10.0.11 on the `n2-standard-4` worker, `-T none -t none` so neither end goes
+through the page cache:
+
+| Command | Run 1 | Run 2 | Output |
+|---|---|---|---|
+| `convert -c` (what `Flatten` runs today) | 19 511 | 19 525 | 502 MiB |
+| `convert`, no `-c` | 2 952 | 2 950 | **502 MiB** |
+
+19 511 ms against the 19 559 ms p50 the 500 MiB arm actually recorded, a 0.2%
+match, so the synthetic stands in for the real thing.
+
+**Dropping `-c` is 6.6× faster and the output is not one byte larger.** On
+incompressible data deflate returns what it was given, so the whole 16.6 s is
+spent producing an image identical in size to the one a plain convert produces.
+
+Parallelism cannot recover it — compressed cluster writes do not scale with
+`convert`'s coroutine count:
+
+| Command | Time |
+|---|---|
+| `convert -c -m 1` | 24 398 |
+| `convert -c -m 8` (the default) | 19 511 |
+| `convert -c -m 16` | 19 871 |
+| `convert -m 16` | 2 984 |
+
+Applying the 6.6× to the flatten at every size, and subtracting the saving from
+the measured `ResumeActor` p50:
+
+| Size | tar | qcow2 now | qcow2 without `-c` | vs tar |
+|---|---|---|---|---|
+| 5 MiB | 1 200 | 2 300 | ~1 600 | 9.4× → 1.3× |
+| 10 MiB | 1 200 | 2 800 | ~1 800 | — |
+| 64 MiB | 1 400 | 9 500 | ~3 100 | 6.8× → 2.2× |
+| 128 MiB | 1 600 | 15 000 | ~4 500 | 9.4× → 2.8× |
+| 256 MiB | 2 600 | 11 000 | ~3 600 | 4.2× → 1.4× |
+| 500 MiB | 5 900 | 24 000 | ~7 400 | 4.1× → 1.3× |
+
+Only the first two columns are measured; the third is the measured 6.6× applied
+to the measured flatten, and the arithmetic assumes the rest of the restore is
+unchanged.
+
+The reason the scaling is legitimate is that the flatten is linear in the chain
+it reads — 41 MiB/s at every size up to 128 MiB, 57–59 MiB/s at 256 and 500 MiB:
+
+| Size | Chain | Flatten | Rate |
+|---|---|---|---|
+| 5 MiB | 33 MiB | 810 | 41 MiB/s |
+| 10 MiB | 53 MiB | 1 194 | 44 MiB/s |
+| 64 MiB | 315 MiB | 7 491 | 42 MiB/s |
+| 128 MiB | 507 MiB | 12 390 | 41 MiB/s |
+| 256 MiB | 515 MiB | 8 732 | 59 MiB/s |
+| 500 MiB | 1 123 MiB | 19 559 | 57 MiB/s |
+
+One caveat on generality: this workload is incompressible by construction, which
+is the worst case for `-c`'s benefit and a fair case for its cost. A workload
+with compressible data would get a smaller image out of `-c`, and the
+image-size-against-CPU trade would come back. That case has not been measured.
+The conclusion this run supports is narrower than "delete `-c`": for
+incompressible data it is pure loss, so the flatten wants to be told which it
+is dealing with rather than always compressing.
+
+## The restore path without the flatten
+
+Subtracting the flatten from the restore total isolates what the qcow2
+arrangement costs to land and mount, as against tar's unpack. Seconds, ateom
+side:
+
+| Size | tar restore | qcow2 restore | qcow2 minus flatten |
+|---|---|---|---|
+| 5 MiB | 0.97 | 1.95 | 1.14 |
+| 10 MiB | 0.97 | 2.38 | 1.19 |
+| 64 MiB | 1.00 | 8.68 | 1.19 |
+| 128 MiB | 1.05 | 13.60 | 1.21 |
+| 256 MiB | 1.56 | 9.99 | **1.26** |
+| 500 MiB | 3.91 | 21.10 | **1.54** |
+
+**Landing a chain is close to constant time — 1.14 s to 1.54 s over a 100×
+range — the same shape as the seal.** tar has to unpack, so it grows with the
+data, and the two cross at ~200 MiB. The restore path is not inherently the
+qcow2 arrangement's weak side; the flatten is the only thing making it look
+that way, and the flatten is a policy knob.
+
+> [!IMPORTANT]
+> **The default `MAX_CHAIN` of 8 has never been run.** Every qcow2 scenario
+> here set it to 1, which is what makes the seal comparable and what makes the
+> flatten fire on every restore. At 8 only one restore in eight would flatten,
+> so the p50 would be the rightmost column above — but the chain would also be
+> up to eight layers deep, and landing and reading through a deeper chain costs
+> more than the two-layer chains these numbers come from. That column is
+> therefore an optimistic bound, not a prediction. Deciding the flatten policy
+> needs a run at the default.
 
 ## Caveats
 
@@ -333,17 +461,21 @@ rescheduling the work.
 
 ## Follow-ups
 
-1. Try discard. The flatten reads an image that plateaus at 2–4× the live data
-   because nothing releases the clusters an overwrite replaces. Shrinking the
-   input is cheaper than rescheduling the flatten, and it would help the upload
-   and the download too.
-2. Settle the flatten policy. This is what blocks making qcow2 the default:
-   with `MAX_CHAIN=1` it costs 19.6 s of `qemu-img convert -c` on every
-   500 MiB resume. Measuring the uncompressed convert is the cheapest first
-   step.
+1. Stop compressing the flatten unconditionally. Measured at 6.6× for no
+   change in output size on this workload, it is the largest single win
+   available and it is one flag. What it needs is a way to tell a compressible
+   payload from an incompressible one, since the trade is real for the former.
+2. Re-run at the default `MAX_CHAIN=8`. Nothing in this report says what the
+   arrangement does when the flatten is amortized over eight restores instead
+   of firing on every one, and that is the configuration a production default
+   would ship. It is also the only way to price a deep chain's landing and
+   read costs, which the `MAX_CHAIN=1` runs cannot see.
 3. Re-run the two largest steps at their committed 20m and 30m durations, now
    that the route timeout no longer caps a write at 10 s. Until then the sweep
    has no valid data point above 500 MiB.
 4. Instrument the landing step. `Landed the durable-dir chain` records the
    chain's size but not how long the download took, which is the one part of
    the restore path still unaccounted for.
+5. Try discard. Worth doing for the storage and transfer footprint rather than
+   for resume latency — see the bloat table above for why it does nothing at
+   256 MiB and above.
