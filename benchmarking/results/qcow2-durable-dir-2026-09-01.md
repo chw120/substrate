@@ -540,10 +540,15 @@ from the `MAX_CHAIN=1` arm:
 | 500 MiB | 19 559 | 1 123 MiB | 10 026 | ~4 526 MiB | 1 013 MiB |
 
 Two to eight times faster *while reading a two-to-four-times deeper chain*.
-Measured as input throughput that is 57 MiB/s against 451 MiB/s at 500 MiB. The
-6.6× from [The cost of `-c`](#the-cost-of--c) turns out to be a lower bound on
-the real path, which also gets page-cache help the O_DIRECT microbenchmark
-deliberately removed.
+
+> [!WARNING]
+> An earlier version of this section read that as input throughput of 57 MiB/s
+> against 451 MiB/s, and concluded the 6.6× microbenchmark was a lower bound.
+> Both figures are confounded — the two arms differ in chain depth as well as in
+> `-c`, and nominal input is not comparable across depths. [`MAX_CHAIN=1`
+> without the `-c`](#max_chain1-without-the--c) measures the flag on its own and
+> gets 2.6–10.4×, with 6.6× inside the range. Use that section, not this table,
+> for what `-c` costs.
 
 Flatten counts are low by construction — n=7, 6, 5, 4, 7 across the five sizes,
 one per eight cycles — so read these as an order of magnitude, not a p50 with
@@ -567,19 +572,116 @@ weaken it: the paused window is still constant and still ~450× smaller. Chain
 depth cycled 2..8 in every scenario, so these are genuinely spread across
 depths rather than concentrated at one.
 
-### One configuration this sweep implies but did not run
+## `MAX_CHAIN=1` without the `-c`
 
-`MAX_CHAIN=1` with the `-c` removed was never measured, and it is the only
-combination that looks like it could beat tar end to end. Extrapolating the
-500 MiB row — the 1 123 MiB chain of the `MAX_CHAIN=1` arm at the ~450 MiB/s
-flatten rate measured here — puts the flatten at ~2.5 s instead of 19.6 s, for a
-resume near 7 000 ms against an unchanged suspend of 3 800 ms. That is 10 800 ms
-of cycle against tar's 11 300 ms.
+Three configurations were now measured — `MAX_CHAIN=1` with `-c`, `MAX_CHAIN=8`
+without it — leaving the fourth corner, shallow chain and no compression, as the
+one combination that had the flatten's two costs both minimized. This is that
+run: same image as the `MAX_CHAIN=8` sweep, `MAX_CHAIN` back to 1, fresh golden,
+2026-09-02 05:29Z to 06:03Z, at the same durations as the original
+`MAX_CHAIN=1` arm so the cells line up. Zero failures in all five.
 
-That is arithmetic on two measurements, not a measurement, and the flatten rate
-it borrows came from deeper chains than the ones it is applied to. It costs
-three minutes to check and no code change, which makes it the cheapest open
-question in this report.
+It does not beat tar. An extrapolation in an earlier draft of this section
+predicted it would, and that prediction was wrong by 3 s — see [Where the
+extrapolation went wrong](#where-the-extrapolation-went-wrong).
+
+### End-to-end, p50 in milliseconds
+
+| Size | ResumeActor | SuspendActor | ServeAfterResume | ServeWarm | Overwrite | n |
+|---|---|---|---|---|---|---|
+| 5 MiB | 1 400 | 640 | 64 | 26 | 50 | 56 |
+| 64 MiB | 3 700 | 3 600 | 640 | 220 | 450 | 32 |
+| 128 MiB | 4 500 | 4 300 | 1 300 | 430 | 830 | 29 |
+| 256 MiB | 7 100 | 5 300 | 2 600 | 850 | 1 800 | 27 |
+| 500 MiB | 10 000 | 3 800 | 5 000 | 1 600 | 3 300 | 24 |
+
+### All four arms
+
+`ResumeActor` + `SuspendActor` p50 in milliseconds, which is the whole cycle the
+caller pays:
+
+| Size | tar | qcow2 MC=1 `-c` | qcow2 MC=8 no `-c` | qcow2 MC=1 no `-c` |
+|---|---|---|---|---|
+| 5 MiB | **1 580** | 3 040 | 2 280 | 2 040 |
+| 64 MiB | **2 900** | 12 800 | 5 400 | 7 300 |
+| 128 MiB | **3 900** | 17 400 | 9 600 | 8 800 |
+| 256 MiB | **6 100** | 13 200 | 13 600 | 12 400 |
+| 500 MiB | **11 300** | 27 800 | 21 700 | 13 800 |
+
+**Shallow chain and no compression is the best of the three qcow2
+configurations at every size except 64 MiB, and it still loses to tar at every
+size.** At 500 MiB it closes the gap from 2.5× to 1.22×, which is the most this
+arrangement has managed, and is not a win.
+
+### Where the extrapolation went wrong
+
+The earlier draft took the 451 MiB/s flatten throughput from the `MAX_CHAIN=8`
+sweep, applied it to the 1 123 MiB chain of the `MAX_CHAIN=1` arm, and got a
+2.5 s flatten. The measured flatten is **6 958 ms**, at 163 MiB/s.
+
+The borrowed rate was inflated by the deeper chain it came from. A depth-8 chain
+is nominally 4 526 MiB of input, but most of those clusters are superseded by a
+later layer and never reach the output, and many are still in page cache from
+the layers written moments before. Dividing wall time by nominal input therefore
+flatters a deep chain and says nothing about a shallow one. Input throughput is
+not a portable rate across chain depths, and this report should not have treated
+it as one.
+
+### What `-c` actually costs, measured cleanly
+
+This run differs from the original `MAX_CHAIN=1` arm in exactly one thing, so it
+is the apples-to-apples measurement the other two comparisons could not be.
+Flatten p50 in milliseconds, and the same figure as throughput over the landed
+chain:
+
+| Size | With `-c` | Without `-c` | Speedup | MiB/s with | MiB/s without |
+|---|---|---|---|---|---|
+| 5 MiB | 810 | 78 | 10.4× | 41 | 405 |
+| 64 MiB | 7 491 | 1 591 | 4.7× | 42 | 204 |
+| 128 MiB | 12 390 | 2 226 | 5.6× | 41 | 217 |
+| 256 MiB | 8 732 | 3 321 | 2.6× | 59 | 235 |
+| 500 MiB | 19 559 | 6 958 | 2.8× | 57 | 163 |
+
+Between 2.6× and 10.4×, and the 6.6× of [The cost of `-c`](#the-cost-of--c)
+sits inside that range rather than below it. The O_DIRECT microbenchmark was a
+fair estimate, not a lower bound; the claim in the `MAX_CHAIN=8` section that it
+understated the real path came from the confounded comparison and does not
+survive this one.
+
+### The rest of the restore is unchanged
+
+Seconds, ateom side, from `Actor restored (durable-dir volumes, cold boot)`:
+
+| Size | Restore total | minus flatten | Same column at MC=1 with `-c` |
+|---|---|---|---|
+| 5 MiB | 1.16 | 1.08 | 1.14 |
+| 64 MiB | 2.70 | 1.11 | 1.19 |
+| 128 MiB | 3.36 | 1.14 | 1.21 |
+| 256 MiB | 5.46 | 2.14 | 1.26 |
+| 500 MiB | 8.16 | 1.21 | 1.54 |
+
+Landing and mounting a chain is 1.08–1.21 s over a 100× range, reproducing the
+constant-time result from [the earlier
+subtraction](#the-restore-path-without-the-flatten) on an independent run. The
+256 MiB cell is the one outlier and has no explanation here.
+
+The seal is 5.54–5.75 ms across all five sizes, with `pause` at 2.56–2.71 ms —
+indistinguishable from both other arms.
+
+### A caution about `SuspendActor` at the middle sizes
+
+`SuspendActor` at 128 and 256 MiB is 4 300 and 5 300 ms here against 2 400 and
+2 200 ms in the original `MAX_CHAIN=1` arm, and `-c` cannot explain that because
+it never runs on the suspend path. `guest_flush` does: it is 2 192 and 2 789 ms
+here against 273 and 39 ms there. As the caveats already note, `guest_flush`
+measures how much dirty page cache happens to be outstanding when the suspend
+lands, which is a lottery on where the write loop was interrupted.
+
+That term is large enough to move `SuspendActor` by 2× between runs of the same
+configuration, so **suspend comparisons between arms at 64–256 MiB are inside
+the noise.** The 5 MiB and 500 MiB cells, where `guest_flush` happened to be
+small in every arm, are the only suspend numbers this report should be read as
+comparing.
 
 ## Caveats
 
@@ -605,22 +707,31 @@ question in this report.
 
 ## Follow-ups
 
-1. Run `MAX_CHAIN=1` without the `-c`. Three minutes, no code change, and it is
-   the only configuration this report's numbers suggest could beat tar on total
-   cycle cost — see [One configuration this sweep implies but did not
-   run](#one-configuration-this-sweep-implies-but-did-not-run).
-2. Measure a partial-update workload. Every number here comes from a durable dir
+1. Measure a partial-update workload. Every number here comes from a durable dir
    that is rewritten end to end every cycle, which is the worst case for a
    backing-file chain and the case where chain depth is pure cost. Nothing in
    this report says what the arrangement does when successive cycles touch a
    subset, which is the case the design is for. `glutton` would need a write
    mode that dirties a fraction of the file rather than all of it.
-3. Re-run the two largest steps at their committed 20m and 30m durations, now
+2. Move the flatten off the restore path. Every arm measured pays it as resume
+   latency, and it is the single term separating this arrangement from tar:
+   6 958 ms of the 500 MiB arm's 10 000 ms resume, and 1 591 of 3 700 at
+   64 MiB. Subtracting it leaves 1.08–1.21 s flat across the range. Whether it
+   can run after the resume returns, or on the suspend side, or on a background
+   worker, is a design question this report does not answer, but no tuning of
+   the flatten itself will close a gap the flatten's mere presence creates.
+3. Instrument the landing step. `Landed the durable-dir chain` records the
+   chain's size but not how long the download took, which is the one part of
+   the restore path still unaccounted for. It is also the term the suspend-side
+   upload is inferred from rather than measured.
+4. Re-run the two largest steps at their committed 20m and 30m durations, now
    that the route timeout no longer caps a write at 10 s. Until then the sweep
    has no valid data point above 500 MiB.
-4. Instrument the landing step. `Landed the durable-dir chain` records the
-   chain's size but not how long the download took, which is the one part of
-   the restore path still unaccounted for.
-5. Try discard. Worth doing for the storage and transfer footprint rather than
+5. Reduce the `guest_flush` lottery, or stop reporting `SuspendActor` at the
+   middle sizes as a comparison. A term that swings 39 ms to 2 789 ms at
+   256 MiB between runs of the same configuration makes those cells
+   uninterpretable — see [A caution about `SuspendActor` at the middle
+   sizes](#a-caution-about-suspendactor-at-the-middle-sizes).
+6. Try discard. Worth doing for the storage and transfer footprint rather than
    for resume latency — see the bloat table above for why it does nothing at
    256 MiB and above.
