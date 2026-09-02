@@ -28,6 +28,15 @@ def add_durdir_arguments(parser: LocustArgumentParser) -> None:
         help="Size of the test file written and read during the DurDir benchmark (default: 8388608 = 8 MiB)",
     )
     group.add_argument(
+        "--durdir-file-count",
+        type=int,
+        default=1,
+        help="Number of files the DurDir benchmark rotates over, one rewritten per cycle "
+        "(default: 1). The directory holds count x size bytes, so a count above 1 makes a "
+        "cycle rewrite only part of it -- the case a snapshot arrangement that ships deltas "
+        "is built for.",
+    )
+    group.add_argument(
         "--durdir-read-mode",
         type=str,
         default="data",

@@ -624,6 +624,65 @@ tests:
       - "1.0"
       - "--max-wait-time"
       - "1.0"
+  # Partial rewrite. The size sweep above rewrites the whole durable dir every
+  # cycle, which is the worst case for any arrangement that ships a delta
+  # rather than the volume: every byte of the previous checkpoint is dead by
+  # the time the next one lands. These hold the directory at the same total
+  # size and rewrite an eighth of it, which is closer to an agent that edits a
+  # few files in a workspace it otherwise leaves alone.
+  #
+  # They pair with the equally-sized steps of the sweep: partial_128mb against
+  # durdir_size_128mb_microvm, partial_512mb against durdir_size_500mb_microvm.
+  # The volume is the same in each pair and only the per-cycle delta differs,
+  # so the difference between them is what a delta is worth.
+  - name: durdir_partial_128mb_microvm
+    type: locust
+    description: "DurDir partial rewrite on micro-VM: 8 x 16 MiB, one file rewritten per cycle"
+    targetCluster: dev
+    sandboxClass: microvm
+    file: /app/tests/durdir.py
+    duration: 10m
+    users: 1
+    workerCount: 1
+    flags:
+      - "--durdir-template"
+      - "glutton-durdir-data"
+      - "--resume-mode"
+      - "explicit"
+      - "--durdir-read-mode"
+      - "digest"
+      - "--durdir-file-size-bytes"
+      - "16777216"
+      - "--durdir-file-count"
+      - "8"
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
+  - name: durdir_partial_512mb_microvm
+    type: locust
+    description: "DurDir partial rewrite on micro-VM: 8 x 64 MiB, one file rewritten per cycle"
+    targetCluster: dev
+    sandboxClass: microvm
+    file: /app/tests/durdir.py
+    duration: 20m
+    users: 1
+    workerCount: 1
+    flags:
+      - "--durdir-template"
+      - "glutton-durdir-data"
+      - "--resume-mode"
+      - "explicit"
+      - "--durdir-read-mode"
+      - "digest"
+      - "--durdir-file-size-bytes"
+      - "67108864"
+      - "--durdir-file-count"
+      - "8"
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
   - name: ingress_routercap_envoy_2cpu
     description: "Router capacity: Nighthawk adaptive max-RPS search under a 25ms tail-latency SLO, Envoy at 2 CPUs"
     type: nighthawk-ingress

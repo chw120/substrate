@@ -50,6 +50,7 @@ _FLAGS = {
     "--min-wait-time": float,
     "--max-wait-time": float,
     "--durdir-file-size-bytes": int,
+    "--durdir-file-count": int,
     "--resume-mode": str,
     "--durdir-read-mode": str,
     "--durdir-template": str,

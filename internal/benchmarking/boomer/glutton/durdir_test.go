@@ -82,7 +82,7 @@ func TestDurDirUsesConfiguredFileSize(t *testing.T) {
 	srv := &fake.Server{Data: make([]byte, configuredSize)}
 	du := newTestDurDirUser(t, srv, nil)
 
-	if err := du.writeDisk(context.Background(), "TestConfiguredSize", configuredSize, gluttonpb.WriteMode_WRITE_MODE_TRUNCATE); err != nil {
+	if err := du.writeDisk(context.Background(), "TestConfiguredSize", durDirFileKey(0), configuredSize, gluttonpb.WriteMode_WRITE_MODE_TRUNCATE); err != nil {
 		t.Fatalf("writeDisk failed: %v", err)
 	}
 
@@ -95,9 +95,105 @@ func TestDurDirUsesConfiguredFileSize(t *testing.T) {
 	}
 }
 
-func TestDurDirTestFileIsAValidGluttonKey(t *testing.T) {
-	if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(durDirTestFile) {
-		t.Fatalf("durDirTestFile %q would be rejected by glutton", durDirTestFile)
+func TestDurDirFileKeysAreValidGluttonKeys(t *testing.T) {
+	valid := regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+	for _, i := range []int{0, 1, 9, dynconfig.MaxDurDirFileCount - 1} {
+		if key := durDirFileKey(i); !valid.MatchString(key) {
+			t.Errorf("durDirFileKey(%d) = %q, which glutton would reject", i, key)
+		}
+	}
+}
+
+// A rotation wider than one file is the point of the file-count knob: it makes
+// a cycle rewrite part of the durable dir rather than all of it, which is what
+// separates a snapshot arrangement that ships deltas from one that does not.
+func TestDurDirStepRotatesOverConfiguredFiles(t *testing.T) {
+	tests := []struct {
+		name       string
+		fileCount  int
+		steps      int
+		wantWrites []string
+		wantReads  []string
+	}{
+		{
+			name:       "unset file count rewrites one file",
+			fileCount:  0,
+			steps:      3,
+			wantWrites: []string{"bench-data-0", "bench-data-0", "bench-data-0"},
+			wantReads: []string{
+				"bench-data-0", "bench-data-0",
+				"bench-data-0", "bench-data-0",
+				"bench-data-0", "bench-data-0",
+			},
+		},
+		{
+			name:       "three files rotate and wrap",
+			fileCount:  3,
+			steps:      4,
+			wantWrites: []string{"bench-data-0", "bench-data-1", "bench-data-2", "bench-data-0"},
+			// Each cycle reads the file the previous cycle wrote, so the read
+			// sequence trails the write sequence by one.
+			wantReads: []string{
+				"bench-data-0", "bench-data-0",
+				"bench-data-0", "bench-data-0",
+				"bench-data-1", "bench-data-1",
+				"bench-data-2", "bench-data-2",
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := &fake.Server{Data: []byte("rotation content")}
+			cfg := &userclass.Config{
+				Dyn: dynconfig.NewHolder(dynconfig.Config{
+					DurDirFileSize: int64(len(srv.Data)),
+					ResumeMode:     dynconfig.ResumeModeExplicit,
+				}),
+			}
+			du := newTestDurDirUser(t, srv, cfg)
+			du.fileCount = tc.fileCount
+			du.expectedDigest = srv.HexDigest()
+
+			for range tc.steps {
+				du.step(context.Background(), cfg.Dyn.Load())
+			}
+
+			if got := srv.RecordedWriteKeys(); !reflect.DeepEqual(got, tc.wantWrites) {
+				t.Errorf("write keys: got %v, want %v", got, tc.wantWrites)
+			}
+			if got := srv.RecordedReadKeys(); !reflect.DeepEqual(got, tc.wantReads) {
+				t.Errorf("read keys: got %v, want %v", got, tc.wantReads)
+			}
+		})
+	}
+}
+
+// Bootstrap must create the whole rotation, or the durable dir would grow
+// through the first fileCount cycles and every early sample would measure a
+// smaller volume than the ones after it.
+func TestDurDirBootstrapCreatesEveryFile(t *testing.T) {
+	srv := &fake.Server{Data: []byte("bootstrap content")}
+	cfg := newTestConfig(t, srv, &userclass.Config{
+		Dyn: dynconfig.NewHolder(dynconfig.Config{
+			DurDirFileSize:  int64(len(srv.Data)),
+			DurDirFileCount: 4,
+			ResumeMode:      dynconfig.ResumeModeExplicit,
+		}),
+	})
+
+	rt := &durDirRuntime{cfg: cfg}
+	u, err := rt.startUser(context.Background(), cfg.Dyn.Load())
+	if err != nil {
+		t.Fatalf("startUser failed: %v", err)
+	}
+
+	want := []string{"bench-data-0", "bench-data-1", "bench-data-2", "bench-data-3"}
+	if got := srv.RecordedWriteKeys(); !reflect.DeepEqual(got, want) {
+		t.Errorf("bootstrap write keys: got %v, want %v", got, want)
+	}
+	if u.files() != 4 {
+		t.Errorf("user file count: got %d, want 4", u.files())
 	}
 }
 

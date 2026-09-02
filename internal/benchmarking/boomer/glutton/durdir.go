@@ -54,10 +54,19 @@ const (
 	writeDiskRoute = "/writedisk"
 	readDiskRoute  = "/readdisk"
 
-	durDirTestFile = "bench-data"
+	// Files in the durable dir are named durDirFilePrefix-<index>.
+	durDirFilePrefix = "bench-data"
 
 	defaultFileSize int64 = 8388608 // 8 MiB
 )
+
+const defaultFileCount = 1
+
+// durDirFileKey names the file at `index` in the rotation. Glutton rejects a
+// key outside [a-zA-Z0-9_-], which the prefix and the decimal index satisfy.
+func durDirFileKey(index int) string {
+	return durDirFilePrefix + "-" + strconv.Itoa(index)
+}
 
 func init() {
 	userclass.Add(userclass.Entry{
@@ -126,6 +135,7 @@ func (r *durDirRuntime) startUser(ctx context.Context, dynCfg dynconfig.Config) 
 		actorName:    "sb-" + uuid.NewString(),
 		templateName: tmpl,
 		userClass:    durDirUserClass,
+		fileCount:    dynCfg.DurDirFileCount,
 	}
 	u.hostHeader = u.actorName + "." + u.cfg.Atespace + "." + actorDomain
 	bmetrics.UpdateUsers(durDirUserClass, 1)
@@ -155,13 +165,33 @@ func (r *durDirRuntime) shutdown(ctx context.Context) {
 }
 
 type durDirUser struct {
-	cfg            *userclass.Config
-	actorName      string
-	hostHeader     string
-	templateName   string
-	userClass      string
+	cfg          *userclass.Config
+	actorName    string
+	hostHeader   string
+	templateName string
+	userClass    string
+
+	// fileCount is fixed at startUser rather than re-read each cycle: bootstrap
+	// creates exactly this many files, and shrinking the rotation mid-run would
+	// strand the ones above the new bound in the durable dir.
+	fileCount int
+	// cycle counts completed writes and selects the file the next one targets.
+	cycle int
+
+	// The reads of a cycle verify the file the previous cycle wrote, so one
+	// digest is enough however wide the rotation is.
+	lastWritten    string
 	expectedDigest string
 	expectedSize   int64
+}
+
+// files is the rotation width, with the zero value read as the single-file
+// workload rather than as a division by zero.
+func (u *durDirUser) files() int {
+	if u.fileCount < 1 {
+		return defaultFileCount
+	}
+	return u.fileCount
 }
 
 func (u *durDirUser) ref() *ateapipb.ObjectRef {
@@ -298,8 +328,13 @@ func (u *durDirUser) step(ctx context.Context, dynCfg dynconfig.Config) {
 		return
 	}
 
-	// 5. Overwrite file with fresh random bytes
-	if err := u.writeDisk(ctx, "DurDirOverwrite", fileSize, gluttonpb.WriteMode_WRITE_MODE_TRUNCATE); err != nil {
+	// 5. Overwrite one file with fresh random bytes. A rotation wider than one
+	// leaves the rest of the directory untouched, which is the case a snapshot
+	// arrangement that ships deltas is built for; at width one every cycle
+	// rewrites everything, which is the case it gets no credit for.
+	key := durDirFileKey(u.cycle % u.files())
+	u.cycle++
+	if err := u.writeDisk(ctx, "DurDirOverwrite", key, fileSize, gluttonpb.WriteMode_WRITE_MODE_TRUNCATE); err != nil {
 		return
 	}
 }
@@ -311,9 +346,12 @@ func (u *durDirUser) bootstrap(ctx context.Context, dynCfg dynconfig.Config) err
 		return fmt.Errorf("initial resume failed")
 	}
 
-	// Initial write to create DurDir file
-	if err := u.writeDisk(ctx, "DurDirWrite", fileSize, gluttonpb.WriteMode_WRITE_MODE_TRUNCATE); err != nil {
-		return fmt.Errorf("initial WriteDisk failed: %w", err)
+	// Create every file of the rotation up front, so the durable dir is at its
+	// steady size from the first measured cycle instead of growing into it.
+	for i := range u.files() {
+		if err := u.writeDisk(ctx, "DurDirWrite", durDirFileKey(i), fileSize, gluttonpb.WriteMode_WRITE_MODE_TRUNCATE); err != nil {
+			return fmt.Errorf("initial WriteDisk failed: %w", err)
+		}
 	}
 
 	// Initial read to verify file
@@ -324,9 +362,9 @@ func (u *durDirUser) bootstrap(ctx context.Context, dynCfg dynconfig.Config) err
 	return nil
 }
 
-func (u *durDirUser) writeDisk(ctx context.Context, metricName string, size int64, mode gluttonpb.WriteMode) error {
+func (u *durDirUser) writeDisk(ctx context.Context, metricName, key string, size int64, mode gluttonpb.WriteMode) error {
 	req := &gluttonpb.WriteDiskRequest{
-		Key:       durDirTestFile,
+		Key:       key,
 		Size:      int32(size),
 		WriteMode: mode,
 	}
@@ -357,14 +395,18 @@ func (u *durDirUser) writeDisk(ctx context.Context, metricName string, size int6
 	if err != nil {
 		return err
 	}
+	u.lastWritten = key
 	u.expectedDigest = newDigest
 	u.expectedSize = newSize
 	return nil
 }
 
+// readDisk reads back the file the most recent writeDisk wrote. That is the
+// file whose durability across the suspend is in question; the others in the
+// rotation carry bytes an earlier cycle already verified.
 func (u *durDirUser) readDisk(ctx context.Context, metricName string, readMode gluttonpb.ReadMode) error {
 	req := &gluttonpb.ReadDiskRequest{
-		Key:      durDirTestFile,
+		Key:      u.lastWritten,
 		ReadMode: readMode,
 	}
 	body, err := proto.Marshal(req)

@@ -88,7 +88,12 @@ and state restoration latency when a durable directory is attached to the actor.
 
 #### DurDir Configuration Knobs
 
-* `--durdir-file-size-bytes`: Size in bytes of the data file (default `8388608` = 8 MiB).
+* `--durdir-file-size-bytes`: Size in bytes of each data file (default `8388608` = 8 MiB).
+* `--durdir-file-count`: Number of data files, one rewritten per cycle (default `1`).
+  The directory holds `count x size` bytes, so a count above 1 rewrites only part
+  of it each cycle. At the default of 1 every cycle rewrites the whole directory,
+  which is the worst case for an arrangement that checkpoints a delta rather than
+  the volume.
 * `--resume-mode`: Resume trigger mode:
   * `explicit` (default): Client invokes the `ResumeActor` RPC before sending traffic.
   * `implicit`: Client sends traffic through the router without an explicit wake RPC, testing traffic-triggered resume.
@@ -117,6 +122,16 @@ scales with the size of the durable directory. For measured numbers see
 [results/baseline-2026-08-26.md](results/baseline-2026-08-26.md); to repeat the
 measurement, including the two failure modes that appear only above 500 MiB,
 see [results/REPRODUCING.md](results/REPRODUCING.md).
+
+#### DurDir Partial Rewrite
+
+The `durdir_partial_*` scenarios hold the directory at the size of a sweep step
+and rewrite an eighth of it per cycle, so a pair of equally-sized scenarios
+differs only in the size of the per-cycle delta. That is the difference a
+snapshot arrangement that ships a delta can exploit and the size sweep gives it
+no room to: `durdir_partial_128mb_microvm` pairs with
+`durdir_size_128mb_microvm`, and `durdir_partial_512mb_microvm` with
+`durdir_size_500mb_microvm`.
 
 ### Viewing Traces
 You must have enabled otel tracing for your cluster to view traces.
