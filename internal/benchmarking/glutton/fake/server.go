@@ -58,7 +58,9 @@ type Server struct {
 
 	mu            sync.Mutex
 	paths         []string
+	writeKeys     []string
 	writeSizes    []int32
+	readKeys      []string
 	readModes     []gluttonpb.ReadMode
 	ramWriteSizes []string
 	ramWriteModes []gluttonpb.WriteMode
@@ -90,6 +92,20 @@ func (s *Server) RecordedPaths() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]string(nil), s.paths...)
+}
+
+// RecordedWriteKeys returns each /writedisk request's key, in call order.
+func (s *Server) RecordedWriteKeys() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.writeKeys...)
+}
+
+// RecordedReadKeys returns each /readdisk request's key, in call order.
+func (s *Server) RecordedReadKeys() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.readKeys...)
 }
 
 func (s *Server) RecordedWriteSizes() []int32 {
@@ -153,6 +169,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.mu.Lock()
+		s.writeKeys = append(s.writeKeys, req.GetKey())
 		s.writeSizes = append(s.writeSizes, req.GetSize())
 		s.mu.Unlock()
 
@@ -174,6 +191,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.mu.Lock()
+		s.readKeys = append(s.readKeys, req.GetKey())
 		s.readModes = append(s.readModes, req.GetReadMode())
 		s.mu.Unlock()
 

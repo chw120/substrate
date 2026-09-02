@@ -31,6 +31,7 @@ func TestParseValid(t *testing.T) {
 		"min_wait_time": 0.1,
 		"max_wait_time": 0.5,
 		"durdir_file_size_bytes": 1048576,
+		"durdir_file_count": 8,
 		"resume_mode": "explicit",
 		"durdir_read_mode": "data",
 		"durdir_template": "glutton-durdir-data"
@@ -52,6 +53,9 @@ func TestParseValid(t *testing.T) {
 	}
 	if cfg.DurDirFileSize != 1048576 {
 		t.Errorf("DurDirFileSize: got %d, want 1048576", cfg.DurDirFileSize)
+	}
+	if cfg.DurDirFileCount != 8 {
+		t.Errorf("DurDirFileCount: got %d, want 8", cfg.DurDirFileCount)
 	}
 	if cfg.ResumeMode != ResumeModeExplicit {
 		t.Errorf("ResumeMode: got %q, want %q", cfg.ResumeMode, ResumeModeExplicit)
@@ -96,6 +100,14 @@ func TestParseInvalidValues(t *testing.T) {
 		{
 			name: "file size exceeds 2 GiB",
 			json: `{"durdir_file_size_bytes": 2147483648}`,
+		},
+		{
+			name: "negative file count",
+			json: `{"durdir_file_count": -1}`,
+		},
+		{
+			name: "file count exceeds the sanity bound",
+			json: `{"durdir_file_count": 1025}`,
 		},
 		{
 			name: "invalid resume mode",

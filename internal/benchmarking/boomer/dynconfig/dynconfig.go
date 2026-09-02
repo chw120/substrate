@@ -44,13 +44,19 @@ const (
 	ReadModeDigest = "digest"
 )
 
+// MaxDurDirFileCount bounds DurDirFileCount. It is a sanity limit, not a
+// property of the workload: nothing needs hundreds of files, and the bound is
+// what catches a byte count pasted into the wrong flag.
+const MaxDurDirFileCount = 1024
+
 // Config is the dynamic-mutable subset of boomer's behavior. Holder swaps
 // it atomically so task goroutines read a consistent snapshot.
 type Config struct {
 	MinWait          time.Duration
 	MaxWait          time.Duration
 	TraceProbability float64
-	DurDirFileSize   int64  // bytes
+	DurDirFileSize   int64  // bytes, per file
+	DurDirFileCount  int    // files the DurdirUser rotates over; 0 or 1 rewrites one file every cycle
 	ResumeMode       string // ResumeModeExplicit | ResumeModeImplicit
 	DurDirReadMode   string // ReadModeData | ReadModeDigest
 	DurDirTemplate   string // ActorTemplate name
@@ -90,6 +96,7 @@ type payload struct {
 	MinWaitTime      *float64 `json:"min_wait_time"`
 	MaxWaitTime      *float64 `json:"max_wait_time"`
 	DurDirFileSize   *float64 `json:"durdir_file_size_bytes"`
+	DurDirFileCount  *float64 `json:"durdir_file_count"`
 	ResumeMode       *string  `json:"resume_mode"`
 	DurDirReadMode   *string  `json:"durdir_read_mode"`
 	DurDirTemplate   *string  `json:"durdir_template"`
@@ -161,6 +168,14 @@ func (c Config) Validate() error {
 	if c.DurDirFileSize > math.MaxInt32 {
 		return fmt.Errorf("durdir_file_size_bytes cannot exceed %d (2 GiB), got: %d", math.MaxInt32, c.DurDirFileSize)
 	}
+	if c.DurDirFileCount < 0 {
+		return fmt.Errorf("durdir_file_count cannot be negative: %d", c.DurDirFileCount)
+	}
+	// The directory holds count * size bytes and bootstrap writes every file,
+	// so an accidental byte count here would try to create millions of them.
+	if c.DurDirFileCount > MaxDurDirFileCount {
+		return fmt.Errorf("durdir_file_count cannot exceed %d, got: %d", MaxDurDirFileCount, c.DurDirFileCount)
+	}
 	if c.ResumeMode != "" && c.ResumeMode != ResumeModeExplicit && c.ResumeMode != ResumeModeImplicit {
 		return fmt.Errorf("invalid resume_mode %q: must be %q or %q", c.ResumeMode, ResumeModeExplicit, ResumeModeImplicit)
 	}
@@ -189,6 +204,9 @@ func (p payload) merge(current Config) Config {
 	}
 	if p.DurDirFileSize != nil {
 		out.DurDirFileSize = int64(*p.DurDirFileSize)
+	}
+	if p.DurDirFileCount != nil {
+		out.DurDirFileCount = int(*p.DurDirFileCount)
 	}
 	if p.ResumeMode != nil {
 		out.ResumeMode = *p.ResumeMode
@@ -267,6 +285,7 @@ func StartPoll(
 					slog.Duration("min_wait", next.MinWait),
 					slog.Duration("max_wait", next.MaxWait),
 					slog.Int64("durdir_file_size_bytes", next.DurDirFileSize),
+					slog.Int("durdir_file_count", next.DurDirFileCount),
 					slog.String("resume_mode", next.ResumeMode),
 					slog.String("durdir_read_mode", next.DurDirReadMode),
 					slog.String("durdir_template", next.DurDirTemplate),
@@ -302,6 +321,7 @@ func SubscribeSpawn(url string, holder *Holder, sampler ProbabilityUpdater, fetc
 			slog.Duration("min_wait", next.MinWait),
 			slog.Duration("max_wait", next.MaxWait),
 			slog.Int64("durdir_file_size_bytes", next.DurDirFileSize),
+			slog.Int("durdir_file_count", next.DurDirFileCount),
 			slog.String("resume_mode", next.ResumeMode),
 			slog.String("durdir_read_mode", next.DurDirReadMode),
 			slog.String("durdir_template", next.DurDirTemplate),
