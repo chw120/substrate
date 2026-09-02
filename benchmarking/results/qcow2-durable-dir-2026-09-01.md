@@ -6,9 +6,10 @@ claims: that sealing a qcow2 backing-file chain takes constant time in the
 paused window, where packing a tar grows with the size of the directory.
 
 Measured on branch `poc5-qcow2` at commit `bd8ddbba`, which is the first commit
-at which the qcow2 arrangement boots at all on cloud-hypervisor. The size steps
-come from `durdir-large-sizes`, cherry-picked onto this branch as `97bed514`
-and `aeb08aa6`; the tar arm here is a re-run of
+at which the qcow2 arrangement boots at all on cloud-hypervisor. [A second
+sweep](#at-the-default-max_chain8) at the shipped `MAX_CHAIN` default ran later
+on `9fbef6e9`. The size steps come from `durdir-large-sizes`, cherry-picked onto
+this branch as `97bed514` and `aeb08aa6`; the tar arm here is a re-run of
 [baseline-2026-08-26.md](baseline-2026-08-26.md) under this branch's durations,
 not a reuse of its numbers.
 
@@ -150,7 +151,8 @@ and which runs with the guest live. `n` is the number of checkpoints.
 | 1 GiB | `durdir_size_1gb_microvm` | 08:48:49Z | 07:47:39Z | 12m |
 
 Durations are the overrides used, not the durations committed in `tests.yaml`.
-See [Caveats](#caveats).
+See [Caveats](#caveats). The `MAX_CHAIN=8` sweep is indexed in [its own
+section](#at-the-default-max_chain8).
 
 The 128 and 256 MiB steps ran ~1.5 h after the rest, as their own pair of arms
 with their own golden rebuilds, and with the router's route timeout already
@@ -171,7 +173,10 @@ The qcow2 arrangement has to `sync(2)` the guest before it pauses, and that
 `guest_flush` is charged to the same `SuspendActor` call. End to end, tar wins
 at 5, 10, and 64 MiB and qcow2 wins at 500 MiB; the crossover sits at ~128 MiB
 (see [The crossover](#the-crossover-and-where-the-flatten-cost-actually-comes-from)).
-What the arrangement buys below the crossover is not a
+That crossover holds at `MAX_CHAIN=1` only — [at the shipped default of
+8](#resume-improves-everywhere-suspend-regresses-everywhere) the deeper chain
+costs more to upload than the tar pack it replaces, and qcow2 loses the suspend
+at every size. What the arrangement buys below the crossover is not a
 faster suspend but a shorter *stall* — 5.7 ms versus 310 ms of frozen guest at
 64 MiB — which matters for a workload holding a connection open, and does not
 show up in `SuspendActor` at all.
@@ -427,15 +432,154 @@ data, and the two cross at ~200 MiB. The restore path is not inherently the
 qcow2 arrangement's weak side; the flatten is the only thing making it look
 that way, and the flatten is a policy knob.
 
-> [!IMPORTANT]
-> **The default `MAX_CHAIN` of 8 has never been run.** Every qcow2 scenario
-> here set it to 1, which is what makes the seal comparable and what makes the
-> flatten fire on every restore. At 8 only one restore in eight would flatten,
-> so the p50 would be the rightmost column above — but the chain would also be
-> up to eight layers deep, and landing and reading through a deeper chain costs
-> more than the two-layer chains these numbers come from. That column is
-> therefore an optimistic bound, not a prediction. Deciding the flatten policy
-> needs a run at the default.
+The rightmost column is an optimistic bound rather than a prediction: it comes
+from two-layer chains, and a deeper chain costs more to land and read through.
+[At the default `MAX_CHAIN=8`](#at-the-default-max_chain8) prices that.
+
+## At the default `MAX_CHAIN=8`
+
+Everything above ran with `ATEOM_DURABLE_QCOW2_MAX_CHAIN=1`, which is what makes
+the seal comparable and what makes the flatten fire on every single restore.
+That is not the configuration a production default would ship. This section is a
+second sweep at the shipped default of 8, on commit `9fbef6e9` — the commit that
+also drops the `-c`. The tar arm is not re-run: neither change touches it, so
+the tar columns above stay the comparison.
+
+Ran 2026-09-01 23:45Z to 2026-09-02 00:44Z on the same cluster and node, with a
+fresh golden snapshot, at 3m / 6m / 8m / 10m / 30m. 500 MiB gets 30m because a
+flatten now fires once every eight cycles, and the 10m window that gave n=16
+would have contained two of them. Zero failures in all five.
+
+> [!NOTE]
+> Two variables moved at once, so end-to-end deltas against the `MAX_CHAIN=1`
+> arm mix them. The directions are still separable. Dropping `-c` can only
+> affect the flatten, which runs on restore; it never ran on the suspend path at
+> all. So **the suspend numbers isolate chain depth cleanly**, and only the
+> resume numbers are confounded.
+
+### End-to-end, p50 in milliseconds
+
+| Size | ResumeActor | SuspendActor | ServeAfterResume | ServeWarm | Overwrite | n |
+|---|---|---|---|---|---|---|
+| 5 MiB | 1 400 | 880 | 65 | 26 | 50 | 52 |
+| 64 MiB | 1 900 | 3 500 | 650 | 220 | 450 | 44 |
+| 128 MiB | 4 400 | 5 200 | 1 300 | 440 | 840 | 37 |
+| 256 MiB | 7 200 | 6 400 | 2 500 | 850 | 1 800 | 30 |
+| 500 MiB | 14 000 | 7 700 | 4 900 | 1 700 | 3 300 | 52 |
+
+p95:
+
+| Size | ResumeActor | SuspendActor | ServeAfterResume | ServeWarm | Overwrite |
+|---|---|---|---|---|---|
+| 5 MiB | 1 600 | 1 100 | 71 | 29 | 55 |
+| 64 MiB | 5 000 | 4 300 | 680 | 240 | 470 |
+| 128 MiB | 10 000 | 6 200 | 1 300 | 460 | 870 |
+| 256 MiB | 17 000 | 7 800 | 2 600 | 890 | 1 800 |
+| 500 MiB | 34 000 | 14 000 | 5 300 | 1 700 | 3 500 |
+
+The three read operations are unchanged from the `MAX_CHAIN=1` arm to within
+noise. Chain depth does not cost anything to read through once the chain is
+mounted, which is worth stating because it was not obvious in advance.
+
+### Resume improves everywhere, suspend regresses everywhere
+
+p50 in milliseconds, the three arms side by side:
+
+| Size | Resume tar | Resume MC=1 | Resume MC=8 | Suspend tar | Suspend MC=1 | Suspend MC=8 |
+|---|---|---|---|---|---|---|
+| 5 MiB | 1 200 | 2 300 | 1 400 | 380 | 740 | 880 |
+| 64 MiB | 1 400 | 9 500 | 1 900 | 1 500 | 3 300 | 3 500 |
+| 128 MiB | 1 600 | 15 000 | 4 400 | 2 300 | 2 400 | 5 200 |
+| 256 MiB | 2 600 | 11 000 | 7 200 | 3 500 | 2 200 | 6 400 |
+| 500 MiB | 5 900 | 24 000 | 14 000 | 5 400 | 3 800 | 7 700 |
+
+**This reverses the crossover result.** At `MAX_CHAIN=1` the qcow2 arrangement
+won `SuspendActor` at 256 MiB and above; at the shipped default it loses at
+every size measured. Resume improves by 1.6× to 5× but still loses to tar
+everywhere.
+
+### Why suspend regresses: the chain is the upload
+
+`durable_bytes` on the `Actor checkpointed` record is the chain that gets pushed
+to GCS. In MiB:
+
+| Size | Chain MC=1 | Chain MC=8 p50 | Chain MC=8 max | Top layer |
+|---|---|---|---|---|
+| 5 MiB | 33 | 54 | 79 | 6 |
+| 64 MiB | 315 | 337 | 596 | 65 |
+| 128 MiB | 507 | 775 | 1 292 | 129 |
+| 256 MiB | 515 | 1 296 | 2 325 | 257 |
+| 500 MiB | 1 123 | 2 769 | 4 526 | 502 |
+
+At 500 MiB the chain grows 2.5× and the suspend grows 2.0×. `snapshot` has a p50
+of 0 across every scenario, so the memory snapshot is not involved — the cost is
+the chain, and nothing else changed on that path.
+
+The reason the chain scales with depth is [the same one the crossover section
+found](#the-crossover-and-where-the-flatten-cost-actually-comes-from): the
+workload overwrites the entire file every cycle, so successive layers share no
+clusters and a depth-8 chain is close to eight full copies. **Chain depth only
+pays for itself when a cycle touches a subset of the data, and this benchmark
+never does.** That is a property of the workload, not of the arrangement, and it
+means neither `MAX_CHAIN` value measured here is the one a partial-update
+workload would want. It also bounds what this report can say about the default:
+the regression is real for a full-rewrite workload and says nothing about any
+other.
+
+### The `-c` removal, on the real path
+
+`Flattened the durable-dir chain`, p50 in milliseconds, against the same record
+from the `MAX_CHAIN=1` arm:
+
+| Size | Flatten with `-c` | Bytes read | Flatten without `-c` | Bytes read | Output |
+|---|---|---|---|---|---|
+| 5 MiB | 810 | 33 MiB | 97 | ~79 MiB | 35 MiB |
+| 64 MiB | 7 491 | 315 MiB | 1 909 | ~596 MiB | 139 MiB |
+| 128 MiB | 12 390 | 507 MiB | 3 138 | ~1 292 MiB | 387 MiB |
+| 256 MiB | 8 732 | 515 MiB | 4 933 | ~2 325 MiB | 523 MiB |
+| 500 MiB | 19 559 | 1 123 MiB | 10 026 | ~4 526 MiB | 1 013 MiB |
+
+Two to eight times faster *while reading a two-to-four-times deeper chain*.
+Measured as input throughput that is 57 MiB/s against 451 MiB/s at 500 MiB. The
+6.6× from [The cost of `-c`](#the-cost-of--c) turns out to be a lower bound on
+the real path, which also gets page-cache help the O_DIRECT microbenchmark
+deliberately removed.
+
+Flatten counts are low by construction — n=7, 6, 5, 4, 7 across the five sizes,
+one per eight cycles — so read these as an order of magnitude, not a p50 with
+any precision behind it.
+
+### The seal survives a depth-8 chain
+
+Milliseconds, from `Actor checkpointed`:
+
+| Size | n | guest_flush p50 | pause p50 | **seal p50** | seal p95 | teardown p50 |
+|---|---|---|---|---|---|---|
+| 5 MiB | 53 | 261.7 | 2.65 | **6.72** | 7.88 | 57.3 |
+| 64 MiB | 44 | 1 721.5 | 2.66 | **6.78** | 8.05 | 69.3 |
+| 128 MiB | 37 | 2 605.4 | 2.58 | **6.43** | 7.75 | 80.8 |
+| 256 MiB | 30 | 2 274.5 | 2.49 | **6.36** | 7.89 | 105.2 |
+| 500 MiB | 52 | 1 372.3 | 2.52 | **6.50** | 8.07 | 148.5 |
+
+**6.36 to 6.78 ms across a 100× range at chain depth 8**, against tar's 2 972 ms
+at 500 MiB. This is Proposal 5's actual claim, and the shipped default does not
+weaken it: the paused window is still constant and still ~450× smaller. Chain
+depth cycled 2..8 in every scenario, so these are genuinely spread across
+depths rather than concentrated at one.
+
+### One configuration this sweep implies but did not run
+
+`MAX_CHAIN=1` with the `-c` removed was never measured, and it is the only
+combination that looks like it could beat tar end to end. Extrapolating the
+500 MiB row — the 1 123 MiB chain of the `MAX_CHAIN=1` arm at the ~450 MiB/s
+flatten rate measured here — puts the flatten at ~2.5 s instead of 19.6 s, for a
+resume near 7 000 ms against an unchanged suspend of 3 800 ms. That is 10 800 ms
+of cycle against tar's 11 300 ms.
+
+That is arithmetic on two measurements, not a measurement, and the flatten rate
+it borrows came from deeper chains than the ones it is applied to. It costs
+three minutes to check and no code change, which makes it the cheapest open
+question in this report.
 
 ## Caveats
 
@@ -461,15 +605,16 @@ that way, and the flatten is a policy knob.
 
 ## Follow-ups
 
-1. Stop compressing the flatten unconditionally. Measured at 6.6× for no
-   change in output size on this workload, it is the largest single win
-   available and it is one flag. What it needs is a way to tell a compressible
-   payload from an incompressible one, since the trade is real for the former.
-2. Re-run at the default `MAX_CHAIN=8`. Nothing in this report says what the
-   arrangement does when the flatten is amortized over eight restores instead
-   of firing on every one, and that is the configuration a production default
-   would ship. It is also the only way to price a deep chain's landing and
-   read costs, which the `MAX_CHAIN=1` runs cannot see.
+1. Run `MAX_CHAIN=1` without the `-c`. Three minutes, no code change, and it is
+   the only configuration this report's numbers suggest could beat tar on total
+   cycle cost — see [One configuration this sweep implies but did not
+   run](#one-configuration-this-sweep-implies-but-did-not-run).
+2. Measure a partial-update workload. Every number here comes from a durable dir
+   that is rewritten end to end every cycle, which is the worst case for a
+   backing-file chain and the case where chain depth is pure cost. Nothing in
+   this report says what the arrangement does when successive cycles touch a
+   subset, which is the case the design is for. `glutton` would need a write
+   mode that dirties a fraction of the file rather than all of it.
 3. Re-run the two largest steps at their committed 20m and 30m durations, now
    that the route timeout no longer caps a write at 10 s. Until then the sweep
    has no valid data point above 500 MiB.
