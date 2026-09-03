@@ -16,7 +16,10 @@
 package ateompath
 
 import (
+	"fmt"
 	"path/filepath"
+	"strconv"
+	"strings"
 )
 
 const (
@@ -43,6 +46,13 @@ var (
 	// CredentialBrokerSocket is the node-local atelet socket used by atunnel
 	// to request credentials for the worker's current actor assignment.
 	CredentialBrokerSocket = filepath.Join(BasePath, "credential-broker.sock")
+
+	// IncrementalDurableDirCacheDir holds the durable-dir generation archives an
+	// incremental capture reuses (see IncrementalDurableDirActorCacheDir). It
+	// sits beside ActorsDir rather than under it because the per-actor state
+	// directories are wiped between cycles, and a cache that does not outlive
+	// one cycle would make every capture a full one.
+	IncrementalDurableDirCacheDir = filepath.Join(BasePath, "incremental-durable-dir")
 )
 
 func RunSCBinaryPath(sha256 string) string {
@@ -197,6 +207,63 @@ func LocalSnapshotDir(actorUID, snapshotName string) string {
 // snapshot consists of this file alone, so atelet uses the name to carve the
 // durable data out of a FULL snapshot's file set.
 const DurableDirTarFile = "durable-dir.tar"
+
+// DurableDirManifestFile describes an incrementally captured durable-dir
+// snapshot in full: every path, and which generation's archive holds it. Its
+// presence in a snapshot is what tells a restore to reassemble a chain rather
+// than extract DurableDirTarFile alone, so a snapshot taken before incremental
+// capture existed still restores the way it always did.
+const DurableDirManifestFile = "durable-dir.manifest.json"
+
+// durableDirGenTarPrefix names the archives of the generations an incremental
+// snapshot inherits from its ancestors. The newest generation is not among
+// them: it is written as DurableDirTarFile, so a chain of length one is
+// byte-identical to a full capture and needs no special case anywhere.
+const durableDirGenTarPrefix = "durable-dir.g"
+
+// DurableDirGenTarFile is the snapshot file holding the archive of one
+// inherited generation.
+func DurableDirGenTarFile(gen int) string {
+	return fmt.Sprintf("%s%d.tar", durableDirGenTarPrefix, gen)
+}
+
+// DurableDirGeneration returns the generation whose archive name is, and
+// reports whether name is one at all.
+func DurableDirGeneration(name string) (int, bool) {
+	rest, ok := strings.CutPrefix(name, durableDirGenTarPrefix)
+	if !ok {
+		return 0, false
+	}
+	digits, ok := strings.CutSuffix(rest, ".tar")
+	if !ok || digits == "" {
+		return 0, false
+	}
+	gen, err := strconv.Atoi(digits)
+	if err != nil || gen < 1 {
+		return 0, false
+	}
+	return gen, true
+}
+
+// IsDurableDirFile reports whether a snapshot file carries durable-dir data.
+// atelet uses it to carve exactly that data out of a FULL capture when
+// uploading it as DATA: under an incremental capture the data is a manifest and
+// several archives rather than the single tar it once was, and shipping only
+// some of them would produce a snapshot that cannot be restored.
+func IsDurableDirFile(name string) bool {
+	if name == DurableDirTarFile || name == DurableDirManifestFile {
+		return true
+	}
+	_, ok := DurableDirGeneration(name)
+	return ok
+}
+
+// IncrementalDurableDirActorCacheDir is where one actor's durable-dir
+// generation archives are kept on the worker between cycles, so a suspend can
+// hand a snapshot the ancestors it inherits without rewriting their contents.
+func IncrementalDurableDirActorCacheDir(actorUID string) string {
+	return filepath.Join(IncrementalDurableDirCacheDir, actorUID)
+}
 
 // DurableDirVolumeMountsDir is the directory where individual durable-dir
 // volumes are mounted.

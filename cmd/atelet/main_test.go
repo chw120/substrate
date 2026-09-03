@@ -41,6 +41,7 @@ import (
 	"github.com/agent-substrate/substrate/internal/proto/ateompb"
 	"github.com/agent-substrate/substrate/internal/resources"
 	"github.com/agent-substrate/substrate/internal/serverboot"
+	atev1alpha1 "github.com/agent-substrate/substrate/pkg/api/v1alpha1"
 	"github.com/google/go-cmp/cmp"
 	"github.com/klauspost/compress/zstd"
 	"github.com/spf13/pflag"
@@ -1954,5 +1955,69 @@ func TestShouldHaveSnapshots(t *testing.T) {
 				t.Errorf("shouldHaveSnapshots() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestNarrowFullCaptureToDataKeepsTheWholeDurableChain(t *testing.T) {
+	// An incremental capture spreads durable data over a manifest and the
+	// archives of the generations it inherits. Uploading the newest archive
+	// alone would produce a DATA snapshot that only fails at the resume, long
+	// after the capture that could have been retried is gone.
+	rec := &sandboxAssetsRecord{
+		SandboxClass: string(atev1alpha1.SandboxClassMicroVM),
+		Scope:        ateattr.SnapshotScopeFull,
+		SnapshotFiles: []string{
+			"config.json",
+			"state.json",
+			"memory-ranges",
+			ateompath.DurableDirManifestFile,
+			ateompath.DurableDirTarFile,
+			ateompath.DurableDirGenTarFile(2),
+			ateompath.DurableDirGenTarFile(5),
+			"rootfs-upper.tar",
+		},
+	}
+	if err := narrowFullCaptureToData(rec); err != nil {
+		t.Fatalf("narrowFullCaptureToData: %v", err)
+	}
+
+	want := []string{
+		ateompath.DurableDirManifestFile,
+		ateompath.DurableDirTarFile,
+		ateompath.DurableDirGenTarFile(2),
+		ateompath.DurableDirGenTarFile(5),
+	}
+	if !slices.Equal(rec.SnapshotFiles, want) {
+		t.Errorf("SnapshotFiles = %v, want %v", rec.SnapshotFiles, want)
+	}
+	if rec.Scope != ateattr.SnapshotScopeData {
+		t.Errorf("Scope = %q, want %q", rec.Scope, ateattr.SnapshotScopeData)
+	}
+}
+
+func TestNarrowFullCaptureToDataOnAFullCapture(t *testing.T) {
+	// With incremental capture off there is one durable file, and narrowing has
+	// to leave exactly the single-file snapshot it always produced.
+	rec := &sandboxAssetsRecord{
+		SandboxClass:  string(atev1alpha1.SandboxClassMicroVM),
+		Scope:         ateattr.SnapshotScopeFull,
+		SnapshotFiles: []string{"config.json", "state.json", ateompath.DurableDirTarFile},
+	}
+	if err := narrowFullCaptureToData(rec); err != nil {
+		t.Fatalf("narrowFullCaptureToData: %v", err)
+	}
+	if want := []string{ateompath.DurableDirTarFile}; !slices.Equal(rec.SnapshotFiles, want) {
+		t.Errorf("SnapshotFiles = %v, want %v", rec.SnapshotFiles, want)
+	}
+}
+
+func TestNarrowFullCaptureToDataRejectsASnapshotWithoutDurableData(t *testing.T) {
+	rec := &sandboxAssetsRecord{
+		SandboxClass:  string(atev1alpha1.SandboxClassMicroVM),
+		Scope:         ateattr.SnapshotScopeFull,
+		SnapshotFiles: []string{"config.json", "state.json"},
+	}
+	if err := narrowFullCaptureToData(rec); err == nil {
+		t.Error("narrowFullCaptureToData accepted a capture with no durable data")
 	}
 }

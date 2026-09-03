@@ -94,3 +94,44 @@ func TestActorPathUsesUID(t *testing.T) {
 		t.Errorf("ActorPath(%q) = %q, want suffix %q", uid1, path1, want)
 	}
 }
+
+func TestDurableDirGeneration(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		wantGen int
+		wantOK  bool
+	}{
+		{DurableDirGenTarFile(1), 1, true},
+		{DurableDirGenTarFile(42), 42, true},
+		{DurableDirTarFile, 0, false},
+		{DurableDirManifestFile, 0, false},
+		// A generation is numbered from one, so a zero or negative name is not
+		// one this package ever wrote and must not be mistaken for a chain link.
+		{"durable-dir.g0.tar", 0, false},
+		{"durable-dir.g-1.tar", 0, false},
+		{"durable-dir.g.tar", 0, false},
+		{"durable-dir.gx.tar", 0, false},
+		{"durable-dir.g1.tar.tmp", 0, false},
+		{"state.json", 0, false},
+	} {
+		gen, ok := DurableDirGeneration(tc.name)
+		if gen != tc.wantGen || ok != tc.wantOK {
+			t.Errorf("DurableDirGeneration(%q) = (%d, %v), want (%d, %v)", tc.name, gen, ok, tc.wantGen, tc.wantOK)
+		}
+	}
+}
+
+func TestIsDurableDirFile(t *testing.T) {
+	// atelet narrows a full capture to its durable data with this predicate, so
+	// a durable file it misses is one a DATA snapshot is silently missing.
+	for _, name := range []string{DurableDirTarFile, DurableDirManifestFile, DurableDirGenTarFile(3)} {
+		if !IsDurableDirFile(name) {
+			t.Errorf("IsDurableDirFile(%q) = false, want true", name)
+		}
+	}
+	for _, name := range []string{"state.json", "config.json", "memory-ranges", "base-id", "rootfs-upper.tar"} {
+		if IsDurableDirFile(name) {
+			t.Errorf("IsDurableDirFile(%q) = true, want false", name)
+		}
+	}
+}

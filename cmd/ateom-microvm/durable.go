@@ -85,7 +85,15 @@ func (s *AteomService) stageDurableVolumes(ctx context.Context, actorUID string)
 //
 // Sockets the workload left behind are skipped rather than archived (tarutil
 // logs them); they hold no data and the workload recreates them on start.
-func tarDurableVolumes(ctx context.Context, dir, checkpointDir string) error {
+//
+// Under ATE_INCREMENTAL_DURABLE_DIR the tar holds only what changed since the
+// actor's previous snapshot and the checkpoint gains a manifest plus the
+// inherited generations (see durable_incremental.go). The resulting snapshot is
+// still self-contained, so nothing above ateom distinguishes the two.
+func tarDurableVolumes(ctx context.Context, actorUID, dir, checkpointDir string) error {
+	if incrementalDurableDirEnabled() {
+		return tarDurableVolumesIncrementally(ctx, actorUID, dir, checkpointDir)
+	}
 	if err := tarutil.Create(ctx, filepath.Join(checkpointDir, durableTarFile), dir); err != nil {
 		return fmt.Errorf("while archiving durable-dir volumes from %q: %w", dir, err)
 	}
@@ -96,9 +104,20 @@ func tarDurableVolumes(ctx context.Context, dir, checkpointDir string) error {
 // actor's host directory (dir, which atelet has already created, empty). It must
 // run before the durable share's virtiofsd starts, so the guest never observes
 // the directory mid-restore.
-func untarDurableVolumes(dir, snapshotDir string) error {
+//
+// Which scheme captured the snapshot is read off the snapshot, not off the
+// environment: a chain restores after incremental capture is switched off, and
+// a snapshot from before it existed restores when it is on.
+func untarDurableVolumes(actorUID, dir, snapshotDir string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("while creating durable-dir volumes dir %q: %w", dir, err)
+	}
+	manifest, err := readSnapshotManifest(snapshotDir)
+	if err != nil {
+		return err
+	}
+	if manifest != nil {
+		return untarDurableVolumesFromChain(actorUID, dir, snapshotDir, manifest)
 	}
 	if err := tarutil.Extract(filepath.Join(snapshotDir, durableTarFile), dir); err != nil {
 		return fmt.Errorf("while restoring durable-dir volumes into %q: %w", dir, err)

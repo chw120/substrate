@@ -130,7 +130,7 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	// cold-starts. The snapshot must carry them — the actor declares the volume, and
 	// every scope captures it.
 	if hasDurableVolumes(p.containers) {
-		if err := untarDurableVolumes(durableDir, restoreDir); err != nil {
+		if err := untarDurableVolumes(p.actorUID, durableDir, restoreDir); err != nil {
 			return nil, err
 		}
 	}

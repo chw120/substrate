@@ -925,7 +925,13 @@ func narrowFullCaptureToData(rec *sandboxAssetsRecord) error {
 			// holds no data, and never will — not retryable.
 			return status.Errorf(codes.FailedPrecondition, "full micro-VM capture has no %s; the actor has no durable data to upload as %s", ateompath.DurableDirTarFile, ateattr.SnapshotScopeData)
 		}
-		rec.SnapshotFiles = []string{ateompath.DurableDirTarFile}
+		// Every durable-dir file, not just the tar: an incremental capture
+		// spreads the data over a manifest and the archives of the generations
+		// it inherits, and a DATA snapshot missing any of them cannot be
+		// restored.
+		rec.SnapshotFiles = slices.DeleteFunc(slices.Clone(rec.SnapshotFiles), func(name string) bool {
+			return !ateompath.IsDurableDirFile(name)
+		})
 		rec.Scope = ateattr.SnapshotScopeData
 		return nil
 

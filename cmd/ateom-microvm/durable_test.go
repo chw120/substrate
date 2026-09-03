@@ -82,7 +82,7 @@ func TestDurableVolumesRoundTrip(t *testing.T) {
 		}
 	}
 	checkpointDir := t.TempDir()
-	if err := tarDurableVolumes(t.Context(), src, checkpointDir); err != nil {
+	if err := tarDurableVolumes(t.Context(), "actor-uid", src, checkpointDir); err != nil {
 		t.Fatalf("tarDurableVolumes: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(checkpointDir, durableTarFile)); err != nil {
@@ -91,7 +91,7 @@ func TestDurableVolumesRoundTrip(t *testing.T) {
 
 	// Restore: onto the empty directory atelet re-creates for the actor.
 	dst := t.TempDir()
-	if err := untarDurableVolumes(dst, checkpointDir); err != nil {
+	if err := untarDurableVolumes("actor-uid", dst, checkpointDir); err != nil {
 		t.Fatalf("untarDurableVolumes: %v", err)
 	}
 	// Both volumes come back, each under its own name: the names are what the
