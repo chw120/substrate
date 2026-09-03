@@ -66,9 +66,37 @@ func Create(ctx context.Context, tarPath, srcDir string) error {
 // directory omits its entire subtree.
 type SkipFunc func(rel string) bool
 
+// SelectFunc reports whether the entry at rel — a slash-separated path relative
+// to the archive root — belongs in the archive. d describes the entry as
+// filepath.WalkDir found it.
+//
+// It differs from SkipFunc in what a directory means. Declining a directory
+// here omits that directory's own entry and nothing else: the walk still
+// descends into it, so a caller can archive a handful of deep files without
+// carrying every intermediate directory along. Whoever extracts such an archive
+// is then responsible for the missing directories, because Extract creates
+// files through an os.Root and fails on a path whose parent is absent.
+type SelectFunc func(rel string, d fs.DirEntry) bool
+
+// CreateSelected is Create restricted to the entries sel accepts. A nil sel
+// archives everything, making it identical to Create.
+//
+// It exists for incremental snapshots, which archive only the paths that
+// changed since the previous generation and restore directories from a manifest
+// rather than from any archive (see internal/incrtar). CreateFiltered's
+// subtree-pruning skip cannot express that: pruning at the first directory
+// would take the whole tree with it.
+func CreateSelected(ctx context.Context, tarPath, srcDir string, sel SelectFunc) error {
+	return create(ctx, tarPath, srcDir, nil, sel)
+}
+
 // CreateFiltered is Create with entries omitted where skip returns true. A nil
 // skip archives everything.
 func CreateFiltered(ctx context.Context, tarPath, srcDir string, skip SkipFunc) error {
+	return create(ctx, tarPath, srcDir, skip, nil)
+}
+
+func create(ctx context.Context, tarPath, srcDir string, skip SkipFunc, sel SelectFunc) error {
 	f, err := os.Create(tarPath)
 	if err != nil {
 		return fmt.Errorf("creating tar %q: %w", tarPath, err)
@@ -76,7 +104,7 @@ func CreateFiltered(ctx context.Context, tarPath, srcDir string, skip SkipFunc) 
 	defer f.Close()
 
 	tw := tar.NewWriter(f)
-	if err := writeTree(ctx, tw, srcDir, skip); err != nil {
+	if err := writeTree(ctx, tw, srcDir, skip, sel); err != nil {
 		return err
 	}
 	if err := tw.Close(); err != nil {
@@ -92,9 +120,10 @@ func CreateFiltered(ctx context.Context, tarPath, srcDir string, skip SkipFunc) 
 
 // writeTree walks srcDir in lexical order (filepath.WalkDir) and writes one
 // entry per path, omitting entries (and, for directories, subtrees) that skip
-// selects. The deterministic order keeps archives of identical trees
-// byte-comparable, which makes snapshot diffs meaningful.
-func writeTree(ctx context.Context, tw *tar.Writer, srcDir string, skip SkipFunc) error {
+// selects, and entries that sel declines. The deterministic order keeps
+// archives of identical trees byte-comparable, which makes snapshot diffs
+// meaningful.
+func writeTree(ctx context.Context, tw *tar.Writer, srcDir string, skip SkipFunc, sel SelectFunc) error {
 	// Maps an already-archived multi-link inode to the name it was archived
 	// under, so later links become tar hardlink entries instead of copies.
 	linked := map[inodeKey]string{}
@@ -114,6 +143,12 @@ func writeTree(ctx context.Context, tw *tar.Writer, srcDir string, skip SkipFunc
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
+			return nil
+		}
+		// Checked before the hardlink bookkeeping below, so a declined link is
+		// not recorded as the name later links point at. If the first member of
+		// a link set is declined, the first one kept carries the contents.
+		if sel != nil && !sel(filepath.ToSlash(rel), d) {
 			return nil
 		}
 
@@ -226,6 +261,25 @@ func copyFileInto(tw *tar.Writer, path string) error {
 // an existing path replaces it ("later entry wins", standard tar semantics),
 // except that an existing directory is kept when the entry is also a directory.
 func Extract(tarPath, dstDir string) error {
+	return ExtractFiltered(tarPath, dstDir, nil)
+}
+
+// KeepFunc reports whether an archive entry should be materialized, given its
+// cleaned name and header. A nil KeepFunc keeps everything.
+type KeepFunc func(name string, hdr *tar.Header) bool
+
+// ExtractFiltered is Extract restricted to the entries keep accepts.
+//
+// It exists for incremental snapshots, where one generation's archive may hold
+// a path that a later generation superseded. Restoring from the chain takes
+// each path from exactly the archive the manifest attributes it to, so a file
+// is written once rather than once per generation that ever touched it — which
+// is what keeps a long chain from costing more to restore than a full capture
+// (see internal/incrtar).
+//
+// A dropped entry is dropped whole: a hardlink whose target was not kept will
+// fail to extract, so callers must keep link sets together.
+func ExtractFiltered(tarPath, dstDir string, keep KeepFunc) error {
 	f, err := os.Open(tarPath)
 	if err != nil {
 		return fmt.Errorf("opening tar %q: %w", tarPath, err)
@@ -257,6 +311,9 @@ func Extract(tarPath, dstDir string) error {
 			return fmt.Errorf("invalid entry in tar %q: %w", tarPath, err)
 		}
 		if skip {
+			continue
+		}
+		if keep != nil && !keep(name, hdr) {
 			continue
 		}
 		if err := extractEntry(root, tr, hdr, name, dirs); err != nil {

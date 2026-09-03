@@ -19,9 +19,12 @@ package tarutil
 import (
 	"archive/tar"
 	"errors"
+	"io"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -652,5 +655,128 @@ func TestExtractSupportsDeviceEntry(t *testing.T) {
 	}
 	if st.Mode()&os.ModeCharDevice == 0 {
 		t.Errorf("extracted node mode = %v, want a character device", st.Mode())
+	}
+}
+
+// namesIn lists an archive's entry names in order.
+func namesIn(t *testing.T, tarPath string) []string {
+	t.Helper()
+	f, err := os.Open(tarPath)
+	if err != nil {
+		t.Fatalf("opening tar: %v", err)
+	}
+	defer f.Close()
+
+	var names []string
+	tr := tar.NewReader(f)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return names
+		}
+		if err != nil {
+			t.Fatalf("reading tar: %v", err)
+		}
+		names = append(names, hdr.Name)
+	}
+}
+
+func TestCreateSelectedOmitsDeclinedEntries(t *testing.T) {
+	src := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(src, "sub"), 0o755); err != nil {
+		t.Fatalf("creating sub: %v", err)
+	}
+	for _, name := range []string{"keep.txt", "drop.txt", "sub/keep.txt", "sub/drop.txt"} {
+		if err := os.WriteFile(filepath.Join(src, name), []byte(name), 0o644); err != nil {
+			t.Fatalf("writing %q: %v", name, err)
+		}
+	}
+
+	tarPath := filepath.Join(t.TempDir(), "filtered.tar")
+	// Declining the directory too, to pin down that a declined directory is
+	// still descended into rather than pruned.
+	sel := func(rel string, _ fs.DirEntry) bool {
+		return rel != "sub" && !strings.HasSuffix(rel, "drop.txt")
+	}
+	if err := CreateSelected(t.Context(), tarPath, src, sel); err != nil {
+		t.Fatalf("CreateSelected: %v", err)
+	}
+	if got, want := namesIn(t, tarPath), []string{"keep.txt", "sub/keep.txt"}; !slices.Equal(got, want) {
+		t.Errorf("archive holds %v, want %v", got, want)
+	}
+}
+
+func TestCreateSelectedDecliningEverythingYieldsAnEmptyArchive(t *testing.T) {
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatalf("writing file: %v", err)
+	}
+	tarPath := filepath.Join(t.TempDir(), "empty.tar")
+	if err := CreateSelected(t.Context(), tarPath, src, func(string, fs.DirEntry) bool { return false }); err != nil {
+		t.Fatalf("CreateSelected: %v", err)
+	}
+	if got := namesIn(t, tarPath); len(got) != 0 {
+		t.Errorf("archive holds %v, want nothing", got)
+	}
+	// Still a well-formed archive, so restoring an unchanged generation is an
+	// ordinary extraction rather than a special case.
+	if err := Extract(tarPath, t.TempDir()); err != nil {
+		t.Errorf("Extract of an empty archive: %v", err)
+	}
+}
+
+func TestCreateSelectedPromotesTheFirstKeptLink(t *testing.T) {
+	src := t.TempDir()
+	first := filepath.Join(src, "a.txt")
+	if err := os.WriteFile(first, []byte("shared"), 0o644); err != nil {
+		t.Fatalf("writing file: %v", err)
+	}
+	if err := os.Link(first, filepath.Join(src, "b.txt")); err != nil {
+		t.Fatalf("creating hardlink: %v", err)
+	}
+
+	tarPath := filepath.Join(t.TempDir(), "links.tar")
+	sel := func(rel string, _ fs.DirEntry) bool { return rel != "a.txt" }
+	if err := CreateSelected(t.Context(), tarPath, src, sel); err != nil {
+		t.Fatalf("CreateSelected: %v", err)
+	}
+
+	// b.txt has to carry the contents: a.txt is not in the archive, so a
+	// hardlink entry pointing at it would be unrestorable.
+	dst := t.TempDir()
+	if err := Extract(tarPath, dst); err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dst, "b.txt"))
+	if err != nil {
+		t.Fatalf("reading b.txt: %v", err)
+	}
+	if string(got) != "shared" {
+		t.Errorf("b.txt = %q, want %q", got, "shared")
+	}
+}
+
+func TestExtractFilteredTakesOnlyKeptEntries(t *testing.T) {
+	src := t.TempDir()
+	for _, name := range []string{"keep.txt", "drop.txt"} {
+		if err := os.WriteFile(filepath.Join(src, name), []byte(name), 0o644); err != nil {
+			t.Fatalf("writing %q: %v", name, err)
+		}
+	}
+	tarPath := filepath.Join(t.TempDir(), "both.tar")
+	if err := Create(t.Context(), tarPath, src); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	dst := t.TempDir()
+	keep := func(name string, _ *tar.Header) bool { return name == "keep.txt" }
+	if err := ExtractFiltered(tarPath, dst, keep); err != nil {
+		t.Fatalf("ExtractFiltered: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dst, "keep.txt")); err != nil {
+		t.Errorf("keep.txt was not extracted: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dst, "drop.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("stat of drop.txt = %v, want it to not exist", err)
 	}
 }
