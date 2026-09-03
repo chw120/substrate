@@ -57,11 +57,11 @@ const (
 	// off by default: the scheme trades a read of the whole volume (to hash it)
 	// for a much smaller write, which is the right trade on the node's disk but
 	// not obviously so on every workload shape.
-	incrementalDurableDirEnv = "ATE_INCREMENTAL_DURABLE_DIR"
+	incrementalDurableDirEnv = "ATEOM_INCREMENTAL_DURABLE_DIR"
 
 	// maxDurableDirChainEnv overrides how many generations a chain may reference
 	// before the next capture is taken in full.
-	maxDurableDirChainEnv = "ATE_INCREMENTAL_DURABLE_DIR_MAX_CHAIN"
+	maxDurableDirChainEnv = "ATEOM_INCREMENTAL_DURABLE_DIR_MAX_CHAIN"
 
 	// defaultMaxDurableDirChain bounds the chain. Every referenced generation is
 	// an archive the snapshot has to carry and the restore has to open, so a

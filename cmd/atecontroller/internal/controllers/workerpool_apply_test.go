@@ -930,3 +930,38 @@ func expectedDeploymentApplyConfig(mutatePodSpec func(*corev1ac.PodSpecApplyConf
 				WithLabels(map[string]string{"ate.dev/worker-pool": wp.Name}).
 				WithSpec(podSpecAC)))
 }
+
+func TestAteomContainerEnvPropagatesTheDurableDirKnobs(t *testing.T) {
+	// Any worker may be asked to restore what another wrote, so a knob set on
+	// the controller has to reach every worker pod rather than being configured
+	// pod by pod.
+	t.Setenv("ATEOM_INCREMENTAL_DURABLE_DIR", "1")
+	t.Setenv("ATEOM_INCREMENTAL_DURABLE_DIR_MAX_CHAIN", "8")
+
+	got := map[string]string{}
+	for _, e := range ateomContainerEnv(ateomOTelSettings{}) {
+		if e.Name != nil && e.Value != nil {
+			got[*e.Name] = *e.Value
+		}
+	}
+	want := map[string]string{
+		"ATEOM_INCREMENTAL_DURABLE_DIR":           "1",
+		"ATEOM_INCREMENTAL_DURABLE_DIR_MAX_CHAIN": "8",
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("worker pod env (-want +got):\n%s", diff)
+	}
+}
+
+func TestAteomContainerEnvOmitsUnsetDurableDirKnobs(t *testing.T) {
+	// A default deployment must add nothing, so turning the scheme off is the
+	// same as never having deployed it.
+	for _, name := range ateomDurableDirEnv {
+		t.Setenv(name, "")
+	}
+	for _, e := range ateomContainerEnv(ateomOTelSettings{}) {
+		if e.Name != nil && strings.HasPrefix(*e.Name, "ATEOM_") {
+			t.Errorf("a default deployment set %q on the worker pod", *e.Name)
+		}
+	}
+}

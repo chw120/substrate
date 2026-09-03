@@ -86,7 +86,7 @@ func (s *AteomService) stageDurableVolumes(ctx context.Context, actorUID string)
 // Sockets the workload left behind are skipped rather than archived (tarutil
 // logs them); they hold no data and the workload recreates them on start.
 //
-// Under ATE_INCREMENTAL_DURABLE_DIR the tar holds only what changed since the
+// Under ATEOM_INCREMENTAL_DURABLE_DIR the tar holds only what changed since the
 // actor's previous snapshot and the checkpoint gains a manifest plus the
 // inherited generations (see durable_incremental.go). The resulting snapshot is
 // still self-contained, so nothing above ateom distinguishes the two.
