@@ -59,6 +59,8 @@ import (
 	"strconv"
 	"strings"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/reaper"
 )
 
@@ -97,7 +99,8 @@ const defaultSizeGiB = 32
 // MaxChainEnvVar caps how many layers a backing chain may reach before the
 // next restore flattens it. Every extra layer is another indirection a guest
 // read of a cold cluster may have to walk, and another file that must be
-// present before the image will open at all.
+// present before the image will open at all. Values past what
+// cloud-hypervisor will open are clamped; see MaxChain.
 //
 // It is also the setting that decides what a benchmark measures, so set it
 // deliberately when running one. A chain of depth N holds up to N copies of
@@ -114,6 +117,18 @@ const MaxChainEnvVar = "ATEOM_DURABLE_QCOW2_MAX_CHAIN"
 // and in the other direction it is read amplification that grows without
 // bound for the whole of a long-lived actor's life.
 const defaultMaxChain = 8
+
+// maxNestingDepth is the deepest chain cloud-hypervisor will open: a top layer
+// plus ten backing files. Measured rather than read off a flag — a chain of
+// eleven boots and one of twelve fails vm.boot with "Maximum disk nesting depth
+// exceeded", the same message CH gives for a qcow2 whose backing files were not
+// enabled at all (see the ch package's DiskConfig).
+//
+// Exceeding it is not one bad restore but a dead actor. A boot that fails lands
+// no new layer and collapses none, so the chain that was too deep is exactly as
+// deep on the next attempt, and every activation from then on fails the same
+// way.
+const maxNestingDepth = 11
 
 // magic is the qcow2 file header's first four bytes ("QFI\xfb").
 var magic = []byte{0x51, 0x46, 0x49, 0xfb}
@@ -140,10 +155,16 @@ func SizeBytes() int64 {
 	return int64(gib) << 30
 }
 
-// MaxChain is the chain depth at which the next restore flattens.
+// MaxChain is the chain depth at which the next restore flattens, and so the
+// deepest chain cloud-hypervisor is ever handed.
+//
+// Clamped to what CH will open. The setting trades read amplification for
+// flatten frequency, and both ends of that trade are survivable; a chain past
+// maxNestingDepth is not, so a configuration that asks for one is honored as
+// far as it can be and no further.
 func MaxChain() int {
 	if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv(MaxChainEnvVar))); err == nil && v > 0 {
-		return v
+		return min(v, maxNestingDepth)
 	}
 	return defaultMaxChain
 }
@@ -317,16 +338,80 @@ func BackingChain(ctx context.Context, path string) ([]ImageInfo, error) {
 // with the actor's data, which is why what triggers it (MaxChain) is a policy
 // question rather than a detail.
 //
-// The convert is deliberately not compressed. It runs on the restore path, so
-// every millisecond it takes is resume latency, and no coroutine count recovers
-// what deflate costs: measured against a durable-dir chain, -c took 6.6x the
-// wall time and returned an image of exactly the same size, because the payload
-// was incompressible. A workload whose data does compress would trade that CPU
-// for a smaller image and a smaller upload; if that case ever needs serving it
-// wants to be a choice rather than the default.
+// The convert is deliberately not compressed. Measured against a durable-dir
+// chain, -c took 6.6x the wall time and returned an image of exactly the same
+// size, because the payload was incompressible. A workload whose data does
+// compress would trade that CPU for a smaller image and a smaller upload; if
+// that case ever needs serving it wants to be a choice rather than the default.
+//
+// -t none puts the destination on O_DIRECT, because these bytes are the largest
+// single source of dirty host page cache in the whole arrangement — a 512 MiB
+// durable dir flattens to some 740 MB — and nothing on this node reads them
+// back: the guest reads the chain it already has open, and the flattened base
+// is for the next restore to land. Buffering them only hands the bill to
+// whoever next forces an ext4 journal commit, which is the guest's pre-suspend
+// flush (see Drain). A filesystem that cannot do O_DIRECT gets the buffered
+// convert instead, since a flatten that refuses to run is worse than one that
+// dirties the cache.
+//
+// -U because this reads layers cloud-hypervisor has open. They are the chain
+// BEHIND the layer the guest writes to, and a backing file is immutable for as
+// long as something is stacked on it, so the lock qemu-img would otherwise
+// insist on is guarding against a writer that does not exist.
 func Flatten(ctx context.Context, src, dst string) error {
-	if out, err := run(ctx, qemuImg, "convert", "-f", "qcow2", "-O", "qcow2", src, dst); err != nil {
-		return fmt.Errorf("flattening the qcow2 chain at %q into %q: %w (%s)", src, dst, err, out)
+	out, err := run(ctx, qemuImg, "convert", "-U", "-t", "none", "-f", "qcow2", "-O", "qcow2", src, dst)
+	if err == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return fmt.Errorf("flattening the qcow2 chain at %q into %q: %w", src, dst, ctx.Err())
+	}
+	out2, err2 := run(ctx, qemuImg, "convert", "-U", "-f", "qcow2", "-O", "qcow2", src, dst)
+	if err2 == nil {
+		return nil
+	}
+	return fmt.Errorf("flattening the qcow2 chain at %q into %q: %w (%s); with O_DIRECT it failed too: %v (%s)",
+		src, dst, err2, out2, err, out)
+}
+
+// Drain writes back every dirty page on the filesystem holding path and waits
+// for them, so that the guest's own flushes do not have to.
+//
+// A restore leaves a large amount of the host's page cache dirty — measured at
+// some 214 MB for a 128 MiB durable dir and 820 MB for a 512 MiB one, an order
+// of magnitude more than the delta that actually changed — and the kernel is
+// under no obligation to write any of it back for another
+// dirty_expire_centisecs. Nothing does, because the totals here are far below
+// the background threshold. The bill arrives at the guest's pre-suspend flush:
+// cloud-hypervisor turns that into an
+// fsync of the durable image, ext4 in its default data=ordered mode cannot
+// commit that journal transaction until every inode's ordered data is on the
+// device, and so a flush of an 18 MB delta waits on a hundred and seventy
+// megabytes it did not write. Measured on a 128 MiB durable dir rewritten a
+// file at a time, that wait was the whole of the cost: the pre-suspend flush
+// took 1 482 ms with the restore's pages left dirty and 34 ms with them already
+// written back.
+//
+// Filesystem-wide rather than per-file, because per-file does not work: the
+// dirty pages are not the images'. sync_file_range on the freshly flattened
+// base returns in under 50 ms with 174 MB still dirty, and the pre-suspend
+// flush is unchanged. What ext4 couples here is the journal, not the file, so
+// the drain has to have the journal's own scope.
+//
+// It blocks, and its caller runs it in a goroutine. Queueing the writeback and
+// returning instead — the cheaper looking SYNC_FILE_RANGE_WRITE — measured no
+// better than doing nothing, because the queued pages then compete with the
+// guest's I/O for the rest of the cycle anyway. Something has to make the
+// device finish; the caller's job is to choose a window where nothing else
+// wants it.
+func Drain(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("opening %q to drain its filesystem: %w", path, err)
+	}
+	defer f.Close()
+	if err := unix.Syncfs(int(f.Fd())); err != nil {
+		return fmt.Errorf("draining the filesystem holding %q: %w", path, err)
 	}
 	return nil
 }

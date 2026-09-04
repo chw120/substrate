@@ -136,7 +136,7 @@ func initDurableQcow2(ctx context.Context, actorUID string) error {
 		return fmt.Errorf("while creating the durable-dir layer directory %q: %w", dir, err)
 	}
 	size := qcow2.SizeBytes()
-	base := qcow2.NextLayerName(ateompath.DurableDirLayerPrefix, 0)
+	base := qcow2.NextLayerName(ateompath.DurableDirLayerPrefix, nil)
 	t := time.Now()
 	if err := qcow2.CreateBase(ctx, filepath.Join(dir, base), size); err != nil {
 		return err
@@ -153,7 +153,7 @@ func appendDurableQcow2Layer(ctx context.Context, actorUID string, layers []stri
 		return errors.New("cannot stack a durable-dir layer on an empty chain")
 	}
 	dir := durableQcow2Dir(actorUID)
-	name := qcow2.NextLayerName(ateompath.DurableDirLayerPrefix, len(layers))
+	name := qcow2.NextLayerName(ateompath.DurableDirLayerPrefix, layers)
 	if err := qcow2.CreateDelta(ctx, filepath.Join(dir, name), layers[len(layers)-1]); err != nil {
 		return err
 	}
@@ -207,17 +207,23 @@ func landDurableQcow2(ctx context.Context, actorUID, snapshotDir string) error {
 	}
 
 	layers := src.LayerFiles()
-	// Flatten before stacking, so the depth check is against what the actor
-	// arrived with and the flattened base is what the new top writes into.
+	// Collapse a chain that has reached the cap before stacking on it, so that
+	// what cloud-hypervisor is handed is never deeper than MaxChain.
+	//
+	// The suspend that sealed the chain normally collapsed it already
+	// (collapseSealedQcow2), which is where the cost belongs. This is the
+	// fallback for the snapshots that arrive deep anyway: one written before
+	// that ran, or one whose collapse failed. It stays because the alternative
+	// to flattening a chain at the cap is an actor that cannot boot.
 	if len(layers) >= qcow2.MaxChain() {
-		flattened, err := flattenDurableQcow2(ctx, actorUID, layers)
+		base, err := flattenDurableQcow2(ctx, actorUID, layers)
 		if err != nil {
 			// A failed flatten is a performance problem, not a correctness
 			// one: the chain that arrived is still intact and still mounts.
 			slog.WarnContext(ctx, "Failed to flatten the durable-dir chain; continuing on the deep chain",
 				slog.String("id", actorUID), slog.Int("layers", len(layers)), slog.Any("err", err))
 		} else {
-			layers = flattened
+			layers = []string{base}
 		}
 	}
 	if err := appendDurableQcow2Layer(ctx, actorUID, layers, src.VirtualSizeBytes); err != nil {
@@ -233,59 +239,94 @@ func landDurableQcow2(ctx context.Context, actorUID, snapshotDir string) error {
 	if err := qcow2.Check(ctx, top); err != nil {
 		return fmt.Errorf("while validating the restored durable-dir chain: %w", err)
 	}
+	// Settle what this restore dirtied, so that the guest's pre-suspend flush
+	// does not have to wait on it. In the background and deliberately: waiting
+	// for it measured a straight trade -- 1 200 ms off suspend, 1 300 ms onto
+	// resume -- which is the wrong direction, since resume is the latency an
+	// actor's caller is sitting through.
+	//
+	// How much of it the guest's own cold boot hides depends on how much there
+	// is. On a 128 MiB durable dir the drain took 1 216 ms against a 1 227 ms
+	// boot and cost nothing; on a 512 MiB one it took 4 659 ms against a
+	// 2 151 ms boot, so the back half of it ran while the guest was reading its
+	// containers off the same device. Sizing this to what is actually dirty is
+	// the open question here, and behind it the larger one of why a restore
+	// dirties an order of magnitude more than it changed.
+	//
+	// Nothing waits for the result and nothing has to: a drain that fails, or
+	// that a teardown outruns, leaves the pages dirty and the kernel writes
+	// them back on its own schedule. The cost of losing the race is the flush
+	// this was meant to spare, not correctness.
+	go func() {
+		tDrain := time.Now()
+		if err := qcow2.Drain(dir); err != nil {
+			slog.WarnContext(ctx, "Could not drain the durable-dir filesystem",
+				slog.String("id", actorUID), slog.String("error", err.Error()))
+			return
+		}
+		slog.InfoContext(ctx, "Drained the durable-dir filesystem",
+			slog.String("id", actorUID), slog.Duration("took", time.Since(tDrain)))
+	}()
 	slog.InfoContext(ctx, "Landed the durable-dir chain", slog.String("id", actorUID),
 		slog.Int("layers", len(layers)+1), slog.Int64("bytes", src.TotalBytes()))
 	return nil
 }
 
-// flattenDurableQcow2 collapses the chain into a single self-contained base and
-// returns the layer list that replaces it.
+// flattenDurableQcow2 collapses the chain in an actor's live layer directory.
+func flattenDurableQcow2(ctx context.Context, actorUID string, layers []string) (string, error) {
+	return flattenChain(ctx, actorUID, durableQcow2Dir(actorUID), layers)
+}
+
+// flattenChain collapses layers — a chain, base first, all in dir — into a
+// single self-contained image and returns the name of the one layer that
+// survives.
 //
-// Nothing is removed until the new base is in place under its final name, and
-// the manifest — the marker for the whole arrangement — is not written until
-// after this returns. So an interrupted flatten leaves a directory that does
-// not look active, which the retried restore clears and re-adopts from the
-// checkpoint it is landing.
+// That name is the LAST of the layers given, not a fresh one and not the base's.
+// Whatever is stacked on this chain records its backing file by name, so
+// collapsing into the name at the top of what was collapsed leaves that header
+// correct for free, whether it is written before or after. It is also why layer
+// numbers no longer track chain depth (see qcow2.NextLayerName): the numbers
+// climb, and a flatten removes the ones below the survivor rather than
+// renumbering.
 //
-// It runs at restore rather than at suspend because suspend is the measured
-// window and this is the one operation here that still scales with the actor's
-// data. That makes one restore in every MaxChain() slower, which is a poor
-// trade for a latency-sensitive resume and the reason the flatten policy is
-// still an open question rather than a settled one — moving it to a background
-// job needs an answer for what happens when the actor suspends mid-flatten.
-func flattenDurableQcow2(ctx context.Context, actorUID string, layers []string) ([]string, error) {
-	dir := durableQcow2Dir(actorUID)
+// Nothing is removed until the new image is in place under that name, and
+// rename over it is atomic, so at no point is there a directory in which the
+// layer is absent or half-written. Reversing the two would open a window in
+// which the actor's data existed only under a dotfile name no other code path
+// looks for.
+//
+// The layer files are shared by link between an actor's live directory and the
+// checkpoints sealed from it, so both the rename and the removals must stay
+// link-safe: they replace and unlink names, and never write through an inode a
+// sealed checkpoint still refers to.
+func flattenChain(ctx context.Context, actorUID, dir string, layers []string) (string, error) {
+	if len(layers) == 0 {
+		return "", errors.New("cannot flatten an empty durable-dir chain")
+	}
+	base := layers[len(layers)-1]
 	tmp := filepath.Join(dir, ".flattened.qcow2")
 	t := time.Now()
-	if err := qcow2.Flatten(ctx, filepath.Join(dir, layers[len(layers)-1]), tmp); err != nil {
+	if err := qcow2.Flatten(ctx, filepath.Join(dir, base), tmp); err != nil {
 		_ = os.Remove(tmp)
-		return nil, err
+		return "", err
 	}
-	// Install first, then drop what it replaced. The new base takes the old
-	// one's name, and rename over it is atomic, so at no point is there a
-	// directory in which the base is absent or half-written. Reversing these
-	// two would open a window in which the actor's data existed only under a
-	// dotfile name no other code path looks for.
-	base := qcow2.NextLayerName(ateompath.DurableDirLayerPrefix, 0)
 	if err := os.Rename(tmp, filepath.Join(dir, base)); err != nil {
-		return nil, fmt.Errorf("installing the flattened durable-dir base: %w", err)
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("installing the flattened durable-dir base: %w", err)
 	}
-	for _, name := range layers {
-		if name == base {
-			continue // Replaced in place by the rename above.
-		}
+	for _, name := range layers[:len(layers)-1] {
 		if err := os.Remove(filepath.Join(dir, name)); err != nil {
-			return nil, fmt.Errorf("removing flattened layer %q: %w", name, err)
+			return "", fmt.Errorf("removing flattened layer %q: %w", name, err)
 		}
 	}
 	st, err := os.Stat(filepath.Join(dir, base))
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	slog.InfoContext(ctx, "Flattened the durable-dir chain", slog.String("id", actorUID),
-		slog.Int("from_layers", len(layers)), slog.Int64("bytes", st.Size()),
-		slog.Duration("took", time.Since(t)))
-	return []string{base}, nil
+		slog.Int("from_layers", len(layers)), slog.String("into", base),
+		slog.Int64("bytes", st.Size()), slog.Duration("took", time.Since(t)))
+	return base, nil
 }
 
 // sealDurableQcow2 captures the actor's durable data into checkpointDir. The
@@ -319,6 +360,48 @@ func sealDurableQcow2(ctx context.Context, actorUID, checkpointDir string) (qcow
 		return m, err
 	}
 	return m, nil
+}
+
+// collapseSealedQcow2 flattens a sealed checkpoint's chain in place, so that the
+// restore reading it lands a shallow chain and never has to flatten one itself.
+//
+// The collapse has to happen somewhere: cloud-hypervisor refuses to open a chain
+// nested deeper than qcow2.MaxNestingDepth, and the only way back under that
+// ceiling is a qemu-img convert of the actor's data — 4.6 s at 512 MiB, the one
+// operation in this arrangement that still scales with the data. Doing it here
+// rather than on the restore path spends it where there is measured room for it:
+// a suspend costs 0.42x of the directory arrangement's and a resume 1.5x, so the
+// same work is roughly free on one side and the whole tail on the other. It also
+// shrinks what atelet ships — a chain at the cap is 889 MB against a 512 MiB
+// durable dir, and the flattened image is the durable dir.
+//
+// It runs after the guest is torn down: the checkpoint's files are hardlinks and
+// so outlive the actor's directory, and holding the VM's memory and virtiofsd
+// open across a convert buys nothing.
+//
+// A failure is not fatal. The chain that was sealed is intact and still restores
+// — the restore path keeps its own flatten for exactly this case, and for
+// snapshots written before this ran at all.
+func collapseSealedQcow2(ctx context.Context, actorUID, checkpointDir string, m qcow2.Manifest) (qcow2.Manifest, error) {
+	layers := m.LayerFiles()
+	if len(layers) < qcow2.MaxChain() {
+		return m, nil
+	}
+	survivor, err := flattenChain(ctx, actorUID, checkpointDir, layers)
+	if err != nil {
+		return m, err
+	}
+	// Re-derive from the headers rather than editing the manifest: the flatten
+	// rewrote them, and the manifest is what the restore trusts to know which
+	// files must be present.
+	flat, err := qcow2.DescribeChain(ctx, filepath.Join(checkpointDir, survivor))
+	if err != nil {
+		return m, err
+	}
+	if err := qcow2.WriteManifest(filepath.Join(checkpointDir, ateompath.DurableDirChainFile), flat); err != nil {
+		return m, err
+	}
+	return flat, nil
 }
 
 // topLayerBytes is the size of the layer the actor was writing to — the part of

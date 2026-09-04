@@ -18,11 +18,13 @@ package qcow2
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -90,6 +92,23 @@ func TestSizeAndMaxChainFallBack(t *testing.T) {
 	t.Setenv(MaxChainEnvVar, "3")
 	if got := MaxChain(); got != 3 {
 		t.Errorf("MaxChain() = %d, want 3", got)
+	}
+}
+
+// A depth past what cloud-hypervisor will open is not a slower actor but a dead
+// one: vm.boot fails, so no layer is landed and none is collapsed, and every
+// activation after it fails the same way. The setting is therefore honored only
+// as far as the hypervisor can follow it. The default has to be inside the
+// limit on its own, since nothing clamps it.
+func TestMaxChainIsClampedToTheNestingLimit(t *testing.T) {
+	if defaultMaxChain > maxNestingDepth {
+		t.Errorf("defaultMaxChain = %d, past the %d layers cloud-hypervisor will open", defaultMaxChain, maxNestingDepth)
+	}
+	for _, v := range []int{maxNestingDepth, maxNestingDepth + 1, 999} {
+		t.Setenv(MaxChainEnvVar, strconv.Itoa(v))
+		if got := MaxChain(); got > maxNestingDepth {
+			t.Errorf("MaxChain() with %s=%d = %d, want no more than %d", MaxChainEnvVar, v, got, maxNestingDepth)
+		}
 	}
 }
 
@@ -173,7 +192,7 @@ func TestChainRoundTrip(t *testing.T) {
 
 	names := []string{filepath.Base(base)}
 	for i := 1; i <= 2; i++ {
-		name := NextLayerName("durable-dir.layer-", i)
+		name := NextLayerName("durable-dir.layer-", names)
 		if err := CreateDelta(ctx, filepath.Join(dir, name), names[len(names)-1]); err != nil {
 			t.Fatalf("CreateDelta(%q) = %v", name, err)
 		}
@@ -289,6 +308,91 @@ func TestFlattenProducesASelfContainedBase(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
 			t.Errorf("Flatten() removed %q: %v", name, err)
 		}
+	}
+}
+
+// A filesystem that refuses O_DIRECT must still get a flatten. Dirtying the
+// page cache costs the guest's next flush; not flattening at all lets the chain
+// deepen without bound, which is the worse of the two.
+//
+// Staged with a stub qemu-img rather than a real filesystem, because there is
+// no longer one to hand that refuses: tmpfs has accepted O_DIRECT since Linux
+// 6.1, so the branch is unreachable on any node these tests run on.
+func TestFlattenFallsBackWhenODirectIsRefused(t *testing.T) {
+	requireTools(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	tool, err := exec.LookPath(qemuImg)
+	if err != nil {
+		t.Fatalf("looking up %s: %v", qemuImg, err)
+	}
+	bin := t.TempDir()
+	stub := fmt.Sprintf("#!/bin/sh\nfor a in \"$@\"; do\n  [ \"$a\" = none ] && exit 1\ndone\nexec %q \"$@\"\n", tool)
+	if err := os.WriteFile(filepath.Join(bin, qemuImg), []byte(stub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	base := "durable-dir.layer-0000.qcow2"
+	delta := "durable-dir.layer-0001.qcow2"
+	if err := CreateBase(ctx, filepath.Join(dir, base), probeSizeBytes); err != nil {
+		t.Fatalf("CreateBase() = %v", err)
+	}
+	if err := CreateDelta(ctx, filepath.Join(dir, delta), base); err != nil {
+		t.Fatalf("CreateDelta() = %v", err)
+	}
+	flat := filepath.Join(dir, "flat.qcow2")
+	if err := Flatten(ctx, filepath.Join(dir, delta), flat); err != nil {
+		t.Fatalf("Flatten() = %v, want the buffered retry to have carried it", err)
+	}
+	chain, err := BackingChain(ctx, flat)
+	if err != nil {
+		t.Fatalf("BackingChain() = %v", err)
+	}
+	if len(chain) != 1 {
+		t.Errorf("the fallback produced a %d-image chain, want 1 self-contained image", len(chain))
+	}
+}
+
+// When the convert fails for a reason O_DIRECT has nothing to do with, the
+// error has to say so — both attempts' output, or the retry hides the cause of
+// the first failure behind an identical second one.
+func TestFlattenReportsARealFailure(t *testing.T) {
+	requireTools(t)
+	dir := t.TempDir()
+	err := Flatten(context.Background(), filepath.Join(dir, "absent.qcow2"), filepath.Join(dir, "flat.qcow2"))
+	if err == nil {
+		t.Fatal("Flatten() on a missing source = nil, want an error")
+	}
+	if !strings.Contains(err.Error(), "absent.qcow2") {
+		t.Errorf("Flatten() = %v, want the error to name the source", err)
+	}
+}
+
+// There is no observable "the pages are clean now" to assert on — /proc
+// reports dirty pages for the machine, not for a filesystem, and a shared test
+// host is dirtying them throughout. What is worth pinning is that a drain
+// accepts a directory as readily as a file, since the caller hands it the layer
+// directory, and that it reports a path it cannot open rather than silently
+// doing nothing: a caller that logs and continues would otherwise never learn
+// the drain did not happen.
+func TestDrain(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "durable-dir.layer-0000.qcow2")
+	if err := os.WriteFile(path, make([]byte, 1<<20), 0o600); err != nil {
+		t.Fatalf("writing the probe image: %v", err)
+	}
+	for _, target := range []string{path, dir} {
+		if err := Drain(target); err != nil {
+			t.Errorf("Drain(%q) = %v, want nil", target, err)
+		}
+	}
+}
+
+func TestDrainReportsAMissingPath(t *testing.T) {
+	if err := Drain(filepath.Join(t.TempDir(), "absent.qcow2")); err == nil {
+		t.Error("Drain() on a missing path = nil, want an error")
 	}
 }
 

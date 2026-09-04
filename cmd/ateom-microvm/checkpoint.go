@@ -227,14 +227,6 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 		return nil, err
 	}
 
-	// Report exactly the files we wrote so atelet ships precisely this snapshot: for
-	// Full, the CH snapshot (config.json + state.json + memory-ranges + base-id) plus
-	// any durable-dir tar; for Data, that tar alone.
-	snapshotFiles, err := listFiles(checkpointDir)
-	if err != nil {
-		return nil, fmt.Errorf("while listing snapshot files: %w", err)
-	}
-
 	// Tear down: the actor returns to "available". Best-effort; the snapshot is
 	// already on disk for atelet to ship.
 	tTeardown := time.Now()
@@ -245,6 +237,29 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 			slog.Any("err", err))
 	}
 	dTeardown := time.Since(tTeardown)
+
+	// Collapse a chain that has reached the cap now, on the suspend side, so the
+	// restore that reads this snapshot does not have to. Before listFiles: the
+	// collapse is what decides how many layer files there are to report.
+	var dCollapse time.Duration
+	if durableDisk {
+		t := time.Now()
+		if m, err := collapseSealedQcow2(ctx, actorUID, checkpointDir, durableChain); err != nil {
+			slog.WarnContext(ctx, "Failed to collapse the sealed durable-dir chain; the restore will flatten it instead",
+				slog.String("id", actorUID), slog.Int("layers", len(durableChain.Layers)), slog.Any("err", err))
+		} else {
+			durableChain = m
+		}
+		dCollapse = time.Since(t)
+	}
+
+	// Report exactly the files we wrote so atelet ships precisely this snapshot: for
+	// Full, the CH snapshot (config.json + state.json + memory-ranges + base-id) plus
+	// any durable-dir tar; for Data, that tar alone.
+	snapshotFiles, err := listFiles(checkpointDir)
+	if err != nil {
+		return nil, fmt.Errorf("while listing snapshot files: %w", err)
+	}
 
 	s.actorLogger.EmitLifecycleLog(ctx, "Actor checkpointed", attribution)
 	attrs := []slog.Attr{
@@ -271,7 +286,11 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 		attrs = append(attrs,
 			slog.Int("durable_layers", len(durableChain.Layers)),
 			slog.Int64("durable_bytes", durableChain.TotalBytes()),
-			slog.Int64("durable_top_bytes", topLayerBytes(durableChain)))
+			slog.Int64("durable_top_bytes", topLayerBytes(durableChain)),
+			// Zero unless this suspend was the one that hit the cap. It is the
+			// cost the restore path no longer pays, so it belongs next to the
+			// layer count that triggered it.
+			slog.Duration("durable_collapse", dCollapse))
 	}
 	slog.LogAttrs(ctx, slog.LevelInfo, "Actor checkpointed", attrs...)
 	return &ateompb.CheckpointWorkloadResponse{SnapshotFiles: snapshotFiles}, nil

@@ -172,17 +172,40 @@ func TestManifestCarriesNoContentDigest(t *testing.T) {
 }
 
 // The layer names are what a directory listing and a checkpoint's file set are
-// read through, so they have to sort in chain order.
+// read through, so a chain that has only ever been stacked on has to sort in
+// chain order.
 func TestNextLayerNameSortsInChainOrder(t *testing.T) {
 	var names []string
 	for i := 0; i < 12; i++ {
-		names = append(names, NextLayerName("durable-dir.layer-", i))
+		names = append(names, NextLayerName("durable-dir.layer-", names))
 	}
 	if !slices.IsSorted(names) {
 		t.Errorf("NextLayerName() produced %v, which does not sort in chain order", names)
 	}
 	if got, want := names[0], "durable-dir.layer-0000.qcow2"; got != want {
-		t.Errorf("NextLayerName(_, 0) = %q, want %q", got, want)
+		t.Errorf("NextLayerName(_, nil) = %q, want %q", got, want)
+	}
+}
+
+// The case the numbering exists for: a flatten leaves the surviving layer under
+// its own name, so the chain that follows it is short but high-numbered. Naming
+// the next layer after the chain's LENGTH would reissue a name the surviving
+// layer's own header, and the manifest, still point at.
+func TestNextLayerNameDoesNotReuseAFlattenedChainsNumbers(t *testing.T) {
+	const prefix = "durable-dir.layer-"
+	flattened := []string{prefix + "0006.qcow2", prefix + "0007.qcow2"}
+	if got, want := NextLayerName(prefix, flattened), prefix+"0008.qcow2"; got != want {
+		t.Errorf("NextLayerName(_, %v) = %q, want %q", flattened, got, want)
+	}
+}
+
+// Order is the caller's, not the name's: landDurableQcow2 hands over whatever
+// the manifest listed, and a flatten can leave that list in any numeric shape.
+func TestNextLayerNameIgnoresOrderAndForeignNames(t *testing.T) {
+	const prefix = "durable-dir.layer-"
+	mixed := []string{prefix + "0009.qcow2", "durable-dir.chain.json", prefix + "0002.qcow2", ".flattened.qcow2"}
+	if got, want := NextLayerName(prefix, mixed), prefix+"0010.qcow2"; got != want {
+		t.Errorf("NextLayerName(_, %v) = %q, want %q", mixed, got, want)
 	}
 }
 

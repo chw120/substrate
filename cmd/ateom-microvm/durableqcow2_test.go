@@ -154,10 +154,8 @@ func TestInitDurableQcow2(t *testing.T) {
 	if err != nil {
 		t.Fatalf("durableQcow2Top() = %v", err)
 	}
-	want := []string{
-		qcow2.NextLayerName(ateompath.DurableDirLayerPrefix, 0),
-		qcow2.NextLayerName(ateompath.DurableDirLayerPrefix, 1),
-	}
+	first := qcow2.NextLayerName(ateompath.DurableDirLayerPrefix, nil)
+	want := []string{first, qcow2.NextLayerName(ateompath.DurableDirLayerPrefix, []string{first})}
 	if !slices.Equal(m.LayerFiles(), want) {
 		t.Errorf("chain layers = %v, want %v", m.LayerFiles(), want)
 	}
@@ -278,37 +276,165 @@ func TestLandDurableQcow2RefusesAHole(t *testing.T) {
 	}
 }
 
-// A chain that has reached the depth cap is flattened as it lands, so reads
-// stop walking an ever-growing stack of indirections. The result must still be
-// the same disk, and must still have a writable layer on top.
+// deepChain writes a chain of n layers plus its manifest into dir: the shape a
+// snapshot arrives in from an actor that has suspended n-1 times without ever
+// being flattened.
+func deepChain(t *testing.T, ctx context.Context, dir string, n int) {
+	t.Helper()
+	names := []string{qcow2.NextLayerName(ateompath.DurableDirLayerPrefix, nil)}
+	if err := qcow2.CreateBase(ctx, filepath.Join(dir, names[0]), qcow2.SizeBytes()); err != nil {
+		t.Fatalf("CreateBase() = %v", err)
+	}
+	for len(names) < n {
+		name := qcow2.NextLayerName(ateompath.DurableDirLayerPrefix, names)
+		if err := qcow2.CreateDelta(ctx, filepath.Join(dir, name), names[len(names)-1]); err != nil {
+			t.Fatalf("CreateDelta() = %v", err)
+		}
+		names = append(names, name)
+	}
+	m, err := qcow2.DescribeChain(ctx, filepath.Join(dir, names[len(names)-1]))
+	if err != nil {
+		t.Fatalf("DescribeChain() = %v", err)
+	}
+	if err := qcow2.WriteManifest(filepath.Join(dir, ateompath.DurableDirChainFile), m); err != nil {
+		t.Fatalf("WriteManifest() = %v", err)
+	}
+}
+
+// The collapse moved to the suspend side is only worth anything if the restore
+// that follows lands a shallow chain without flattening. A checkpoint sealed at
+// the cap must therefore arrive as one layer, and the restore must still be able
+// to read every byte of it.
+func TestCollapseSealedQcow2LeavesTheRestoreNothingToFlatten(t *testing.T) {
+	requireQemuImg(t)
+	smallDurableDisk(t)
+	t.Setenv(qcow2.MaxChainEnvVar, "3")
+	ctx := context.Background()
+	const uid = "actor-collapse"
+
+	checkpoint := t.TempDir()
+	deepChain(t, ctx, checkpoint, 3)
+	sealed, err := qcow2.ReadManifest(filepath.Join(checkpoint, ateompath.DurableDirChainFile))
+	if err != nil {
+		t.Fatalf("ReadManifest() = %v", err)
+	}
+
+	collapsed, err := collapseSealedQcow2(ctx, uid, checkpoint, sealed)
+	if err != nil {
+		t.Fatalf("collapseSealedQcow2() = %v", err)
+	}
+	if len(collapsed.Layers) != 1 {
+		t.Fatalf("collapseSealedQcow2() left %d layers, want 1", len(collapsed.Layers))
+	}
+	// The manifest on disk is what the restore trusts, so it has to agree with
+	// the directory: a layer it still names but the collapse removed would fail
+	// VerifyPresent and strand the actor.
+	onDisk, err := qcow2.ReadManifest(filepath.Join(checkpoint, ateompath.DurableDirChainFile))
+	if err != nil {
+		t.Fatalf("ReadManifest() after the collapse = %v", err)
+	}
+	if err := onDisk.VerifyPresent(checkpoint); err != nil {
+		t.Errorf("the rewritten manifest does not describe the checkpoint: %v", err)
+	}
+	if len(onDisk.Layers) != 1 {
+		t.Errorf("the manifest on disk names %d layers, want 1", len(onDisk.Layers))
+	}
+
+	if err := landDurableQcow2(ctx, uid, checkpoint); err != nil {
+		t.Fatalf("landDurableQcow2() = %v", err)
+	}
+	_, landed, err := durableQcow2Top(uid)
+	if err != nil {
+		t.Fatalf("durableQcow2Top() = %v", err)
+	}
+	if len(landed.Layers) != 2 {
+		t.Errorf("landed %d layers, want the collapsed base plus a fresh top", len(landed.Layers))
+	}
+}
+
+// Below the cap the collapse must not run: it is a convert of the actor's data,
+// and paying it on every suspend rather than every MaxChain-th would cost more
+// than the restore path it was moved off.
+func TestCollapseSealedQcow2LeavesAShallowChainAlone(t *testing.T) {
+	requireQemuImg(t)
+	smallDurableDisk(t)
+	t.Setenv(qcow2.MaxChainEnvVar, "8")
+	ctx := context.Background()
+
+	checkpoint := t.TempDir()
+	deepChain(t, ctx, checkpoint, 3)
+	sealed, err := qcow2.ReadManifest(filepath.Join(checkpoint, ateompath.DurableDirChainFile))
+	if err != nil {
+		t.Fatalf("ReadManifest() = %v", err)
+	}
+	collapsed, err := collapseSealedQcow2(ctx, "actor-shallow", checkpoint, sealed)
+	if err != nil {
+		t.Fatalf("collapseSealedQcow2() = %v", err)
+	}
+	if len(collapsed.Layers) != 3 {
+		t.Errorf("collapseSealedQcow2() collapsed a chain of 3 under a cap of 8, leaving %d layers", len(collapsed.Layers))
+	}
+}
+
+// The checkpoint's layers are hardlinks to the live actor's, so a collapse that
+// wrote through an inode instead of replacing a name would reach back into the
+// actor that is still running on that chain.
+func TestCollapseSealedQcow2DoesNotTouchTheLiveChain(t *testing.T) {
+	requireQemuImg(t)
+	smallDurableDisk(t)
+	t.Setenv(qcow2.MaxChainEnvVar, "2")
+	ctx := context.Background()
+	const uid = "actor-live"
+
+	if err := initDurableQcow2(ctx, uid); err != nil {
+		t.Fatalf("initDurableQcow2() = %v", err)
+	}
+	checkpoint := t.TempDir()
+	sealed, err := sealDurableQcow2(ctx, uid, checkpoint)
+	if err != nil {
+		t.Fatalf("sealDurableQcow2() = %v", err)
+	}
+	if _, err := collapseSealedQcow2(ctx, uid, checkpoint, sealed); err != nil {
+		t.Fatalf("collapseSealedQcow2() = %v", err)
+	}
+
+	_, live, err := durableQcow2Top(uid)
+	if err != nil {
+		t.Fatalf("durableQcow2Top() = %v", err)
+	}
+	if len(live.Layers) != len(sealed.Layers) {
+		t.Errorf("the live chain has %d layers after the collapse, want the %d it had", len(live.Layers), len(sealed.Layers))
+	}
+	if err := live.VerifyPresent(durableQcow2Dir(uid)); err != nil {
+		t.Errorf("the collapse removed a layer the live actor is running on: %v", err)
+	}
+}
+
+// A chain that arrives at the depth cap is collapsed before it is stacked on,
+// so the chain handed to cloud-hypervisor never gets deeper than MaxChain.
+// The suspend side normally collapses first; this is the fallback for the
+// snapshots that arrive deep anyway.
 func TestLandDurableQcow2FlattensADeepChain(t *testing.T) {
 	requireQemuImg(t)
 	smallDurableDisk(t)
 	t.Setenv(qcow2.MaxChainEnvVar, "3")
 	ctx := context.Background()
+	const uid = "actor-flatten"
 
-	// Build up a chain by sealing and landing repeatedly, as suspend/resume
-	// cycles do, until it is deep enough to trip the cap.
-	const uid = "actor-deep"
-	if err := initDurableQcow2(ctx, uid); err != nil {
-		t.Fatalf("initDurableQcow2() = %v", err)
+	checkpoint := t.TempDir()
+	deepChain(t, ctx, checkpoint, 3)
+	if err := landDurableQcow2(ctx, uid, checkpoint); err != nil {
+		t.Fatalf("landDurableQcow2() = %v", err)
 	}
-	var landed qcow2.Manifest
-	for i := 0; i < 3; i++ {
-		checkpoint := t.TempDir()
-		if _, err := sealDurableQcow2(ctx, uid, checkpoint); err != nil {
-			t.Fatalf("sealDurableQcow2() = %v", err)
-		}
-		if err := landDurableQcow2(ctx, uid, checkpoint); err != nil {
-			t.Fatalf("landDurableQcow2() = %v", err)
-		}
-		var err error
-		if _, landed, err = durableQcow2Top(uid); err != nil {
-			t.Fatalf("durableQcow2Top() = %v", err)
-		}
+	_, m, err := durableQcow2Top(uid)
+	if err != nil {
+		t.Fatalf("durableQcow2Top() = %v", err)
 	}
-	if len(landed.Layers) > 3 {
-		t.Errorf("chain reached %d layers with a cap of 3; it is not being flattened", len(landed.Layers))
+	if len(m.Layers) != 2 {
+		t.Fatalf("landDurableQcow2() left %d layers, want the flattened base plus the writable top", len(m.Layers))
+	}
+	if err := m.VerifyPresent(durableQcow2Dir(uid)); err != nil {
+		t.Errorf("the manifest does not describe what is on disk: %v", err)
 	}
 	top, _, err := durableQcow2Top(uid)
 	if err != nil {
@@ -316,6 +442,83 @@ func TestLandDurableQcow2FlattensADeepChain(t *testing.T) {
 	}
 	if err := qcow2.Check(ctx, top); err != nil {
 		t.Errorf("Check() after flattening = %v", err)
+	}
+}
+
+// The depth cap is what keeps the chain inside cloud-hypervisor's nesting
+// limit, so a node configured past that limit must still land a chain CH will
+// open. Getting this wrong does not cost one slow restore: a boot that fails
+// lands no layer and collapses none, so the actor never starts again.
+func TestLandDurableQcow2StaysInsideTheNestingLimit(t *testing.T) {
+	requireQemuImg(t)
+	smallDurableDisk(t)
+	t.Setenv(qcow2.MaxChainEnvVar, "999")
+	ctx := context.Background()
+	const uid = "actor-nesting"
+
+	checkpoint := t.TempDir()
+	deepChain(t, ctx, checkpoint, qcow2.MaxChain())
+	if err := landDurableQcow2(ctx, uid, checkpoint); err != nil {
+		t.Fatalf("landDurableQcow2() = %v", err)
+	}
+	_, m, err := durableQcow2Top(uid)
+	if err != nil {
+		t.Fatalf("durableQcow2Top() = %v", err)
+	}
+	if len(m.Layers) > qcow2.MaxChain() {
+		t.Errorf("landDurableQcow2() handed cloud-hypervisor %d layers, want no more than %d",
+			len(m.Layers), qcow2.MaxChain())
+	}
+}
+
+// The flatten collapses into the name of the layer it collapsed UP TO, not a
+// fresh one and not the base's. Anything stacked on the chain records that name
+// in its own header, and cloud-hypervisor is writing to it, so reusing the name
+// is what lets the whole thing happen without a second writer on that header.
+func TestFlattenDurableQcow2KeepsTheNameTheTopBacksOnto(t *testing.T) {
+	requireQemuImg(t)
+	smallDurableDisk(t)
+	ctx := context.Background()
+	const uid = "actor-flatten-name"
+
+	dir := durableQcow2Dir(uid)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	deepChain(t, ctx, dir, 3)
+	m, err := qcow2.ReadManifest(filepath.Join(dir, ateompath.DurableDirChainFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	layers := m.LayerFiles()
+
+	base, err := flattenDurableQcow2(ctx, uid, layers)
+	if err != nil {
+		t.Fatalf("flattenDurableQcow2() = %v", err)
+	}
+	if want := layers[len(layers)-1]; base != want {
+		t.Errorf("flattenDurableQcow2() = %q, want the chain's own top layer %q", base, want)
+	}
+	chain, err := qcow2.BackingChain(ctx, filepath.Join(dir, base))
+	if err != nil {
+		t.Fatalf("BackingChain() = %v", err)
+	}
+	if len(chain) != 1 {
+		t.Errorf("the flattened layer still backs onto %d others, want it self-contained", len(chain)-1)
+	}
+	for _, name := range layers[:len(layers)-1] {
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Errorf("flattenDurableQcow2() left the collapsed layer %q behind", name)
+		}
+	}
+}
+
+// A chain with nothing in it is a caller bug, and flattening it would produce
+// an empty directory that still looked like a chain.
+func TestFlattenDurableQcow2RejectsAnEmptyChain(t *testing.T) {
+	smallDurableDisk(t)
+	if _, err := flattenDurableQcow2(context.Background(), "actor-empty", nil); err == nil {
+		t.Error("flattenDurableQcow2() on an empty chain = nil, want an error")
 	}
 }
 

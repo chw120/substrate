@@ -41,6 +41,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 )
 
 // Manifest describes one actor's backing chain. It is written beside the
@@ -112,13 +114,24 @@ func ReadManifest(path string) (Manifest, error) {
 }
 
 // WriteManifest writes m to path.
+//
+// Through a temporary file and a rename, so what is at path is always a whole
+// manifest. This is the file that says which layer is the top, and an in-place
+// rewrite interrupted by a crash or a container kill leaves a truncated one
+// that the next restore rejects as unparseable — with the layers themselves
+// intact on disk and no record of how they stack.
 func WriteManifest(path string, m Manifest) error {
 	b, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, b, 0o600); err != nil {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		return fmt.Errorf("writing durable-dir chain manifest %q: %w", path, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("installing durable-dir chain manifest %q: %w", path, err)
 	}
 	return nil
 }
@@ -199,11 +212,46 @@ func (m Manifest) LayerFiles() []string {
 	return out
 }
 
-// NextLayerName returns the filename for the layer that goes on top of a chain
-// of n layers. Sequence-numbered rather than content-addressed so that the
-// order is legible in a directory listing and in a checkpoint's file set —
-// which matters because an operator looking at either is usually asking "how
-// deep has this got".
-func NextLayerName(prefix string, n int) string {
-	return fmt.Sprintf("%s%04d.qcow2", prefix, n)
+// NextLayerName returns the filename for the layer that goes on top of the
+// chain made of existing, given by bare filename in any order. Sequence-
+// numbered rather than content-addressed so that the order is legible in a
+// directory listing and in a checkpoint's file set — which matters because an
+// operator looking at either is usually asking "how deep has this got".
+//
+// One past the highest number in use, rather than the number of layers. The two
+// agree until a flatten runs, and a flatten collapses layers WITHOUT renaming
+// the one that survives — it has to, since the layer above records its backing
+// file by name and is open in a running guest. Numbering by count after that
+// would hand a new layer the name of one a live header still points at.
+//
+// Numbers therefore climb for the life of an actor rather than tracking its
+// depth, and past 9999 the names grow a digit and stop sorting with their
+// predecessors. Nothing reads chain order out of the names — the headers carry
+// it — so that costs legibility in a directory listing, not correctness.
+func NextLayerName(prefix string, existing []string) string {
+	next := 0
+	for _, name := range existing {
+		if n, ok := layerNumber(prefix, name); ok && n >= next {
+			next = n + 1
+		}
+	}
+	return fmt.Sprintf("%s%04d.qcow2", prefix, next)
+}
+
+// layerNumber pulls the sequence number back out of a layer filename, and
+// reports whether the name was one of this package's at all.
+func layerNumber(prefix, name string) (int, bool) {
+	s, ok := strings.CutPrefix(name, prefix)
+	if !ok {
+		return 0, false
+	}
+	s, ok = strings.CutSuffix(s, ".qcow2")
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
 }
