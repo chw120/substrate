@@ -17,6 +17,17 @@ To repeat this measurement, read [REPRODUCING.md](REPRODUCING.md), then the
 [Separating the two arms](#separating-the-two-arms) section below, which is
 specific to this comparison.
 
+> [!IMPORTANT]
+> **Read [the drain section](#it-is-the-restore-paths-dirty-pages-and-the-fix-is-a-background-drain)
+> before any qcow2 suspend number below.** Every one of them includes a
+> `guest_flush` that turned out to be the restore path's own dirty page cache,
+> collected at the guest's `fsync` by ext4's `data=ordered` journal, and a
+> background `syncfs` after landing removes it: 1 233 → 35 ms on the flush,
+> 1 300 ms off the cycle. The partial-update comparison is
+> [re-run against tar with it in](#against-tar-with-the-drain-in), and it changes
+> who wins — 128 MiB partial goes from tar by 1.24× to a tie, 512 MiB partial
+> from qcow2 by 1.09× to 1.30×.
+
 ## Environment
 
 | | |
@@ -154,6 +165,20 @@ Durations are the overrides used, not the durations committed in `tests.yaml`.
 See [Caveats](#caveats). The `MAX_CHAIN=8` sweep is indexed in [its own
 section](#at-the-default-max_chain8).
 
+The partial-update pairs ran on 2026-09-03 as their own session, `MAX_CHAIN=8`
+in the qcow2 arm, with a golden rebuild between the arms:
+
+| Scenario | qcow2 UTC start | tar UTC start | Duration |
+|---|---|---|---|
+| `durdir_size_128mb_microvm` | 03:43:29Z | 04:17:59Z | 6m |
+| `durdir_partial_128mb_microvm` | 03:50:00Z | 04:24:30Z | 6m |
+| `durdir_size_500mb_microvm` | 03:56:30Z | 04:31:01Z | 10m |
+| `durdir_partial_512mb_microvm` | 04:07:14Z | 04:41:34Z | 10m |
+
+The flush breakdown, the `Direct` A/B and the chain-depth sweep all ran against
+`durdir_partial_128mb_microvm` for 3m per arm, on 2026-09-03 at 07:39Z, 08:27Z
+and 16:34Z respectively.
+
 The 128 and 256 MiB steps ran ~1.5 h after the rest, as their own pair of arms
 with their own golden rebuilds, and with the router's route timeout already
 raised to 5m. Neither size writes for anywhere near 10 s, so the raised timeout
@@ -180,6 +205,15 @@ at every size. What the arrangement buys below the crossover is not a
 faster suspend but a shorter *stall* — 5.7 ms versus 310 ms of frozen guest at
 64 MiB — which matters for a workload holding a connection open, and does not
 show up in `SuspendActor` at all.
+
+**On a full rewrite the arrangement never wins the end-to-end cycle; on a
+partial update it does.** Everything in this section and the three that follow
+it rewrites the durable dir completely every cycle, which is the worst case for
+shipping a delta. [A partial-update
+workload](#a-partial-update-workload) holds the volume fixed and rewrites an
+eighth of it, halves the qcow2 cycle, leaves tar's unchanged, and takes the
+512 MiB cell outright. Read the full-rewrite results as a floor, not as the
+arrangement's verdict.
 
 **Everything on the read path is faster under qcow2, by 15–25%.** At 500 MiB,
 `ServeWarm` 2 100 → 1 600 ms, `Overwrite` 4 600 → 3 300 ms,
@@ -248,6 +282,12 @@ measured in [The cost of `-c`](#the-cost-of--c) below; move the flatten off the
 restore path to a background job, which needs an answer for a suspend that
 arrives mid-flatten; or flatten at seal instead and give back part of the
 constant-time pause the arrangement exists to provide.
+
+> **The background job was built and reverted.** It does not survive contact
+> with an actor whose activation is shorter than its own flatten, and the way
+> it fails is to grow the chain past what cloud-hypervisor will open. See
+> [The background flatten hits cloud-hypervisor's nesting
+> limit](#the-background-flatten-hits-cloud-hypervisors-nesting-limit).
 
 ## The crossover, and where the flatten cost actually comes from
 
@@ -683,8 +723,619 @@ the noise.** The 5 MiB and 500 MiB cells, where `guest_flush` happened to be
 small in every arm, are the only suspend numbers this report should be read as
 comparing.
 
+## A partial-update workload
+
+Every arm above rewrites the durable dir end to end every cycle, which the
+[`MAX_CHAIN=8` section](#why-suspend-regresses-the-chain-is-the-upload) already
+names as the worst case for a backing-file chain: successive layers share no
+clusters, so depth is pure cost and a delta is the whole volume. That was
+follow-up 1. `durdir_partial_128mb_microvm` and `durdir_partial_512mb_microvm`
+hold the directory at the same total size and rewrite an eighth of it — 8 files,
+one rewritten per cycle — which is closer to an agent editing a few files in a
+workspace it otherwise leaves alone.
+
+Ran 2026-09-03 03:43Z to 04:52Z, both arrangements, on the same cluster and node,
+each with its own golden rebuild. Each partial scenario is paired with the
+equally-sized full-rewrite step in the same session, so the only thing that
+differs inside a pair is the per-cycle delta. `MAX_CHAIN=8` throughout — this
+section is about the delta, not about depth. Zero failures in all eight runs.
+
+### The cycle the caller pays
+
+`ResumeActor` + `SuspendActor` p50, milliseconds:
+
+| Volume | Delta | tar | qcow2 | Winner |
+|---|---|---|---|---|
+| 128 MiB | full (128 MiB) | **4 000** | 10 100 | tar, 2.5× |
+| 128 MiB | partial (16 MiB) | **4 100** | 5 100 | tar, 1.24× |
+| ~500 MiB | full (500 MiB) | **9 100** | 22 000 | tar, 2.4× |
+| ~512 MiB | partial (64 MiB) | 11 800 | **10 800** | **qcow2, 1.09×** |
+
+> [!NOTE]
+> Both partial rows were re-measured after the
+> [background drain](#against-tar-with-the-drain-in) and both moved: 128 MiB to
+> a tie and 512 MiB to qcow2 by 1.30×. The two full-rewrite rows were not
+> re-run, and the drain does not change what they say — a full delta gives the
+> chain nothing to be sparse about.
+
+**Going partial halves the qcow2 cycle and does nothing for tar.** 10 100 →
+5 100 and 22 000 → 10 800 on one side; 4 000 → 4 100 and 9 100 → 11 800 on the
+other. That asymmetry is the whole design argument, and it is the first thing in
+this report to show up as an end-to-end win: at 512 MiB with a one-eighth delta,
+qcow2 takes the cycle.
+
+tar getting *slower* on the 512 MiB partial than on the 500 MiB full step is not
+noise — it packs the same bytes either way, but into 8 files rather than 1, and
+pays per-file overhead for the privilege. It cannot benefit from a delta because
+it does not ship one.
+
+### Where the halving comes from
+
+ateom side, p50 in milliseconds. `top` is `durable_top_bytes`, the layer the
+seal produces; `chain` is `durable_bytes`, what gets uploaded.
+
+| Volume | Delta | Arm | n | guest_flush | **seal** | teardown | top MB | chain MB |
+|---|---|---|---|---|---|---|---|---|
+| 128 MiB | full | tar | 42 | 0 | 761.7 | 89.7 | — | — |
+| 128 MiB | full | qcow2 | 26 | 4 332.5 | **8.4** | 90.3 | 135.6 | 812.1 |
+| 128 MiB | partial | tar | 64 | 0 | 754.6 | 68.8 | — | — |
+| 128 MiB | partial | qcow2 | 54 | 1 246.7 | **8.1** | 71.0 | **18.0** | 235.0 |
+| ~500 MiB | full | tar | 25 | 0 | 3 270.2 | 159.5 | — | — |
+| ~500 MiB | full | qcow2 | 19 | 3 584.7 | **7.9** | 169.2 | 526.0 | 2 638.6 |
+| ~512 MiB | partial | tar | 41 | 0 | 5 113.8 | 120.1 | — | — |
+| ~512 MiB | partial | qcow2 | 41 | 4 210.3 | **8.3** | 93.5 | **68.5** | 824.0 |
+
+Two readings:
+
+**The delta is real and it is the whole saving.** `durable_top_bytes` goes
+135.6 MB → 18.0 MB and 526.0 MB → 68.5 MB, both close to the nominal eighth. The
+chain follows, 812 → 235 MB and 2 639 → 824 MB, and the chain is the upload. tar
+has no equivalent column because it has no equivalent behavior: its
+`durable_dir` is 761.7 ms for the full 128 MiB and 754.6 ms for the partial one,
+identical to within 1%.
+
+**The seal is untouched by any of it** — 7.9 to 8.4 ms across full, partial,
+128 MiB and 500 MiB. Proposal 5's constant-time claim survives its fourth
+independent test.
+
+### The read path, again
+
+p50 in milliseconds. Consistent with the size sweep: qcow2 is faster on every
+read, by 12–19%.
+
+| Volume | Op | tar | qcow2 |
+|---|---|---|---|
+| 128 MiB partial | `ServeWarm` | 74 | **60** |
+| 128 MiB partial | `ServeAfterResume` | 180 | **160** |
+| 512 MiB partial | `ServeWarm` | 270 | **220** |
+| 512 MiB partial | `ServeAfterResume` | 700 | **590** |
+
+## Where `guest_flush`'s time goes
+
+`guest_flush` is the pre-pause `sync(2)`, and by this point it is the largest
+term the qcow2 arrangement adds. On the 128 MiB partial workload it is 1 246.7 ms
+to get 18.0 MB of delta onto a disk that the flatten drives at 165 MiB/s. That
+is ~14 MB/s, and the gap wants an explanation.
+
+Six candidates were tested, each on that same 128 MiB partial scenario so the
+numbers compare directly. Five are ruled out.
+
+| Candidate | Verdict | Evidence |
+|---|---|---|
+| Small (4 KiB) requests / an IOPS ceiling | **ruled out** | 239.6 KiB average write during the flush window, 746 IOPS |
+| The `ExecProcess` round-trip into the guest | **ruled out** | a no-op helper: 30.0 ms |
+| `sync(2)` flushing the other filesystems too | **ruled out** | `syncfs(2)` on the durable mount alone: 32.1 ms, but teardown 66 → 1 154 ms |
+| The host page cache | **ruled out** | `Direct: true` on the disk: 1 238.4 vs 1 221.0 ms |
+| The qcow2 format itself | **ruled out** | host-side `qemu-img` flattens the same files at 165 MiB/s |
+| Backing-chain depth | **partial, ~31%** | 927.4 / 1 033.1 / 1 337.0 ms at 2 / 3 / 5 layers |
+
+### Instrumentation
+
+A scratch build split `guest_flush` into the host-side staging write and the
+guest round-trip, and made the helper's program selectable, so one image could
+serve every arm. Staging is 0.2 ms in every arm; the entire cost is inside the
+guest call.
+
+| Helper | `exec` p50 | `durable_top_bytes` |
+|---|---|---|
+| `sync(2)` (what ateom ships) | 1 227.7 | 18.0 MB |
+| `syncfs(2)` on the durable mount | 31.8 | 18.0 MB |
+| `exit(0)` | 29.7 | **0.5 MB** |
+
+> [!WARNING]
+> **The no-op arm loses data and is not a configuration.** Its
+> `durable_top_bytes` is 0.5 MB against the other arms' 18.0 MB: it seals
+> whatever happened to reach the disk on its own. It is a yardstick for what the
+> round-trip costs and nothing else.
+
+### `syncfs` does not help; it relocates
+
+`syncfs(2)` on the durable mount alone brings the flush to 32.1 ms and seals the
+same 18.0 MB — so it is not losing writes. But `teardown` goes 66.1 → 1 154.0 ms,
+and `teardown` is the cloud-hypervisor VMM shutdown. The bytes `sync(2)` was
+waiting for are still written; they are just written while the VMM is being torn
+down instead of before the pause. Total cycle cost is unchanged.
+
+This is worth knowing even though it is not a win: it says the cost is the
+*writeback itself*, not the choice of syscall, and it means a flush that "got
+faster" needs its teardown checked before it is believed.
+
+### It is the restore path's dirty pages, and the fix is a background drain
+
+The flush is not slow. It is waiting for bytes it did not write.
+
+Sampling `/proc/meminfo` and `/proc/diskstats` on the node every 200 ms through
+a run, and lining the samples up against ateom's own log, gives the whole cycle:
+
+```
+restore                    dirty page cache 0 -> 272 MB in ~600 ms
+                           (memcpy speed: nothing has reached the device yet)
+flatten                    device saturated at 176 MB/s, ~90 MB drains
+flatten returns            174 MB still dirty
+guest boots, serves        174 MB still dirty. Device idle for 2.4 s.
+                           Nothing writes it back: dirty_expire is 30 s and
+                           the background threshold is 10% of 16 GB.
+guest_flush                174 MB drains at 176 MB/s   <-- 1 000-1 500 ms
+```
+
+The link between the two ends is ext4's journal, not the image. The guest's
+`sync(2)` becomes a virtio-blk flush, cloud-hypervisor turns that into an
+`fsync` of the durable image, and ext4 in its default `data=ordered` mode
+cannot commit that transaction until every inode's ordered data is on the
+device. So an 18 MB flush waits on 174 MB belonging to files it has never
+touched.
+
+That the coupling is journal-wide and not per-file is measurable, and it is what
+makes the cheap fix not work: `sync_file_range(WRITE|WAIT_AFTER)` on the freshly
+flattened base returns in 11-49 ms with the 174 MB still dirty, and the flush is
+unchanged. The base is already clean when the flatten returns —  `qemu-img
+convert` runs at device speed and is dirty-throttled the whole way. The dirty
+pages are the rest of the restore's: ateom writes ~185 MB per cycle by its own
+`/proc/<pid>/io` accounting, on a path that cold-boots the guest every time.
+The flatten is not the main producer either — at `MAX_CHAIN=8`, where only 6 of
+51 restores flatten at all, the flush still costs 1 233 ms.
+
+This also explains the `Direct: true` result above. Putting the durable disk on
+direct I/O takes the *image* out of the page cache, which is not where the dirty
+pages were.
+
+Draining the filesystem — `syncfs(2)` on the layer directory, at the end of
+landing, before the guest runs — removes it completely. Three arms on the
+128 MiB partial workload, `MAX_CHAIN=8`, 6m each, arms run hypothesis-first
+because the second arm of a pair measures 90-290 ms slower on `guest_flush`
+whichever arm it is:
+
+| | none | `syncfs`, waited for | `syncfs`, backgrounded |
+|---|---|---|---|
+| `guest_flush` p50 | 1 233.1 / 1 510.3 | **35.3** | **38.8** |
+| suspend total, server | 1 317.0 / 1 592.0 | 115.7 | 120.7 |
+| `SuspendActor` p50 | 3 200 / 3 600 | 2 000 | 1 900 |
+| `ResumeActor` p50 | 2 000 / 2 200 | 3 300 | 2 600 |
+| cycle (R+S) | 5 200 / 5 800 | 5 300 | **4 500** |
+| iterations completed | 52 / 48 | 51 | **57** |
+
+(Two figures for the no-drain arm because it was run as the control for both.)
+
+Waiting for the drain is a straight trade and the wrong way round: 1 200 ms off
+suspend, 1 300 ms onto resume, which is the latency an actor's caller sits
+through. Backgrounding it is free, because the 2.4 s the guest spends cold
+booting is 2.4 s in which it asks the device for nothing — the drain fits inside
+a window that was already idle. `Drained the durable-dir filesystem` reports a
+p50 of 1 302 ms against a `ResumeActor` cost of 400 ms, so most of it lands in
+that gap.
+
+The cycle improves by 1 300 ms, which is outside the ±600 ms band established
+below, and the arm ordering works against the result rather than for it.
+
+> [!NOTE]
+> None of this is specific to qcow2. Any arrangement whose restore path writes
+> a hundred megabytes and whose guest then calls `sync(2)` pays the same bill.
+> The tar arrangement never sees it only because virtio-fs is write-through and
+> it has no pre-suspend flush at all — the same bytes are still written, just by
+> the kernel's own writeback, off any measured path.
+
+### Against tar, with the drain in
+
+The partial-update comparison above was run before any of this, and its qcow2
+arm was paying the flush. Re-run against tar in one session on one node,
+2026-09-04 03:29Z to 03:57Z, `MAX_CHAIN=8`, 6m an arm, qcow2 first in each pair
+so the drift works against it. p50 in milliseconds:
+
+| | tar 128 | qcow2 128 | tar 512 | qcow2 512 |
+|---|---|---|---|---|
+| `durable_dir` (the seal) | 753.4 | **7.9** | 7 058.7 | **8.2** |
+| `guest_flush` | 0.0 | 37.5 | 0.0 | 76.6 |
+| suspend total, server | 816.1 | **116.3** | 7 155.8 | **175.4** |
+| `SuspendActor` | 2 400 | **1 900** | 9 900 | **4 000** |
+| `ResumeActor` | **1 700** | 2 400 | **3 200** | 6 100 |
+| **cycle (R+S)** | **4 100** | 4 300 | 13 100 | **10 100** |
+
+**128 MiB partial goes from tar by 1.24× to a tie** — 200 ms apart, inside the
+band — and qcow2 now takes the suspend half of it outright, 1 900 against
+2 400. **512 MiB partial goes from qcow2 by 1.09× to qcow2 by 1.30×**, 3 000 ms
+of cycle.
+
+The shape of the trade is unchanged and is now clean enough to state: qcow2
+moves work off suspend and onto resume. At 512 MiB it moves 5 900 ms of suspend
+for 2 900 ms of resume, and wins. At 128 MiB there is only 753 ms of tar seal to
+move, which does not cover what resume costs, and it draws. Where the resume
+goes, p50 in milliseconds:
+
+| | tar 128 | qcow2 128 | tar 512 | qcow2 512 |
+|---|---|---|---|---|
+| restore total | 1 035.7 | 1 614.2 | 1 372.3 | 3 160.3 |
+| `containers` (the guest mounting it) | 65.9 | 280.3 | 67.7 | 1 232.7 |
+| `agent_dial` | 619.3 | 736.7 | 627.5 | 742.7 |
+| flatten, when it fires | — | 1 010.5 (8/60) | — | 9 104.4 (3/26) |
+| drain, in the background | — | 1 215.9 | — | 4 659.3 |
+
+Three terms, in order of size: the amortized flatten (~135 ms a cycle at
+128 MiB, ~1 050 at 512 MiB), the guest mounting an ext4 chain rather than a
+virtio-fs share (`containers`, 4× and 18×), and the background drain competing
+for bandwidth. Only the first has a known fix — follow-up 2 — and at 512 MiB it
+is most of the gap.
+
+### Multiqueue could not be tested
+
+The disk's queue count follows the guest's vCPU count
+([`run.go`](../../cmd/ateom-microvm/run.go), `NumQueues: int32(vcpus)`), and
+`default_vcpus = 1` in the kata config, so the durable disk has a single
+virtio-blk queue and cloud-hypervisor runs a single host thread for it. Raising
+it fails at every value tried — 2, 4 and 8 alike:
+
+```
+Failed to validate config
+Queue count (4) must not exceed boot vCPUs (1)
+```
+
+That is a cloud-hypervisor invariant, not a resource limit: `VmConfig::validate`
+rejects any device whose queue count exceeds `boot_vcpus`. So **the single queue
+is not independently adjustable** — testing multiqueue means giving the guest
+more vCPUs, which changes the workload's compute as well and needs its own
+design. The serialization hypothesis is untested, not refuted.
+
+> [!NOTE]
+> The failure surfaces on `vm.add-net`, which is misleading: the disk's queue
+> count is what violates the rule, but cloud-hypervisor re-validates the whole
+> config on every mutating API call and `vm.add-net` is simply the next one.
+> Reading it at all required a fix — `AddNetWithFDs` and `RestoreWithNetFDs`
+> logged the status line and dropped the response body, so every rejection read
+> as `HTTP/1.1 500 Internal Server Error` regardless of cause.
+
+## Chain depth has an optimum, and it is not 1 or 8
+
+Both `MAX_CHAIN` values used above are extremes: 1 flattens on every restore, 8
+is the shipped default. On the 128 MiB partial workload, with the same image and
+three fresh goldens, 2026-09-03 16:34Z to 16:45Z, 3m each:
+
+| `MAX_CHAIN` | n | guest_flush | seal | teardown | Flattens | Flatten p50 | Amortized | **Per cycle** |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 10 | 927.4 | 7.0 | 68.5 | 10/10 | 926.2 | 926.2 | **1 932.2** |
+| 4 | 26 | 1 033.1 | 7.2 | 66.7 | 8/26 | 1 026.1 | 315.7 | **1 425.8** |
+| 8 | 25 | 1 337.0 | 8.4 | 66.4 | 3/25 | 1 358.0 | 163.0 | **1 577.9** |
+
+"Per cycle" is the suspend phases plus the flatten amortized over the cycles
+between flattens. **Depth 4 is the optimum**, and the throughput agrees
+independently: 26 checkpoints in three minutes against 10 and 25.
+
+The shape is a genuine trade-off rather than a tuning accident. Depth costs
+~137 ms of `guest_flush` per extra layer, because the guest writes through a
+deeper backing chain; shallowness costs a flatten on a larger fraction of
+restores. `MAX_CHAIN=1` pays a 926 ms flatten on **100%** of restores, which is
+why it is the worst of the three despite having the cheapest flush.
+
+The flatten rate is 161–166 MiB/s at every depth, so the flatten itself is
+linear in the chain and holds no surprises; only how often it fires changes.
+
+> [!NOTE]
+> cloud-hypervisor refuses to open a backing chain nested deeper than 11, so the
+> knob has a hard ceiling well below where this curve would flatten out anyway.
+
+> [!IMPORTANT]
+> **Superseded — this optimum is an artifact of the per-layer flush cost, which
+> the background drain removed.** Half of the trade-off above is the ~137 ms of
+> `guest_flush` an extra layer costs, and with the drain in place `guest_flush`
+> measures 35.1 ms at 2 layers and 38.8 ms at 5. With that side of the trade
+> gone, only the flatten's frequency remains, and it falls monotonically with
+> depth. The re-run confirms it: 4 is now the *worst* setting measured, and 8 and
+> 11 tie. See [The chain depth sweep](#the-chain-depth-sweep).
+
+## Write amplification
+
+Node write counters sampled across a full run of the 128 MiB partial workload,
+both arrangements, against the 16 MiB the workload actually writes per cycle:
+
+| Arm | Cycles | Total written | Per cycle | Amplification | Avg request |
+|---|---|---|---|---|---|
+| tar | 32 | 4 935 MiB | 154 MiB | **10×** | 185.0 KiB |
+| qcow2 | 27 | 7 248 MiB | 268 MiB | **17×** | 182.4 KiB |
+
+Both arrangements amplify heavily and qcow2 amplifies 1.7× more. The request
+sizes are indistinguishable, which is what rules out the small-I/O explanation
+for the flush: whatever qcow2 costs, it does not cost it in badly-shaped writes.
+
+> **Most of this is the stager, not either arrangement.** atelet byte-copies
+> every file a local checkpoint names into the restore directory before ateom
+> runs, which is one extra write of the whole durable data set per restore —
+> the whole chain for qcow2, the tarball for tar. See [The dirty pages the drain
+> waits for are atelet's, not
+> ateom's](#the-dirty-pages-the-drain-waits-for-are-atelets-not-ateoms).
+
+## The background flatten hits cloud-hypervisor's nesting limit
+
+The flatten is the one operation left on the restore path that scales with the
+actor's data, so the obvious move is [follow-up 2](#follow-ups): run it in the
+background while the guest is up, with a synchronous backstop at twice
+`MAX_CHAIN` for an actor that never gives it a window. Built, measured, and
+reverted. What follows is why, because the failure is a property of the idea and
+not of the implementation.
+
+### It never finishes at 512 MiB, and finishing is not optional
+
+| Arm | Flattens started | Completed | Abandoned at seal |
+|---|---|---|---|
+| qcow2 128 MiB | 7 | **7** | 0 |
+| qcow2 512 MiB | 40 | **0** | **40** |
+
+A 512 MiB durable dir takes 9.1 s to flatten. The actor's activation in this
+workload is shorter than that, so every flatten was cancelled by the suspend
+that ended the activation, and the chain grew by a layer on every cycle instead
+of collapsing every eighth. Its depth walked 3, 4, 5 … and stopped at 12:
+
+```
+depth  3  4  5  6  7  8  9 10 11 12
+lands  1  1  1  1  1  1  1  1  1 38
+```
+
+Eleven layers boots. Twelve fails `vm.boot` with
+
+```
+Cannot open disk path (path=.../durable-dir.layer-0011.qcow2)
+Backing file open error: .../layer-0010.qcow2
+  ... one per layer, down to layer-0001
+"Maximum disk nesting depth exceeded"
+```
+
+which is cloud-hypervisor's cap of a top layer plus ten backing files. **38 of
+that arm's 47 restores failed** — `ResumeActor` reported 29 failures out of 38
+requests, 76.32%.
+
+The cap is absorbing, which is what makes this a correctness bug rather than a
+slow path. A boot that fails lands no new layer and collapses none, so the chain
+that was one too deep is exactly as deep on the next attempt, and every
+activation from then on fails the same way. The actor is dead until something
+outside it rewrites the chain. The backstop did not help: at twice the shipped
+`MAX_CHAIN` of 8 it sits at 16, five layers past what the hypervisor will open.
+
+`MaxChain()` now clamps to eleven, so no configuration can ask for a chain CH
+cannot follow, and the flatten is back on the restore path.
+
+### It is not free at 128 MiB either
+
+Where the background flatten *does* complete, it completes a cycle late, and the
+chain is one layer deeper for the whole of that cycle:
+
+| qcow2 128 MiB | Depth sawtooth | Chain bytes p50 | `ResumeActor` p50 |
+|---|---|---|---|
+| Flatten on the restore path | 2–8 | 233 MB | 2 400 ms |
+| Flatten in the background | 3–9 | 300 MB | 3 000 ms |
+
+Restore cost tracks the chain's total size, not the flatten's placement, so
+moving the flatten out of the critical path and paying a deeper chain for it is
+a losing trade in both directions this workload measures.
+
+## The cycle at 512 MiB, with the flatten back on the restore path
+
+Four arms, 6 minutes each, `MAX_CHAIN=8`, qcow2 first in each pair. Zero
+failures anywhere; `nestfail=0` in all four. p50 in milliseconds.
+
+| | qcow2 128 | tar 128 | qcow2 512 | tar 512 |
+|---|---|---|---|---|
+| `ResumeActor` | 3 200 | **2 800** | 10 000 | **7 600** |
+| `SuspendActor` | **1 900** | 2 500 | **4 000** | 9 400 |
+| Cycle | **5 100** | 5 300 | **14 000** | 17 000 |
+| Checkpoints in 6 min | 104 | 104 | **40** | 34 |
+
+**qcow2 loses resume and wins the cycle.** At 512 MiB it gives up 2 400 ms of
+resume and takes back 5 400 ms of suspend, for 3 000 ms — 18% — off the round
+trip, and 18% more cycles in the same wall clock. The suspend advantage is the
+one that scales: sealing a chain is hardlinks and a manifest at any size, while
+tar's suspend goes 2 500 → 9 400 ms between the two steps. The resume penalty
+grows too, but more slowly.
+
+At 128 MiB the two are a wash (5 100 against 5 300, inside the ±600 ms band this
+report's caveats give for a cycle). The crossover is somewhere below 512 MiB and
+this run does not locate it.
+
+### Where the resume penalty is
+
+atelet's own `Restore timing breakdown`, same run, p50 in milliseconds:
+
+| | `download` | `ateom_restore` | atelet `total` |
+|---|---|---|---|
+| qcow2 128 | 1 419 | 1 563 | 3 133 |
+| tar 128 | 1 602 | 1 035 | 2 719 |
+| qcow2 512 | 6 669 | 2 700 | 10 046 |
+| tar 512 | 5 483 | 1 840 | 7 548 |
+
+`download` is the largest term in every arm and it is mostly *not* the durable
+data: this is a `DATA_ON_GOLDEN` restore, so it fetches the golden snapshot from
+object storage concurrently with copying the actor's own files off local disk,
+and at 128 MiB the two backends are indistinguishable in it. The chain costs
+**+1 186 ms** over one tar at 512 MiB and nothing measurable at 128.
+
+The rest — +528 ms at 128, +860 ms at 512 — is inside ateom, and it is the
+guest, not the landing:
+
+| p50 ms | `agent_dial` | `containers` | `readyz` | `since_boot` | drain | chain MB | top MB |
+|---|---|---|---|---|---|---|---|
+| qcow2 128 | 694 | **300** | 146 | 1 173 | 1 209 | 233 | 18.0 |
+| tar 128 | 616 | **65** | 142 | 825 | — | — | — |
+| qcow2 512 | 699 | **1 247** | 152 | 2 122 | 4 171 | 823 | 68.5 |
+| tar 512 | 819 | **69** | 148 | 1 106 | — | — | — |
+
+`containers` is flat under tar across a 4× change in size (65 → 69 ms) and
+near-linear under qcow2 (300 → 1 247). That shape is the whole explanation: a
+virtio-fs read is a file-level request the host serves out of a page cache it
+has just written, while a virtio-blk read is guest ext4 walking inode tables and
+extent trees it has no cache for, in 4 KiB requests, each resolved through a
+qcow2 L2 lookup into one of up to eight layer files. The guest's page cache is
+empty on a cold boot and there is nothing on the qcow2 side that corresponds to
+the host cache tar's arrangement reads through.
+
+Note that ateom's pre-boot work is *faster* for qcow2 — `since_boot` is
++1 016 ms while `ateom_restore` is only +860 — because landing a chain is
+hardlinks where landing a tar is an unpack. The arrangement wins the landing and
+gives it back with interest in the guest's first reads.
+
+### The dirty pages the drain waits for are atelet's, not ateom's
+
+[Write amplification](#write-amplification) recorded that a restore leaves far
+more dirty host page cache than the delta it landed, and could not say what
+wrote it. It is `copyLocalCheckpoint`: before ateom is called at all, atelet
+byte-copies every file the snapshot names from the local checkpoint directory
+into the restore directory, and for a chain that is every layer.
+
+The arithmetic closes. At 512 MiB the chain is 823 MB, the node writes at a
+measured 183 MB/s, and the drain takes 4 171 ms — 763 MB of writeback. ateom's
+own contribution to that cycle is the 68.5 MB top layer. The copy lands on the
+same filesystem ateom's `syncfs` covers, which is why the drain waits for it.
+
+So the drain is not cleaning up after the chain arrangement; it is cleaning up
+after the stager, and tar pays a version of the same bill in its own `download`
+column. Not making the copy — hardlinking a local checkpoint into the restore
+directory, where the source and destination are on one filesystem and nothing
+downstream writes to the landed files — would take the larger part of both
+backends' `download` and all of qcow2's drain off the restore path at once. It
+is an atelet change and out of this branch's scope.
+
+## The chain depth sweep
+
+Two open questions, one set of arms. Whether the guest's cold-boot read cost is
+the depth of the backing chain or something no amount of flattening reaches; and
+what `MAX_CHAIN` should be now that the drain has removed the per-layer flush
+cost the recorded optimum of 4 was measured against.
+
+`durdir_partial_512mb_microvm`, the depth-clamping build, 8m per arm, a fresh
+golden before each, 2026-09-04 08:10Z to 10:42Z. Caps of 1 and 2 are the same
+experiment — both arrive at the cap on every restore, so both flatten every time
+and both hand cloud-hypervisor a depth of 2 — so the sweep starts at 2. Eleven is
+the deepest chain CH will open. tar runs first and last on an unchanged binary,
+because the previous session moved a tar arm's resume p50 by more than 2× and an
+in-session bracket is the only thing that separates a setting from a day.
+
+`nestfail=0` in every arm, and the deepest chain each arm handed CH was exactly
+its cap — 2, 4, 8, 11. The `MAX_CHAIN=11` arm ran 36 restores at the clamp's
+boundary without a single nesting failure, which is the first direct
+confirmation that [`maxNestingDepth`](#the-background-flatten-hits-cloud-hypervisors-nesting-limit)
+is set to the right number rather than a safe underestimate.
+
+### Depth is not what the guest's first reads cost
+
+Every restore logs the depth it handed CH, and the `Actor boot phases` record
+for the boot that followed carries the same `trace_id`, so the pairs recover
+exactly and pool across arms. This matters because the cap is a ceiling, not a
+setting: the chain sawtooths between 2 and the cap inside a single arm, so an
+arm-level mean measures a mixture and not a depth.
+
+| depth | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `containers` p50 | 1 059 | 1 192 | 1 243 | 1 225 | 1 158 | 1 082 | 1 278 | 1 023 | 1 390 | 951 |
+| n | 40 | 15 | 18 | 9 | 9 | 9 | 9 | 4 | 3 | 3 |
+
+Flat, across a 5.5× range of depth. Whatever the guest is paying for on its
+first reads, it is not the L2 lookup per layer.
+
+This also kills the other candidate. The 40 samples at depth 2 are all boots
+that immediately followed a flatten, and a flatten is a `qemu-img convert` that
+has just written the entire image — so if the cost were device reads that a warm
+host page cache would absorb, those boots would be the fast ones. They are not;
+1 059 ms is the middle of the band. A cheap prefetch of the chain into the host
+cache before boot would buy nothing.
+
+What is left is the guest side: an empty guest page cache, and ext4 walking
+inode tables and extent trees in 4 KiB requests. Only a restore that brings the
+guest's page cache back with it — a `FULL` scope — attacks that, which is
+follow-up 2.
+
+> The same table on the 128 MiB workload does trend, 123 ms at depth 5 to 434 at
+> depth 9. Depth is a real cost there and is simply swamped at 512 MiB, where
+> the volume of guest reads is four times larger and the depth term is not.
+
+### The default stays at 8
+
+| arm | `ResumeActor` | `SuspendActor` | cycle | checkpoints | flattens | drain | `containers` |
+|---|---|---|---|---|---|---|---|
+| tar (first) | 5 100 | 7 200 | 12 300 | 62 | — | — | 69 |
+| qcow2 `MAX_CHAIN=2` | 8 700 | 4 600 | 13 300 | 52 | every restore | 3 416 | 1 097 |
+| qcow2 `MAX_CHAIN=4` | 9 800 | 4 500 | 14 300 | 52 | 8/26 | 3 781 | 1 188 |
+| qcow2 `MAX_CHAIN=8` | 5 900 | 4 300 | 10 200 | 68 | 4/34 | 4 936 | 1 224 |
+| qcow2 `MAX_CHAIN=11` | 5 300 | 4 400 | 9 700 | 74 | 3/37 | 5 350 | 1 147 |
+| tar (last) | 3 100 | 9 800 | 12 900 | 60 | — | — | 66 |
+
+p50 in milliseconds. Locust n is 25–37 per arm.
+
+**Read the raw resume column and you will get the wrong answer.** The arms ran in
+increasing order of depth, and over the same session the tar control's resume
+p50 fell 5 100 → 3 100, or 39%. The qcow2 resume fell 8 700 → 5 300 over the same
+span — also 39%. Depth and elapsed session time are collinear here, and the raw
+column cannot tell them apart.
+
+Normalizing each qcow2 arm against the tar control linearly interpolated between
+the two brackets:
+
+| ÷ tar | `MAX_CHAIN=2` | `MAX_CHAIN=4` | `MAX_CHAIN=8` | `MAX_CHAIN=11` |
+|---|---|---|---|---|
+| `ResumeActor` | 1.85 | 2.28 | **1.51** | **1.51** |
+| `SuspendActor` | 0.60 | 0.55 | **0.49** | **0.47** |
+| cycle | 1.07 | 1.14 | **0.81** | **0.76** |
+
+Three things fall out.
+
+**Shallow is expensive and the recorded optimum of 4 is now the worst setting
+measured.** The trade the old sweep described has lost one of its two sides: an
+extra layer no longer costs a flush, so nothing pushes back against depth, and
+all that remains is the flatten's frequency — 9.1 s at this size, on the restore
+path, on 100% of restores at a cap of 2 and a third of them at 4.
+
+**8 and 11 are indistinguishable once the drift is removed**, at 1.51 and 1.51 on
+resume. The gap in the raw column is the session, not the setting. So there is no
+case for raising the default to sit against cloud-hypervisor's hard limit, where
+a miscount in either direction is a dead actor rather than a slow restore.
+
+**The cycle result reproduces.** qcow2 at the default runs the full cycle in
+0.76–0.81× of tar, against 0.82× measured independently in [the previous
+run](#the-cycle-at-512-mib-with-the-flatten-back-on-the-restore-path), with
+throughput agreeing at +20%. The suspend win and the resume loss both reproduce
+too, at 0.49× and 1.51×.
+
+That resume figure is the whole of the remaining case against this arrangement,
+and the sweep says no setting of this knob addresses it. Both of its terms are
+elsewhere: atelet's copy, and the guest's cold page cache.
+
+> The drain grows monotonically with depth, 3 416 ms to 5 350, because a deeper
+> chain is more bytes for atelet to copy. It is backgrounded and does not show up
+> in the cycle, which is the drain working as intended.
+
 ## Caveats
 
+* **The control drifted hard between sessions and only within-run comparisons
+  hold.** On an unchanged tar arm, `ResumeActor` p50 went 1 700 → 2 800 ms at
+  128 MiB and 3 200 → 7 600 ms at 512 MiB between the 05:08Z and 06:26Z runs on
+  2026-09-04. The device was re-measured at 183 MB/s against 176 earlier and the
+  filesystem was 37% full, so it is not the disk. Nothing in this report should
+  be compared across sessions; every table above pairs its arms inside one run
+  for that reason.
+* **The run-to-run band is ±100-300 ms on `guest_flush` and ±600 ms on the
+  cycle, and it is not symmetric.** Two identical no-drain arms run back to back
+  measured 1 219.8 and 1 311.6 ms; five no-drain-equivalent runs on one day
+  measured 937 / 1 028 / 1 220 / 1 312 / 1 482. Worse, **the second arm of a
+  pair measured slower in every pair run** — +92 ms and +287 ms on `guest_flush`
+  — so this is drift, not noise, and an A/B that puts its hypothesis second will
+  manufacture a result. Every pair from the drain work onward runs the
+  hypothesis first for that reason. Nothing in this report smaller than ~600 ms
+  of cycle should be read as a difference, including cells where an earlier
+  section drew one.
 * **Durations are shorter than the committed ones.** `tests.yaml` runs the two
   largest steps for 20m and 30m; these runs used 10m and 12m so both arms would
   fit in one cluster session. Combined with the qcow2 arm's lower throughput,
@@ -704,34 +1355,56 @@ comparing.
   rows are the exception, and only because every write failed.
 * **Single node, single worker replica, single concurrent user.** Nothing here
   says how either arrangement behaves under contention.
+* **The flush breakdown ran on a scratch build.** The `sync` / `syncfs` / `noop`
+  selector, the staging-versus-round-trip split, the `Direct` flag and the queue
+  override are all environment variables added for these experiments and not
+  part of the branch. Only the response-body fix in `AddNetWithFDs` and
+  `RestoreWithNetFDs` is meant to be kept.
+* **The partial-update runs are one-eighth deltas on eight equal files.** A
+  real workspace has an uneven file-size distribution and a delta that moves
+  between cycles. Nothing here says how the chain behaves when the same clusters
+  are rewritten repeatedly, which is the case where COW should pay best.
+* **No metadata or small-file scenario was run.** Every workload in this report
+  writes a handful of large files. An arrangement's behavior on many small files
+  is a different question, and virtio-fs and ext4-on-virtio-blk have no reason
+  to rank the same way on it.
 
 ## Follow-ups
 
-1. Measure a partial-update workload. Every number here comes from a durable dir
-   that is rewritten end to end every cycle, which is the worst case for a
-   backing-file chain and the case where chain depth is pure cost. Nothing in
-   this report says what the arrangement does when successive cycles touch a
-   subset, which is the case the design is for. `glutton` would need a write
-   mode that dirties a fraction of the file rather than all of it.
-2. Move the flatten off the restore path. Every arm measured pays it as resume
-   latency, and it is the single term separating this arrangement from tar:
-   6 958 ms of the 500 MiB arm's 10 000 ms resume, and 1 591 of 3 700 at
-   64 MiB. Subtracting it leaves 1.08–1.21 s flat across the range. Whether it
-   can run after the resume returns, or on the suspend side, or on a background
-   worker, is a design question this report does not answer, but no tuning of
-   the flatten itself will close a gap the flatten's mere presence creates.
-3. Instrument the landing step. `Landed the durable-dir chain` records the
-   chain's size but not how long the download took, which is the one part of
-   the restore path still unaccounted for. It is also the term the suspend-side
-   upload is inferred from rather than measured.
-4. Re-run the two largest steps at their committed 20m and 30m durations, now
+1. **Stop copying local checkpoints and hardlink them.** This is now the
+   largest single item on the restore path: `download` is the biggest term in
+   every arm measured, and for a local checkpoint it is `copyLocalCheckpoint`
+   writing the actor's whole durable data set a second time. It would take
+   ~1.2 s off qcow2's 512 MiB resume, a comparable share off tar's, and all of
+   qcow2's drain — which exists only because those pages are dirty. The
+   question the change has to answer is which snapshot files are safe to share
+   an inode with: the layers are never written after landing, but the guest
+   memory image is a different argument. atelet, not this branch.
+2. **Test a `FULL` scope restore.** `containers` is the other half of the resume
+   gap — 1 247 ms against tar's 69 at 512 MiB — and [the sweep](#the-chain-depth-sweep)
+   has eliminated every explanation for it but one. It is not chain depth, which
+   the cost is flat across from 2 to 11; and it is not cold host page cache,
+   since the boots that follow a flatten sit in the middle of the band despite
+   `qemu-img convert` having just written the whole image. What is left is the
+   guest's own page cache being empty and ext4 walking metadata in 4 KiB reads,
+   and the only restore that brings a guest page cache back with it is a `FULL`
+   one. This is now the only untried lever on the second half of the resume gap.
+3. Re-run the two largest steps at their committed 20m and 30m durations, now
    that the route timeout no longer caps a write at 10 s. Until then the sweep
    has no valid data point above 500 MiB.
-5. Reduce the `guest_flush` lottery, or stop reporting `SuspendActor` at the
+4. Reduce the `guest_flush` lottery, or stop reporting `SuspendActor` at the
    middle sizes as a comparison. A term that swings 39 ms to 2 789 ms at
    256 MiB between runs of the same configuration makes those cells
    uninterpretable — see [A caution about `SuspendActor` at the middle
    sizes](#a-caution-about-suspendactor-at-the-middle-sizes).
-6. Try discard. Worth doing for the storage and transfer footprint rather than
+5. Try discard. Worth doing for the storage and transfer footprint rather than
    for resume latency — see the bloat table above for why it does nothing at
    256 MiB and above.
+6. Measure a workload whose delta lands on the same clusters each cycle. The
+   partial runs rewrite a different file each cycle, so consecutive layers still
+   share nothing and the chain grows by a full delta every time. The case COW is
+   actually for — repeated edits to the same region — has not been measured, and
+   it is the one where depth should pay for itself rather than cost.
+7. Measure a metadata- or small-file-heavy scenario. Nothing in this report
+   distinguishes virtio-fs from ext4-on-virtio-blk on anything but bulk
+   throughput.

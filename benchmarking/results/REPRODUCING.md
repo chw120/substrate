@@ -309,6 +309,37 @@ does).
 **`HTTP 504: upstream request timeout` on `DurDirWrite` / `DurDirOverwrite`.**
 Envoy's route timeout. See [step 5](#5-raise-the-routers-route-timeout-required-for-1-gib).
 
+**`HTTP 503` on 100% of `DurDirWrite` while `ResumeActor` still succeeds.** The
+atenet-router's client certificate is issued when its pod starts and lives 24
+hours, and nothing rotates it. Past that the router cannot reach the actor, but
+the control plane is unaffected — so the run completes, reports a healthy resume
+rate, and measures an empty durable dir. The tell is in ateom's log, not the
+router's:
+
+```
+x509: certificate has expired or is not yet valid: ... after 2026-09-03T18:44:57Z
+```
+
+```bash
+kubectl -n ate-system rollout restart deploy/atenet-router
+```
+
+A router older than a day invalidates a run silently, so restart it before a
+session and fail the arm on the write failure rate rather than trusting the
+phase numbers.
+
+**A run killed mid-cycle can wedge the pool's only worker.** The actor is left
+in `ACTOR_STATE_DELETING`, and terminating it fails permanently:
+
+```
+TERMINAL_FILE_SYSTEM_ERROR: open /var/lib/ateom-gvisor/actors/<uid>/sandbox-assets.json:
+no such file or directory
+```
+
+`kubectl-ate delete actor --any-state` does not clear it, and while it is there
+the golden cannot resume. Delete the ateom pod first — the assignment goes with
+it — then delete the actors and rebuild the golden.
+
 **Do not use `benchmarking/deploy_locust.sh` for DurDir work.** It calls
 `locust/deploy.sh --deploy` without `--user-class`, so it silently deploys the
 `glutton` class instead of `durdir`. Run the steps separately, or pass
