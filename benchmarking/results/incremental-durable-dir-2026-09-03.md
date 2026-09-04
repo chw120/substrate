@@ -3,8 +3,9 @@
 Measures `ATEOM_INCREMENTAL_DURABLE_DIR` against the full-capture path it
 replaces, on the two `durdir_partial_*` scenarios: a durable directory held at
 a fixed size while one eighth of it is rewritten per cycle. That is the shape
-an arrangement that archives a delta exists for, and the size sweep gives it no
-room to show anything, because there every cycle rewrites everything.
+an arrangement that archives a delta exists for, and the DurDir benchmark could
+not express it until `8b735b0`: every scenario it had rewrote the whole
+directory each cycle, which gives a delta no room to show anything.
 
 It was measured twice. The first pass said incremental capture makes suspend
 much cheaper and resume much dearer; the resume half turned out to be a re-hash

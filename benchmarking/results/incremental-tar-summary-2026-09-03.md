@@ -6,10 +6,16 @@ A one-page summary. The full measurement is in
 ## What we were testing
 
 Whether archiving only what changed should replace the full re-tar of the
-durable directory at every suspend. The scenario is the one the scheme exists
-for: a directory held at a fixed size with one eighth of it rewritten per cycle
-(8 files, one per cycle). The question was how much of the suspend cost that
-actually removes, and what it costs elsewhere.
+durable directory at every suspend — how much of the suspend cost that actually
+removes, and what it costs elsewhere.
+
+The DurDir benchmark was already there, but not in a shape that could answer
+this. Every one of its scenarios rewrites the whole durable directory each
+cycle, which is the one case a delta can never help. `8b735b0` adds
+`--durdir-file-count`, and the two `durdir_partial_*` scenarios it introduces
+hold the directory at the size of an existing sweep step while rewriting one
+eighth of it per cycle (8 files, one per cycle). Each therefore pairs with an
+equally-sized sweep scenario and differs only in the per-cycle delta.
 
 ## 1. The first benchmark said: suspend is half the price, resume is double
 
