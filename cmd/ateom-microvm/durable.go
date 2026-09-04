@@ -49,6 +49,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/kata"
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/tarutil"
@@ -141,19 +142,47 @@ func durableArchiveDir(actorUID string) string {
 	return ateompath.DurableDirVolumeMountsDir(actorUID)
 }
 
+// durableReset is how long each part of resetDurableOverlayState took.
+//
+// Teardown reports it because reclaiming these two trees is the entire cost the
+// image path carries over the plain-directory path: the image stays whole for
+// the actor's lifetime while the upper accumulates beside it, so a suspend has
+// to free both where a plain directory frees nothing. Which of the two is
+// expensive is not something the byte counts predict — freeing one large file
+// and freeing the same bytes as an overlay upper are different work for the
+// filesystem — so they are timed apart.
+type durableReset struct {
+	Image time.Duration
+	Upper time.Duration
+	Work  time.Duration
+}
+
 // resetDurableOverlayState clears the image and overlay dirs so the actor
 // starts from the plain-directory arrangement. Called before a cold boot and
 // at the start of every restore, so a previous activation's image can never
 // decide the current one's format, and so the upper is empty when
 // kata.StageDurableOverlay demands it.
-func resetDurableOverlayState(actorUID string) error {
+//
+// The timings are always returned; callers that only need the reset ignore them.
+func resetDurableOverlayState(actorUID string) (durableReset, error) {
 	upper, work := durableUpperWorkDirs(actorUID)
-	for _, p := range []string{durableImagePath(actorUID), upper, work} {
-		if err := os.RemoveAll(p); err != nil {
-			return fmt.Errorf("while clearing durable-dir overlay state %q: %w", p, err)
+	var d durableReset
+	for _, e := range []struct {
+		path string
+		into *time.Duration
+	}{
+		{durableImagePath(actorUID), &d.Image},
+		{upper, &d.Upper},
+		{work, &d.Work},
+	} {
+		t := time.Now()
+		err := os.RemoveAll(e.path)
+		*e.into = time.Since(t)
+		if err != nil {
+			return d, fmt.Errorf("while clearing durable-dir overlay state %q: %w", e.path, err)
 		}
 	}
-	return nil
+	return d, nil
 }
 
 // stageDurableVolumes exposes the actor's durable-dir volumes to the guest at
@@ -196,7 +225,7 @@ func (s *AteomService) stageDurableVolumes(ctx context.Context, actorUID string,
 		// next suspend would archive kata.DurableMergedDir — a directory
 		// nothing ever mounted — silently checkpointing an empty durable dir
 		// over all of the actor's data.
-		if rerr := resetDurableOverlayState(actorUID); rerr != nil {
+		if _, rerr := resetDurableOverlayState(actorUID); rerr != nil {
 			return rerr
 		}
 	}
@@ -252,7 +281,7 @@ func archiveDurableVolumes(ctx context.Context, dir, checkpointDir string) error
 func landDurableVolumes(dir, snapshotDir, actorUID string) error {
 	// Whichever way this restore goes, it must not inherit the last one's
 	// image or its overlay upper.
-	if err := resetDurableOverlayState(actorUID); err != nil {
+	if _, err := resetDurableOverlayState(actorUID); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {

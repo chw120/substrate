@@ -333,22 +333,37 @@ func (s *AteomService) teardownActor(ctx context.Context, id string, ra *running
 	// it also drops the merged rootfs overlay mounts, which MUST come before
 	// the upper-dir removal below (removing a live overlay's upperdir would
 	// corrupt the mount rather than delete the files).
+	tSweep := time.Now()
 	kata.CleanupSandboxState(ctx, id)
+	dSweep := time.Since(tSweep)
 
 	// Remove the rootfs upper dir: ateom owns it — atelet's actor-dir reset
 	// doesn't know it — and its absence is what marks a worker as holding no
 	// disk-backed upper. Runs after the checkpoint tar, which is already on disk.
+	tRootfsUpper := time.Now()
 	if err := os.RemoveAll(rootfsUpperDir(id)); err != nil {
 		slog.WarnContext(ctx, "Failed to remove rootfs upper dir", slog.String("actorUID", id), slog.Any("err", err))
 	}
+	dRootfsUpper := time.Since(tRootfsUpper)
 
 	// Same for the durable-dir image and its overlay dirs, and for the same
 	// ordering reason: the sweep above dropped the mounts that were using them.
 	// Their absence is what puts the next activation back on the plain-directory
 	// path until a restore lands another image.
-	if err := resetDurableOverlayState(id); err != nil {
+	reset, err := resetDurableOverlayState(id)
+	if err != nil {
 		slog.WarnContext(ctx, "Failed to remove durable-dir overlay state", slog.String("actorUID", id), slog.Any("err", err))
 	}
+
+	// Reclaim dominates the teardown the checkpoint path reports, and on the
+	// image path it dominates by seconds, so report where those seconds went.
+	// The sweep is where the lazy unmounts and the loop autoclear land; the rest
+	// is the filesystem freeing the actor's data. A plain-directory actor should
+	// show near-zero for everything but the sweep.
+	slog.InfoContext(ctx, "Actor state reclaimed", slog.String("actorUID", id),
+		slog.Duration("sandbox_sweep", dSweep), slog.Duration("rootfs_upper", dRootfsUpper),
+		slog.Duration("durable_image", reset.Image), slog.Duration("durable_upper", reset.Upper),
+		slog.Duration("durable_work", reset.Work))
 
 	// Detach the bundle rootfs overlays composed in buildActorContainers, so
 	// atelet's bundle wipe doesn't strand live mounts in this namespace.

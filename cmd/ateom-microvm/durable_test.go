@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/kata"
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/tarutil"
@@ -257,6 +258,50 @@ func TestLandDurableVolumesClearsStaleImage(t *testing.T) {
 		if _, err := os.Stat(d); !os.IsNotExist(err) {
 			t.Errorf("stale overlay dir %q survived the restore (err = %v)", d, err)
 		}
+	}
+}
+
+// TestResetDurableOverlayStateTimings checks that the reset reports one timing
+// per tree it clears, and that the trees are gone. Teardown attributes seconds
+// of suspend latency to these three numbers, so a reset that silently stopped
+// filling one of them would read as "that tree is free" rather than as a bug.
+func TestResetDurableOverlayStateTimings(t *testing.T) {
+	useTempActorsDir(t)
+	const actorUID = "actor-reclaim"
+
+	if err := os.MkdirAll(ateompath.ActorPath(actorUID), 0o755); err != nil {
+		t.Fatalf("creating actor dir: %v", err)
+	}
+	upper, work := durableUpperWorkDirs(actorUID)
+	if err := os.WriteFile(durableImagePath(actorUID), []byte("image"), 0o644); err != nil {
+		t.Fatalf("planting image: %v", err)
+	}
+	for _, d := range []string{upper, work} {
+		if err := os.MkdirAll(filepath.Join(d, "data"), 0o755); err != nil {
+			t.Fatalf("planting overlay dir: %v", err)
+		}
+	}
+
+	got, err := resetDurableOverlayState(actorUID)
+	if err != nil {
+		t.Fatalf("resetDurableOverlayState: %v", err)
+	}
+	for name, d := range map[string]time.Duration{
+		"image": got.Image, "upper": got.Upper, "work": got.Work,
+	} {
+		if d < 0 {
+			t.Errorf("%s timing is negative: %v", name, d)
+		}
+	}
+	for _, p := range []string{durableImagePath(actorUID), upper, work} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("%q survived the reset (err = %v)", p, err)
+		}
+	}
+
+	// A second reset is the cold-boot case: nothing to remove, no error.
+	if _, err := resetDurableOverlayState(actorUID); err != nil {
+		t.Fatalf("resetDurableOverlayState on an already-clear actor: %v", err)
 	}
 }
 
