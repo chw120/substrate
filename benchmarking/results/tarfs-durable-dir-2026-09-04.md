@@ -87,15 +87,17 @@ nothing proportional to the volume happens: the index over the 1 GiB tar is
 alone accounts for; the rest is the same knock-on the erofs run saw, where
 writing a gibibyte back out contends with the VM starting alongside it.
 
-**The cost is on the checkpoint side, and it is smaller than the erofs image's
-was.** `durable_dir` is +2 077 ms and `teardown` is +158 ms, against
-+3 968 ms and +135 ms for the erofs image at the same size. tarfs does not
-rebuild anything on suspend — both arms run the same `tar` — so the +2 s is not
-a tool cost. It is consistent with write-back pressure: the tarfs arm holds
-three live copies of the actor's gibibyte (the tar lower, the overlay upper the
-guest's overwrite copied up, and the new archive being written) on a volume
-that sustains 156 MB/s, where the extract arm holds two. That mechanism is
-inferred from the shape, not confirmed by measurement here.
+**The cost is on the checkpoint side, and it is not new work.** `durable_dir` is
++2 077 ms and `teardown` is +158 ms. tarfs rebuilds nothing on suspend — both
+arms run the same `tar` — and `/proc/diskstats` on the node, sampled through one
+further interleaved round, shows why: both arms write during `durable_dir` at
+exactly 162 MB/s, the volume's line rate, and the tarfs window is longer only
+because 1 397 MiB passes through it against 1 055 MiB. The extra 342 MiB is
+writeback the guest's overwrite deferred — that call returns 2 600 ms earlier on
+tarfs with its pages still dirty, and the archive's `fsync` is the next thing to
+wait for them. Overwrite plus `durable_dir` sums to within 3% on the two arms.
+The three-way comparison has the numbers:
+[durable-dir-landing-summary-2026-09-04.md](durable-dir-landing-summary-2026-09-04.md).
 
 ## Throughput
 
