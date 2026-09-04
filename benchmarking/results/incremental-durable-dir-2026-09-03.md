@@ -6,10 +6,14 @@ a fixed size while one eighth of it is rewritten per cycle. That is the shape
 an arrangement that archives a delta exists for, and the size sweep gives it no
 room to show anything, because there every cycle rewrites everything.
 
-The headline: **incremental capture makes suspend much cheaper and resume
-correspondingly dearer, and both effects are governed by SHA-256 throughput
-rather than by the size of the delta.** It is a net win at 512 MiB and roughly
-a wash at 128 MiB.
+The headline: **incremental capture makes suspend much cheaper, and what it
+saves is governed by SHA-256 throughput rather than by the size of the delta.**
+
+It was measured twice. The first pass, at `24aa6af`, also made resume dearer,
+and tracing that cost to a re-hash of the restored tree is what produced
+`4a8fcad`; the second pass, after that commit, has resume back at parity. Both
+are below — the first because it is the evidence for the change, and because
+the ceiling it establishes on the capture side still stands.
 
 ## Setup
 
@@ -21,7 +25,7 @@ a wash at 128 MiB.
 | Template | `glutton-durdir-data` — DATA scope, so the durable dir is the whole snapshot |
 | Scenarios | `durdir_partial_128mb_microvm` (8 × 16 MiB, 10m), `durdir_partial_512mb_microvm` (8 × 64 MiB, 20m) |
 | Users | 1, `--resume-mode explicit`, `--durdir-read-mode digest`, wait times pinned to 1.0 |
-| Branch | `poc3-incremental-tar` at `24aa6af` |
+| Branch | `poc3-incremental-tar` at `24aa6af`, then again at `4a8fcad` |
 
 The two arms differ in one environment variable on `ate-controller`, which
 `workerpool_apply.go` forwards onto the worker pod:
@@ -41,7 +45,7 @@ Timings are ateom's own phase fields from the `Actor checkpointed` and
 `Handle RPC` elapsed time for `AteomHerder/Checkpoint`, which is the first
 number that includes the upload. Client latencies come from the locust summary.
 
-## Results
+## Results at 24aa6af, before the change
 
 All figures are p50 in milliseconds.
 
@@ -92,6 +96,38 @@ to hash throughput. Even at δ → 0 the incremental capture of a 512 MiB volume
 cannot go below ~1.7 s, against 4.9 s for a full one: a ceiling of about 2.9×,
 reached already at δ = 1/8.
 
+## Results at 4a8fcad, after the change
+
+`4a8fcad` replaced the re-hash with accounting for what extraction took. All
+four arms were rerun on the same cluster and the same worker node, so this
+table stands on its own rather than against the one above; the capture side is
+untouched by that commit and is here as a control.
+
+| | | ateom tar | ateom restore | client Suspend | client Resume | objects/cycle |
+|---|---|---|---|---|---|---|
+| **128 MiB** | full | 749 | 1054 | 2500 | 1700 | 1.00 |
+| | incremental | **430** (−43%) | **1059** (+0.5%) | **1500** (−40%) | **1700** (0%) | 8.68 |
+| **512 MiB** | full | 3376 | 1345 | 7500 | 3100 | 1.00 |
+| | incremental | **1907** (−44%) | **1486** (+10%) | **5000** (−33%) | **2900** (−6%) | 8.72 |
+
+Whole cycle, client side: 4200 → 3200 ms at 128 MiB (−24%), 10600 → 7900 ms at
+512 MiB (−25%). Samples 101–102 cycles per arm at 128 MiB, 85–100 at 512 MiB,
+no failures in any of the four.
+
+The resume regression is gone: +5 ms at 128 MiB and +141 ms at 512 MiB, against
++417 and +1677 before. What is left at 512 MiB is the extra open, read, and
+close of nine objects where a full capture handles one.
+
+Two caveats on this table, both of which understate the incremental arm rather
+than flatter it. The 512 MiB incremental arm ran on a worker pod that had
+already served the 128 MiB run, where the other three arms each started on a
+fresh one; a worker with a warm page cache and prior actors is the harder
+starting point, so the +141 ms is an upper bound. And the capture-side figures
+are not comparable across the two tables — full capture at 512 MiB measured
+4945 ms in the first pass and 3376 ms in the second with no code between them,
+which is the run-to-run variance of this scenario and the reason all four arms
+were rerun rather than three.
+
 ## Write amplification
 
 Of the four writes the proposal counts per cycle — suspend staging tar, resume
@@ -131,13 +167,12 @@ cycles agree with it (tar 2575 ms, restore 3023 ms).
 
 ## What this suggests
 
-1. **The verification is the whole restore regression.** It exists to catch a
-   missing generation, which a single archive cannot suffer from. Extraction
-   already knows which paths it took from which generation, so accounting for
-   them during extraction would catch exactly the same failure for free, and
-   leave content hashing to the object store's own checksums. Doing that would
-   take the 512 MiB restore back to roughly parity and turn the 128 MiB case
-   from a wash into a win.
+1. **The verification was the whole restore regression.** Done in `4a8fcad`:
+   the check exists to catch a missing generation, which a single archive
+   cannot suffer from, and extraction already knows which paths it took from
+   which generation, so accounting for them catches the same failure for free.
+   Content hashing is left to the object store's own checksums. Predicted to
+   take the 512 MiB restore back to roughly parity; measured at +141 ms.
 2. **Retry the per-object upload, or accept the risk knowingly.** Nine objects
    per suspend against a control plane that treats one failed PUT as actor loss
    is the sharpest edge this change adds.
@@ -165,3 +200,9 @@ Then, per arm: set or clear the variable, wait for it to reach the
 `benchmark-ateom` pod template, wait for the worker rollout, and submit the
 scenario. Toggling the variable restarts the worker pod, which is what makes
 the two arms start from the same state; keep that symmetry when adding arms.
+
+Restart the worker between two arms on the same setting as well, by toggling
+the variable there and back. A second scenario submitted onto a worker that has
+just served one fails outright — `AssignWorker: ResourceExhausted: no free
+workers available`, every request, because the actors of the finished run still
+hold the pool's single replica.
