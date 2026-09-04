@@ -67,46 +67,92 @@ func DurableMergedDir(id string) string {
 // Callers stage this before StartVirtiofsd, like every other share subtree.
 func StageDurableOverlay(ctx context.Context, imagePath, id, upper, work string) error {
 	lower := DurableLowerDir(id)
-	merged := DurableMergedDir(id)
-	// Drop any stale mounts first, innermost last (lazy if busy), then ensure
-	// clean mountpoints.
-	unmount(merged)
-	unmount(lower)
-	for _, d := range []string{merged, upper, work} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			return fmt.Errorf("creating %q: %w", d, err)
-		}
+	if err := prepareDurableOverlayDirs(id, upper, work); err != nil {
+		return err
 	}
 	if err := tarutil.MountImage(ctx, imagePath, lower); err != nil {
 		return fmt.Errorf("while mounting the durable-dir image: %w", err)
 	}
-	// metacopy=off,index=off: pinned for the same reason StageMergedRootfs
-	// pins them, and harder. Both record file-handle references to LOWER
-	// inodes in the upper, and this lower is rebuilt from a freshly downloaded
-	// image on every restore — so every inode is new and any preserved handle
-	// is stale, which turns the file silently unreadable after resume.
-	//
-	// No volatile, unlike StageMergedRootfs: that upper is throwaway, tarred
-	// into the snapshot and deleted. This one holds the actor's durable data
-	// between the resume and the next suspend, which is the entire meaning of
-	// the word, so the syncs overlayfs wants to do are syncs we want done.
-	opts := "lowerdir=" + lower + ",upperdir=" + upper + ",workdir=" + work +
-		",metacopy=off,index=off"
-	cmd := exec.CommandContext(ctx, "mount", "-t", "overlay", "overlay", "-o", opts, merged)
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	if err := reaper.Run(cmd); err != nil {
+	if err := mountDurableMerged(ctx, id, lower, upper, work); err != nil {
 		tarutil.UnmountImage(lower)
-		return fmt.Errorf("mounting durable-dir overlay at %q: %w (%s)", merged, err, strings.TrimSpace(stderr.String()))
+		return err
+	}
+	return nil
+}
+
+// StageDurableTarfsOverlay is StageDurableOverlay with a tarfs pair as the
+// lower instead of an image: indexPath supplies the metadata and tarPath the
+// data. Everything above the lower — the mountpoints, the overlay options, the
+// requirement that upper and work be empty siblings on real disk — is identical
+// and identically motivated.
+func StageDurableTarfsOverlay(ctx context.Context, indexPath, tarPath, id, upper, work string) error {
+	lower := DurableLowerDir(id)
+	if err := prepareDurableOverlayDirs(id, upper, work); err != nil {
+		return err
+	}
+	if err := tarutil.MountTarfs(ctx, indexPath, tarPath, lower); err != nil {
+		return fmt.Errorf("while mounting the durable-dir tarfs: %w", err)
+	}
+	if err := mountDurableMerged(ctx, id, lower, upper, work); err != nil {
+		tarutil.UnmountTarfs(ctx, lower, tarPath)
+		return err
 	}
 	return nil
 }
 
 // UnmountDurableOverlay drops both mounts, merged first. Best-effort like the
 // rest of teardown; CleanupSandboxState sweeps whatever is left.
-func UnmountDurableOverlay(id string) {
+//
+// tarPath is the tarfs data device's backing file, and is empty on the image
+// path. Releasing that device is the one part of teardown here that is not
+// just an unmount: mount(8) attached the other loop device and gave it
+// LO_FLAGS_AUTOCLEAR, but nothing does that for a data device, so a loop the
+// node shares stays bound until this call.
+func UnmountDurableOverlay(ctx context.Context, id, tarPath string) {
 	unmount(DurableMergedDir(id))
-	tarutil.UnmountImage(DurableLowerDir(id))
+	if tarPath == "" {
+		tarutil.UnmountImage(DurableLowerDir(id))
+		return
+	}
+	tarutil.UnmountTarfs(ctx, DurableLowerDir(id), tarPath)
+}
+
+// prepareDurableOverlayDirs drops any stale mounts, innermost last (lazy if
+// busy), and ensures the mountpoints and overlay dirs exist.
+func prepareDurableOverlayDirs(id, upper, work string) error {
+	unmount(DurableMergedDir(id))
+	unmount(DurableLowerDir(id))
+	for _, d := range []string{DurableMergedDir(id), upper, work} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return fmt.Errorf("creating %q: %w", d, err)
+		}
+	}
+	return nil
+}
+
+// mountDurableMerged stacks upper and work over an already-mounted lower.
+//
+// metacopy=off,index=off: pinned for the same reason StageMergedRootfs pins
+// them, and harder. Both record file-handle references to LOWER inodes in the
+// upper, and this lower is rebuilt from a freshly downloaded archive on every
+// restore — so every inode is new and any preserved handle is stale, which
+// turns the file silently unreadable after resume.
+//
+// No volatile, unlike StageMergedRootfs: that upper is throwaway, tarred into
+// the snapshot and deleted. This one holds the actor's durable data between the
+// resume and the next suspend, which is the entire meaning of the word, so the
+// syncs overlayfs wants to do are syncs we want done.
+func mountDurableMerged(ctx context.Context, id, lower, upper, work string) error {
+	merged := DurableMergedDir(id)
+	opts := "lowerdir=" + lower + ",upperdir=" + upper + ",workdir=" + work +
+		",metacopy=off,index=off"
+	cmd := exec.CommandContext(ctx, "mount", "-t", "overlay", "overlay", "-o", opts, merged)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := reaper.Run(cmd); err != nil {
+		return fmt.Errorf("mounting durable-dir overlay at %q: %w (%s)", merged, err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
 }
 
 // unmount detaches path, lazily if it is busy, and ignores a path that was

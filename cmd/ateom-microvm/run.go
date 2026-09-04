@@ -297,7 +297,7 @@ func (s *AteomService) RunWorkload(ctx context.Context, req *ateompb.RunWorkload
 	// so drop any image and overlay dirs a previous activation left behind (see
 	// durable.go). Here rather than in coldBootActor, which a Data-scope restore
 	// also runs — that one has just landed an image and must keep it.
-	if _, err := resetDurableOverlayState(p.actorUID); err != nil {
+	if _, err := resetDurableOverlayState(ctx, p.actorUID); err != nil {
 		return nil, err
 	}
 

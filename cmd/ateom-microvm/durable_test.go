@@ -160,14 +160,14 @@ func TestDurableVolumesRoundTrip(t *testing.T) {
 
 	// Restore: onto the empty directory atelet re-creates for the actor.
 	dst := t.TempDir()
-	if err := landDurableVolumes(dst, checkpointDir, actorUID); err != nil {
+	if err := landDurableVolumes(t.Context(), dst, checkpointDir, actorUID); err != nil {
 		t.Fatalf("landDurableVolumes: %v", err)
 	}
 	checkVolumes(t, dst)
 	// A tar leaves the actor on the plain-directory arrangement: nothing to
 	// mount, so stageDurableVolumes must go on binding the directory.
-	if durableOverlayActive(actorUID) {
-		t.Error("a tar restore put the actor on the overlay path")
+	if got := durableLowerKind(actorUID); got != durableLowerNone {
+		t.Errorf("a tar restore put the actor on the %s arrangement", got)
 	}
 	if got, want := durableArchiveDir(actorUID), ateompath.DurableDirVolumeMountsDir(actorUID); got != want {
 		t.Errorf("durableArchiveDir = %q, want %q", got, want)
@@ -195,12 +195,12 @@ func TestLandDurableVolumesImage(t *testing.T) {
 	}
 
 	dst := t.TempDir()
-	if err := landDurableVolumes(dst, snapshotDir, actorUID); err != nil {
+	if err := landDurableVolumes(t.Context(), dst, snapshotDir, actorUID); err != nil {
 		t.Fatalf("landDurableVolumes: %v", err)
 	}
-	if !durableOverlayActive(actorUID) {
-		t.Fatalf("landing an image did not put the actor on the overlay path (no image at %q)",
-			durableImagePath(actorUID))
+	if got := durableLowerKind(actorUID); got != durableLowerImage {
+		t.Fatalf("landing an image left the actor on %s, want %s (no image at %q)",
+			got, durableLowerImage, durableImagePath(actorUID))
 	}
 	// Adopted, not copied: the image is the one thing on this path that must
 	// not be rewritten, since rewriting it is the cost the format exists to
@@ -247,12 +247,12 @@ func TestLandDurableVolumesClearsStaleImage(t *testing.T) {
 		t.Fatalf("archiveDurableVolumes: %v", err)
 	}
 	dst := t.TempDir()
-	if err := landDurableVolumes(dst, checkpointDir, actorUID); err != nil {
+	if err := landDurableVolumes(t.Context(), dst, checkpointDir, actorUID); err != nil {
 		t.Fatalf("landDurableVolumes: %v", err)
 	}
 	checkVolumes(t, dst)
-	if durableOverlayActive(actorUID) {
-		t.Error("a stale image survived a tar restore")
+	if got := durableLowerKind(actorUID); got != durableLowerNone {
+		t.Errorf("a stale image survived a tar restore: the actor is on %s", got)
 	}
 	for _, d := range []string{upper, work} {
 		if _, err := os.Stat(d); !os.IsNotExist(err) {
@@ -273,8 +273,12 @@ func TestResetDurableOverlayStateTimings(t *testing.T) {
 		t.Fatalf("creating actor dir: %v", err)
 	}
 	upper, work := durableUpperWorkDirs(actorUID)
-	if err := os.WriteFile(durableImagePath(actorUID), []byte("image"), 0o644); err != nil {
-		t.Fatalf("planting image: %v", err)
+	// Both arrangements at once, which no real activation produces: the reset
+	// is what guarantees that, so it must not need it to already be true.
+	for _, p := range []string{durableImagePath(actorUID), durableTarPath(actorUID), durableIndexPath(actorUID)} {
+		if err := os.WriteFile(p, []byte("stale"), 0o644); err != nil {
+			t.Fatalf("planting %q: %v", p, err)
+		}
 	}
 	for _, d := range []string{upper, work} {
 		if err := os.MkdirAll(filepath.Join(d, "data"), 0o755); err != nil {
@@ -282,25 +286,28 @@ func TestResetDurableOverlayStateTimings(t *testing.T) {
 		}
 	}
 
-	got, err := resetDurableOverlayState(actorUID)
+	got, err := resetDurableOverlayState(t.Context(), actorUID)
 	if err != nil {
 		t.Fatalf("resetDurableOverlayState: %v", err)
 	}
 	for name, d := range map[string]time.Duration{
-		"image": got.Image, "upper": got.Upper, "work": got.Work,
+		"image": got.Image, "tar": got.Tar, "index": got.Index, "upper": got.Upper, "work": got.Work,
 	} {
 		if d < 0 {
 			t.Errorf("%s timing is negative: %v", name, d)
 		}
 	}
-	for _, p := range []string{durableImagePath(actorUID), upper, work} {
+	for _, p := range []string{durableImagePath(actorUID), durableTarPath(actorUID), durableIndexPath(actorUID), upper, work} {
 		if _, err := os.Stat(p); !os.IsNotExist(err) {
 			t.Errorf("%q survived the reset (err = %v)", p, err)
 		}
 	}
+	if kind := durableLowerKind(actorUID); kind != durableLowerNone {
+		t.Errorf("durableLowerKind after the reset = %s, want %s", kind, durableLowerNone)
+	}
 
 	// A second reset is the cold-boot case: nothing to remove, no error.
-	if _, err := resetDurableOverlayState(actorUID); err != nil {
+	if _, err := resetDurableOverlayState(t.Context(), actorUID); err != nil {
 		t.Fatalf("resetDurableOverlayState on an already-clear actor: %v", err)
 	}
 }
@@ -353,4 +360,125 @@ func sameFile(t *testing.T, a, b string) bool {
 		t.Fatalf("stat %q: %v", b, err)
 	}
 	return os.SameFile(sa, sb)
+}
+
+// TestDurableLowerKindExclusivity pins which file decides the arrangement.
+// stageDurableVolumes dispatches on this, so reading a half-landed tar as a
+// mountable lower would fail the resume, and reading a stale image alongside a
+// fresh index would serve the previous activation's data.
+func TestDurableLowerKindExclusivity(t *testing.T) {
+	tests := []struct {
+		name  string
+		files []string
+		want  durableLower
+	}{
+		{name: "nothing landed", want: durableLowerNone},
+		{name: "image", files: []string{"image"}, want: durableLowerImage},
+		{name: "tar and index", files: []string{"tar", "index"}, want: durableLowerTarfs},
+		// A tar with no index beside it is a landing that died between the two
+		// writes. There is nothing to mount, so the actor belongs on the plain
+		// directory the fallback extracts into.
+		{name: "tar without an index", files: []string{"tar"}, want: durableLowerNone},
+		// Cannot happen, but if it did the image is the safe read: it is
+		// self-contained, where an index is only as good as the tar beside it.
+		{name: "image and index", files: []string{"image", "index"}, want: durableLowerImage},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			useTempActorsDir(t)
+			const actorUID = "actor-kind"
+			if err := os.MkdirAll(ateompath.ActorPath(actorUID), 0o755); err != nil {
+				t.Fatalf("creating actor dir: %v", err)
+			}
+			paths := map[string]string{
+				"image": durableImagePath(actorUID),
+				"tar":   durableTarPath(actorUID),
+				"index": durableIndexPath(actorUID),
+			}
+			for _, f := range tc.files {
+				if err := os.WriteFile(paths[f], []byte(f), 0o644); err != nil {
+					t.Fatalf("planting %s: %v", f, err)
+				}
+			}
+			if got := durableLowerKind(actorUID); got != tc.want {
+				t.Errorf("durableLowerKind = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLandDurableVolumesTarfs covers the landing mode's happy path without
+// needing a kernel that can mount the pair: landing parks the tar and builds
+// the index, and stageDurableVolumes does the mount, precisely because
+// CleanupSandboxState runs between them.
+func TestLandDurableVolumesTarfs(t *testing.T) {
+	if _, err := exec.LookPath("mkfs.erofs"); err != nil {
+		t.Skipf("needs mkfs.erofs on PATH: %v", err)
+	}
+	useTempActorsDir(t)
+	t.Setenv(tarutil.LandingEnvVar, string(tarutil.LandingTarfs))
+	const actorUID = "actor-tarfs"
+
+	checkpointDir := t.TempDir()
+	if err := archiveDurableVolumes(t.Context(), durableFixture(t), checkpointDir); err != nil {
+		t.Fatalf("archiveDurableVolumes: %v", err)
+	}
+	src := filepath.Join(checkpointDir, durableTarFile)
+
+	dst := t.TempDir()
+	if err := landDurableVolumes(t.Context(), dst, checkpointDir, actorUID); err != nil {
+		t.Fatalf("landDurableVolumes: %v", err)
+	}
+	if got := durableLowerKind(actorUID); got != durableLowerTarfs {
+		t.Fatalf("landing a tar under %s=%s left the actor on %s, want %s",
+			tarutil.LandingEnvVar, tarutil.LandingTarfs, got, durableLowerTarfs)
+	}
+	// Adopted, not copied: not rewriting the actor's bytes is the entire point
+	// of the mode.
+	if !sameFile(t, src, durableTarPath(actorUID)) {
+		t.Error("the landed tar is a copy of the snapshot's, not a link to it")
+	}
+	// And nothing unpacked, which is the other half of the same claim.
+	if entries, err := os.ReadDir(dst); err != nil {
+		t.Fatalf("reading durable dir: %v", err)
+	} else if len(entries) != 0 {
+		t.Errorf("a tarfs landing wrote %d entries into the durable dir, want 0", len(entries))
+	}
+	if got, want := durableArchiveDir(actorUID), kata.DurableMergedDir(actorUID); got != want {
+		t.Errorf("durableArchiveDir = %q, want %q", got, want)
+	}
+}
+
+// TestLandDurableVolumesTarfsFallsBackToExtract covers a node that has the
+// setting on but cannot index: the actor's data is not in question, only this
+// node's ability to serve it that way, so the restore has to produce the tree
+// the node would have produced with the setting off — and leave nothing behind
+// that would make the next stage think otherwise.
+func TestLandDurableVolumesTarfsFallsBackToExtract(t *testing.T) {
+	useTempActorsDir(t)
+	t.Setenv(tarutil.LandingEnvVar, string(tarutil.LandingTarfs))
+	// No mkfs.erofs, so CreateTarIndex cannot run. losetup goes with it, which
+	// is fine: there is nothing bound to release.
+	t.Setenv("PATH", t.TempDir())
+	const actorUID = "actor-tarfs-fallback"
+
+	checkpointDir := t.TempDir()
+	if err := archiveDurableVolumes(t.Context(), durableFixture(t), checkpointDir); err != nil {
+		t.Fatalf("archiveDurableVolumes: %v", err)
+	}
+	dst := t.TempDir()
+	if err := landDurableVolumes(t.Context(), dst, checkpointDir, actorUID); err != nil {
+		t.Fatalf("landDurableVolumes: %v", err)
+	}
+	checkVolumes(t, dst)
+	if got := durableLowerKind(actorUID); got != durableLowerNone {
+		t.Errorf("the fallback left the actor on %s, want %s", got, durableLowerNone)
+	}
+	// The adopted tar in particular: left behind it is a second full copy of
+	// the actor's data that nothing would ever reclaim before teardown.
+	for _, p := range []string{durableTarPath(actorUID), durableIndexPath(actorUID)} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("%q survived the fallback (err = %v)", p, err)
+		}
+	}
 }

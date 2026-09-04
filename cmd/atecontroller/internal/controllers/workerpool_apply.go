@@ -208,25 +208,47 @@ func buildDeploymentApplyConfig(wp *atev1alpha1.WorkerPool, otel ateomOTelSettin
 const ateomArchiveFormatEnv = "ATEOM_ARCHIVE_FORMAT"
 
 // ateomArchiveFormatErofs is the one value of ateomArchiveFormatEnv that costs
-// the worker an extra device; see erofsNeedsLoopDevice.
+// the worker an extra device; see loopDevicesNeeded.
 const ateomArchiveFormatErofs = "erofs"
 
-// erofsNeedsLoopDevice reports whether the archive format this controller
-// propagates makes its micro-VM workers need a loop device.
+// ateomDurableLandingEnv selects what ateom does with a durable-dir tar on
+// restore: unpack it, or index it and mount it. Forwarded onto every worker for
+// the same reason ateomArchiveFormatEnv is, though its blast radius is smaller
+// — a landing mode changes nothing about the bytes in the snapshot store, so it
+// binds only the node that reads them.
+const ateomDurableLandingEnv = "ATEOM_DURABLE_LANDING"
+
+// ateomDurableLandingTarfs is the one value of ateomDurableLandingEnv that
+// costs the worker devices; see loopDevicesNeeded.
+const ateomDurableLandingTarfs = "tarfs"
+
+// loopDevicesNeeded reports how many loop devices the durable-dir arrangement
+// this controller propagates makes its micro-VM workers need.
 //
-// Serving a durable dir from an erofs image means loop-mounting that image in
-// the worker, and a loop device is a block device: the worker's device cgroup
+// Serving a durable dir from an erofs lower means loop-mounting it in the
+// worker, and a loop device is a block device: the worker's device cgroup
 // denies opening one whatever capabilities it holds, because the allow-list is
 // not something a container can widen from inside. The grant comes the same way
 // /dev/kvm does — atelet advertises the node's loop devices and kubelet writes
-// the allow rule for the one it reserves — so the worker stays unprivileged.
+// the allow rule for the ones it reserves — so the worker stays unprivileged.
 //
-// The request is conditional because the grant is not free: loop devices are a
-// small fixed pool per node (max_loop, commonly 8), so a pool that asks for one
-// it never uses caps how many other workers the node can take. A deployment
-// that leaves ATEOM_ARCHIVE_FORMAT unset requests nothing.
-func erofsNeedsLoopDevice() bool {
-	return os.Getenv(ateomArchiveFormatEnv) == ateomArchiveFormatErofs
+// An image is one file and needs one device. tarfs needs two, because the index
+// and the tar it addresses are separate files and erofs takes the data as a
+// second device. A worker configured for both still needs only two: an
+// activation lands one arrangement or the other, never both at once.
+//
+// The count matters as much as the yes-or-no. Loop devices are a small fixed
+// pool per node (max_loop, commonly 8), so this number divides into how many
+// micro-VM workers a node can hold: eight for the image, four for tarfs. A
+// deployment that sets neither variable requests nothing and is not capped.
+func loopDevicesNeeded() int64 {
+	if os.Getenv(ateomDurableLandingEnv) == ateomDurableLandingTarfs {
+		return 2
+	}
+	if os.Getenv(ateomArchiveFormatEnv) == ateomArchiveFormatErofs {
+		return 1
+	}
+	return 0
 }
 
 // ateomContainerEnv adds the OTLP endpoint and resource identity only when
@@ -238,8 +260,10 @@ func ateomContainerEnv(otel ateomOTelSettings) []*corev1ac.EnvVarApplyConfigurat
 	}
 	// Only propagated when set, so a default deployment adds no env to worker
 	// pods and every node keeps writing tars.
-	if v := os.Getenv(ateomArchiveFormatEnv); v != "" {
-		envs = append(envs, corev1ac.EnvVar().WithName(ateomArchiveFormatEnv).WithValue(v))
+	for _, name := range []string{ateomArchiveFormatEnv, ateomDurableLandingEnv} {
+		if v := os.Getenv(name); v != "" {
+			envs = append(envs, corev1ac.EnvVar().WithName(name).WithValue(v))
+		}
 	}
 	if otel.Endpoint == "" {
 		return envs
@@ -381,16 +405,17 @@ func maybeApplyMicroVMPodShape(
 	//
 	// atelet advertises it only on nodes where the device exists, so the
 	// request also keeps the pod off nodes that cannot run a micro-VM.
-	addDeviceResourceLimits(containerAC, deviceplugin.ResourceKVM)
+	addDeviceResourceLimits(containerAC, 1, deviceplugin.ResourceKVM)
 
-	// Serving a durable dir from an erofs image loop-mounts it, and a loop
+	// Serving a durable dir from an erofs lower loop-mounts it, and a loop
 	// device is a block device the worker's cgroup denies just as firmly as
 	// /dev/kvm — so it arrives the same way rather than by making the pod
-	// privileged. Only under the opt-in: the node's loop devices are a small
-	// fixed pool, so requesting one a pool will never mount would shrink how
-	// many workers the node can hold (see erofsNeedsLoopDevice).
-	if erofsNeedsLoopDevice() {
-		addDeviceResourceLimits(containerAC, deviceplugin.ResourceLoop)
+	// privileged. Only under the opt-in, and only as many as the arrangement
+	// mounts: the node's loop devices are a small fixed pool, so every one
+	// requested shrinks how many workers the node can hold (see
+	// loopDevicesNeeded).
+	if n := loopDevicesNeeded(); n > 0 {
+		addDeviceResourceLimits(containerAC, n, deviceplugin.ResourceLoop)
 	}
 
 	// The runtime also opens /dev/net/tun to build the guest's tap, but that
@@ -526,9 +551,9 @@ func templateRequestsGPU(tmpl *atev1alpha1.WorkerPoolPodTemplate) bool {
 	return false
 }
 
-// addDeviceResourceLimits requests one unit of each named extended resource,
+// addDeviceResourceLimits requests qty units of each named extended resource,
 // merging into whatever limits the pod template already set.
-func addDeviceResourceLimits(containerAC *corev1ac.ContainerApplyConfiguration, resourceNames ...string) {
+func addDeviceResourceLimits(containerAC *corev1ac.ContainerApplyConfiguration, qty int64, resourceNames ...string) {
 	if containerAC.Resources == nil {
 		containerAC.WithResources(corev1ac.ResourceRequirements())
 	}
@@ -537,7 +562,7 @@ func addDeviceResourceLimits(containerAC *corev1ac.ContainerApplyConfiguration, 
 		limits = *containerAC.Resources.Limits
 	}
 	for _, name := range resourceNames {
-		limits[corev1.ResourceName(name)] = resource.MustParse("1")
+		limits[corev1.ResourceName(name)] = *resource.NewQuantity(qty, resource.DecimalSI)
 	}
 	containerAC.Resources.WithLimits(limits)
 }

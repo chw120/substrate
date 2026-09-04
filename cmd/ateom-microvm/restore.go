@@ -143,7 +143,7 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	var land time.Duration
 	if hasDurableVolumes(p.containers) {
 		tLand := time.Now()
-		if err := landDurableVolumes(durableDir, restoreDir, p.actorUID); err != nil {
+		if err := landDurableVolumes(ctx, durableDir, restoreDir, p.actorUID); err != nil {
 			return nil, err
 		}
 		land = time.Since(tLand)

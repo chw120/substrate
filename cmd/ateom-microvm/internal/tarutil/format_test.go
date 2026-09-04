@@ -107,6 +107,32 @@ func TestPreflight(t *testing.T) {
 			t.Errorf("Preflight() = %v, want nil", err)
 		}
 	})
+
+	// The landing mode is checked independently of the write format: a node
+	// that mounts tars still writes them, so it opts into one and not the other.
+	t.Run("tarfs without the tools is refused", func(t *testing.T) {
+		t.Setenv(FormatEnvVar, "")
+		t.Setenv(LandingEnvVar, string(LandingTarfs))
+		t.Setenv("PATH", t.TempDir())
+		err := Preflight(t.Context())
+		if err == nil {
+			t.Fatal("Preflight() = nil, want an error; the opt-in must not start on a node that cannot honor it")
+		}
+		for _, want := range []string{LandingEnvVar, mkfsErofs, "erofs-utils"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("Preflight() error %q does not mention %q", err, want)
+			}
+		}
+	})
+
+	t.Run("tarfs round trip", func(t *testing.T) {
+		requireTarfs(t)
+		t.Setenv(FormatEnvVar, "")
+		t.Setenv(LandingEnvVar, string(LandingTarfs))
+		if err := Preflight(t.Context()); err != nil {
+			t.Errorf("Preflight() = %v, want nil", err)
+		}
+	})
 }
 
 func TestSniff(t *testing.T) {
@@ -627,4 +653,195 @@ func withLoopGlob(t *testing.T, pattern string) {
 	prev := loopDeviceGlob
 	loopDeviceGlob = pattern
 	t.Cleanup(func() { loopDeviceGlob = prev })
+}
+
+func TestLanding(t *testing.T) {
+	tests := []struct {
+		env  string
+		want LandingMode
+	}{
+		{env: "", want: LandingExtract},
+		{env: "extract", want: LandingExtract},
+		{env: "tarfs", want: LandingTarfs},
+		{env: "TARFS", want: LandingTarfs},
+		{env: "  tarfs  ", want: LandingTarfs},
+		// Unrecognized falls back for the reason WriteFormat does: a typo must
+		// leave the node on the behavior it had before the setting existed.
+		{env: "erofs", want: LandingExtract},
+		{env: "tar fs", want: LandingExtract},
+	}
+	for _, tc := range tests {
+		t.Run("env="+tc.env, func(t *testing.T) {
+			t.Setenv(LandingEnvVar, tc.env)
+			if got := Landing(); got != tc.want {
+				t.Errorf("Landing() with %s=%q = %q, want %q", LandingEnvVar, tc.env, got, tc.want)
+			}
+		})
+	}
+}
+
+// requireTarfs skips unless this host can build a tarfs index and mount the
+// pair — which needs erofs-utils new enough for --tar=i, a kernel that will
+// mount a 512-byte-block erofs, and two loop devices.
+func requireTarfs(t *testing.T) {
+	t.Helper()
+	requireErofs(t)
+
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "probe"), []byte("probe"), 0o600); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	dir := t.TempDir()
+	tarPath, idxPath := filepath.Join(dir, "probe.tar"), filepath.Join(dir, "probe.idx")
+	if err := Create(t.Context(), tarPath, src); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	if err := CreateTarIndex(t.Context(), idxPath, tarPath); err != nil {
+		t.Skipf("cannot build a tarfs index here (erofs-utils 1.6 or newer): %v", err)
+	}
+	mnt := t.TempDir()
+	if err := MountTarfs(t.Context(), idxPath, tarPath, mnt); err != nil {
+		t.Skipf("cannot mount tarfs here (Linux 6.4 or newer, two loop devices): %v", err)
+	}
+	UnmountTarfs(t.Context(), mnt, tarPath)
+}
+
+// TestTarfsFidelity is TestImageFidelity's gate for the landing mode: the
+// index carries the metadata and the tar carries the bytes, so a mount that
+// dropped either would hand the actor a tree that looks right and reads wrong.
+func TestTarfsFidelity(t *testing.T) {
+	requireTarfs(t)
+	src, mtime := fidelityTree(t)
+
+	dir := t.TempDir()
+	tarPath := filepath.Join(dir, "durable-dir.tar")
+	if err := Create(t.Context(), tarPath, src); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	idxPath := filepath.Join(dir, "durable-dir.erofs.idx")
+	if err := CreateTarIndex(t.Context(), idxPath, tarPath); err != nil {
+		t.Fatalf("CreateTarIndex: %v", err)
+	}
+	// The index is metadata only. It has to stay small however big the tar
+	// gets, because that — not the mount — is the whole reason to build one.
+	idx, err := os.Stat(idxPath)
+	if err != nil {
+		t.Fatalf("stat index: %v", err)
+	}
+	tar, err := os.Stat(tarPath)
+	if err != nil {
+		t.Fatalf("stat tar: %v", err)
+	}
+	if idx.Size() >= tar.Size() {
+		t.Errorf("index is %d bytes over a %d-byte tar: it is holding data, not just metadata",
+			idx.Size(), tar.Size())
+	}
+
+	mnt := t.TempDir()
+	if err := MountTarfs(t.Context(), idxPath, tarPath, mnt); err != nil {
+		t.Fatalf("MountTarfs: %v", err)
+	}
+	t.Cleanup(func() { UnmountTarfs(t.Context(), mnt, tarPath) })
+
+	checkFidelity(t, mnt, mtime)
+}
+
+// TestCreateTarIndexOverwrites is TestCreateImageOverwrites' case for the
+// index: mkfs.erofs appends rather than truncates, so a second restore over
+// the first one's index would mount something that is not the actor's tree.
+func TestCreateTarIndexOverwrites(t *testing.T) {
+	requireTarfs(t)
+	dir := t.TempDir()
+	idxPath := filepath.Join(dir, "durable-dir.erofs.idx")
+
+	first := t.TempDir()
+	if err := os.WriteFile(filepath.Join(first, "big"), bytes.Repeat([]byte("x"), 1<<20), 0o644); err != nil {
+		t.Fatalf("writing first fixture: %v", err)
+	}
+	firstTar := filepath.Join(dir, "first.tar")
+	if err := Create(t.Context(), firstTar, first); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := CreateTarIndex(t.Context(), idxPath, firstTar); err != nil {
+		t.Fatalf("first CreateTarIndex: %v", err)
+	}
+
+	second := t.TempDir()
+	if err := os.WriteFile(filepath.Join(second, "small"), []byte("2"), 0o644); err != nil {
+		t.Fatalf("writing second fixture: %v", err)
+	}
+	secondTar := filepath.Join(dir, "second.tar")
+	if err := Create(t.Context(), secondTar, second); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := CreateTarIndex(t.Context(), idxPath, secondTar); err != nil {
+		t.Fatalf("second CreateTarIndex: %v", err)
+	}
+
+	mnt := t.TempDir()
+	if err := MountTarfs(t.Context(), idxPath, secondTar, mnt); err != nil {
+		t.Fatalf("MountTarfs after overwrite: %v", err)
+	}
+	t.Cleanup(func() { UnmountTarfs(t.Context(), mnt, secondTar) })
+	if _, err := os.Lstat(filepath.Join(mnt, "big")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the first index's contents survived the second CreateTarIndex (err = %v)", err)
+	}
+	if _, err := os.Lstat(filepath.Join(mnt, "small")); err != nil {
+		t.Errorf("the second index's contents are missing: %v", err)
+	}
+}
+
+// TestUnmountTarfsReleasesBothLoopDevices is the leak test, and the data
+// device is the half that matters: mount(8) gives the index device
+// LO_FLAGS_AUTOCLEAR, but nothing gives the tar's device one, so without the
+// explicit release every resume would strand a device the whole node shares.
+func TestUnmountTarfsReleasesBothLoopDevices(t *testing.T) {
+	requireTarfs(t)
+	dir := t.TempDir()
+	tarPath, idxPath := filepath.Join(dir, "durable-dir.tar"), filepath.Join(dir, "durable-dir.erofs.idx")
+	if err := Create(t.Context(), tarPath, t.TempDir()); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := CreateTarIndex(t.Context(), idxPath, tarPath); err != nil {
+		t.Fatalf("CreateTarIndex: %v", err)
+	}
+	mnt := t.TempDir()
+	if err := MountTarfs(t.Context(), idxPath, tarPath, mnt); err != nil {
+		t.Fatalf("MountTarfs: %v", err)
+	}
+	UnmountTarfs(t.Context(), mnt, tarPath)
+
+	for _, p := range []string{tarPath, idxPath} {
+		attached, err := loopDeviceFor(p)
+		if err != nil {
+			t.Skipf("cannot enumerate loop devices: %v", err)
+		}
+		if attached != "" {
+			t.Errorf("loop device %s is still backed by %s after UnmountTarfs", attached, p)
+		}
+	}
+}
+
+// A worker granted fewer than two loop devices must say so and name the
+// resource, for the reason MountImage does: the bare mount(8) failure reads as
+// a broken index or an erofs-less kernel, when the pod simply did not ask for
+// enough devices.
+func TestMountTarfsWithoutTwoGrantsNamesTheResource(t *testing.T) {
+	dev := t.TempDir()
+	// One device, which is what an ATEOM_ARCHIVE_FORMAT=erofs pod is granted:
+	// the closest wrong configuration, and the one an operator flipping the
+	// landing mode without redeploying the pool would land on.
+	if err := os.WriteFile(filepath.Join(dev, "loop0"), nil, 0o600); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	withLoopGlob(t, filepath.Join(dev, "loop[0-9]*"))
+
+	dir := t.TempDir()
+	err := MountTarfs(t.Context(), filepath.Join(dir, "idx"), filepath.Join(dir, "tar"), filepath.Join(dir, "mnt"))
+	if err == nil {
+		t.Fatal("MountTarfs with one granted loop device = nil error, want failure")
+	}
+	if !strings.Contains(err.Error(), deviceplugin.ResourceLoop) {
+		t.Errorf("error does not name %s: %v", deviceplugin.ResourceLoop, err)
+	}
 }

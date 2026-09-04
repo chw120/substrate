@@ -428,32 +428,42 @@ func TestAteomSecurityContextByClass(t *testing.T) {
 	}
 }
 
-// TestErofsRequestsLoopDeviceNotPrivilege pins how the erofs durable-dir opt-in
-// pays for its block device: with a device grant, never with privilege. The
-// request is conditional because the node's loop pool is small — a pool that
-// asks for one it will not mount takes capacity from the workers that would.
+// TestErofsRequestsLoopDeviceNotPrivilege pins how the durable-dir opt-ins pay
+// for their block devices: with a device grant, never with privilege. The
+// request is conditional, and its size matters, because the node's loop pool is
+// small — a pool that asks for a device it will not mount takes capacity from
+// the workers that would, and tarfs mounts a pair.
 func TestErofsRequestsLoopDeviceNotPrivilege(t *testing.T) {
 	tests := []struct {
+		name     string
 		format   string
-		wantLoop bool
+		landing  string
+		wantLoop string
 	}{
-		{format: "", wantLoop: false},
-		{format: "tar", wantLoop: false},
-		{format: "erofs", wantLoop: true},
+		{name: "default"},
+		{name: "tar", format: "tar"},
+		{name: "erofs", format: "erofs", wantLoop: "1"},
+		{name: "tarfs", landing: "tarfs", wantLoop: "2"},
+		// Writing images and mounting tars are independent opt-ins, and a node
+		// with both on still mounts only one lower at a time — the larger of
+		// the two grants covers either.
+		{name: "erofs and tarfs", format: "erofs", landing: "tarfs", wantLoop: "2"},
+		{name: "unrecognized landing", landing: "squashfs"},
 	}
 	for _, tt := range tests {
-		t.Run("format="+tt.format, func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv(ateomArchiveFormatEnv, tt.format)
+			t.Setenv(ateomDurableLandingEnv, tt.landing)
 			wp := testWorkerPoolApplyConfig(nil)
 			wp.Spec.SandboxClass = atev1alpha1.SandboxClassMicroVM
 			ps := buildDeploymentApplyConfig(wp, ateomOTelSettings{}).Spec.Template.Spec
 
 			qty, ok := deviceLimit(ps.Containers[0], deviceplugin.ResourceLoop)
-			if ok != tt.wantLoop {
-				t.Errorf("%s requested = %v, want %v", deviceplugin.ResourceLoop, ok, tt.wantLoop)
+			if ok != (tt.wantLoop != "") {
+				t.Errorf("%s requested = %v, want %v", deviceplugin.ResourceLoop, ok, tt.wantLoop != "")
 			}
-			if ok && qty != "1" {
-				t.Errorf("%s limit = %q, want 1", deviceplugin.ResourceLoop, qty)
+			if ok && qty != tt.wantLoop {
+				t.Errorf("%s limit = %q, want %q", deviceplugin.ResourceLoop, qty, tt.wantLoop)
 			}
 			// The whole point of the grant: whatever the format, the worker
 			// stays unprivileged.
@@ -979,46 +989,54 @@ func expectedDeploymentApplyConfig(mutatePodSpec func(*corev1ac.PodSpecApplyConf
 				WithSpec(podSpecAC)))
 }
 
-// TestAteomContainerEnvArchiveFormat covers the opt-in reaching worker pods.
-// The env var is the only way to turn the erofs durable-dir format on, and
-// nothing else in the pod spec is operator-settable, so without this
-// pass-through the feature is unreachable in a real deployment.
-func TestAteomContainerEnvArchiveFormat(t *testing.T) {
-	find := func(envs []*corev1ac.EnvVarApplyConfiguration) *corev1ac.EnvVarApplyConfiguration {
+// TestAteomContainerEnvDurableDirOptIns covers the opt-ins reaching worker
+// pods. These env vars are the only way to turn the erofs durable-dir format
+// or the tarfs landing mode on, and nothing else in the pod spec is
+// operator-settable, so without this pass-through both are unreachable in a
+// real deployment.
+func TestAteomContainerEnvDurableDirOptIns(t *testing.T) {
+	find := func(envs []*corev1ac.EnvVarApplyConfiguration, name string) *corev1ac.EnvVarApplyConfiguration {
 		for _, e := range envs {
-			if e.Name != nil && *e.Name == ateomArchiveFormatEnv {
+			if e.Name != nil && *e.Name == name {
 				return e
 			}
 		}
 		return nil
 	}
 
-	// Unset on the controller must mean absent on the pod: a default install
-	// keeps every worker on tar.
-	t.Run("absent by default", func(t *testing.T) {
-		t.Setenv(ateomArchiveFormatEnv, "")
-		if got := find(ateomContainerEnv(ateomOTelSettings{})); got != nil {
-			t.Errorf("%s is set on the pod with nothing set on the controller", ateomArchiveFormatEnv)
-		}
-	})
-
-	// Forwarded whether or not telemetry is configured: ateomContainerEnv
-	// returns early when there is no OTLP endpoint.
-	for _, tc := range []struct {
-		name string
-		otel ateomOTelSettings
-	}{
-		{name: "without telemetry"},
-		{name: "with telemetry", otel: ateomOTelSettings{Endpoint: "http://collector:4317"}},
+	for _, v := range []struct{ name, value string }{
+		{ateomArchiveFormatEnv, "erofs"},
+		{ateomDurableLandingEnv, ateomDurableLandingTarfs},
 	} {
-		t.Run("forwarded "+tc.name, func(t *testing.T) {
-			t.Setenv(ateomArchiveFormatEnv, "erofs")
-			got := find(ateomContainerEnv(tc.otel))
-			if got == nil {
-				t.Fatalf("%s is not on the pod", ateomArchiveFormatEnv)
-			}
-			if got.Value == nil || *got.Value != "erofs" {
-				t.Errorf("%s = %v, want %q", ateomArchiveFormatEnv, got.Value, "erofs")
+		t.Run(v.name, func(t *testing.T) {
+			// Unset on the controller must mean absent on the pod: a default
+			// install keeps every worker writing and unpacking tars.
+			t.Run("absent by default", func(t *testing.T) {
+				t.Setenv(v.name, "")
+				if got := find(ateomContainerEnv(ateomOTelSettings{}), v.name); got != nil {
+					t.Errorf("%s is set on the pod with nothing set on the controller", v.name)
+				}
+			})
+
+			// Forwarded whether or not telemetry is configured:
+			// ateomContainerEnv returns early when there is no OTLP endpoint.
+			for _, tc := range []struct {
+				name string
+				otel ateomOTelSettings
+			}{
+				{name: "without telemetry"},
+				{name: "with telemetry", otel: ateomOTelSettings{Endpoint: "http://collector:4317"}},
+			} {
+				t.Run("forwarded "+tc.name, func(t *testing.T) {
+					t.Setenv(v.name, v.value)
+					got := find(ateomContainerEnv(tc.otel), v.name)
+					if got == nil {
+						t.Fatalf("%s is not on the pod", v.name)
+					}
+					if got.Value == nil || *got.Value != v.value {
+						t.Errorf("%s = %v, want %q", v.name, got.Value, v.value)
+					}
+				})
 			}
 		})
 	}

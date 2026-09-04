@@ -350,7 +350,7 @@ func (s *AteomService) teardownActor(ctx context.Context, id string, ra *running
 	// ordering reason: the sweep above dropped the mounts that were using them.
 	// Their absence is what puts the next activation back on the plain-directory
 	// path until a restore lands another image.
-	reset, err := resetDurableOverlayState(id)
+	reset, err := resetDurableOverlayState(ctx, id)
 	if err != nil {
 		slog.WarnContext(ctx, "Failed to remove durable-dir overlay state", slog.String("actorUID", id), slog.Any("err", err))
 	}

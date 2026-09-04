@@ -57,10 +57,12 @@ const (
 	// ResourceKVM grants /dev/kvm, which the micro-VM runtime needs to create a
 	// VM (cloud-hypervisor fails with EPERM on VmCreate without it).
 	ResourceKVM = "ate.dev/kvm"
-	// ResourceLoop grants one loop device, which a micro-VM worker needs to
-	// mount a durable-dir erofs image. Unlike /dev/kvm this is an exclusive
+	// ResourceLoop grants loop devices, which a micro-VM worker needs to mount
+	// a durable-dir erofs lower: one for an image, two for a tarfs pair (an
+	// index device and a data device). Unlike /dev/kvm this is an exclusive
 	// grant: a loop device backs exactly one file, so two workers handed the
-	// same one would fight over it.
+	// same one would fight over it, and a worker asking for several gets
+	// several distinct devices.
 	ResourceLoop = "ate.dev/loop"
 )
 

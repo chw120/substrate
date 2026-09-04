@@ -135,6 +135,14 @@ func WriteFormat() Format {
 // in which every node has PROVEN it can mount an image with xattrs intact,
 // which is what makes the read side safe without any capability reporting.
 func Preflight(ctx context.Context) error {
+	if err := preflightErofsFormat(ctx); err != nil {
+		return err
+	}
+	return preflightTarfsLanding(ctx)
+}
+
+// preflightErofsFormat is the FormatErofs half of Preflight.
+func preflightErofsFormat(ctx context.Context) error {
 	if WriteFormat() != FormatErofs {
 		return nil
 	}
@@ -451,4 +459,307 @@ func UnmountImage(mountpoint string) {
 	if err := reaper.Run(exec.Command("umount", mountpoint)); err != nil {
 		_ = reaper.Run(exec.Command("umount", "-l", mountpoint))
 	}
+}
+
+// Landing modes.
+//
+// FormatErofs above changes what a suspend WRITES, and everything awkward about
+// it follows from that: the bytes in the snapshot store are a different file
+// format, so every node that might restore the actor has to be able to read
+// one, the read side has to Sniff which of the two it was handed, and clearing
+// the setting does not undo anything already written — the images drain only
+// once each affected actor has been suspended again.
+//
+// A landing mode changes what a restore DOES with a tar. The archive stays a
+// tar, byte for byte, so none of that applies: the setting is a property of one
+// node, its effect ends when that node's actors are gone, and turning it off
+// takes effect on the next restore with nothing to migrate. It is the same
+// trade in the other direction — LandingTarfs buys the mount-instead-of-unpack
+// restore that FormatErofs buys, without changing the wire format — and it is
+// therefore the safer of the two to roll out, at the cost of a second loop
+// device per worker.
+//
+// The two are independent and may both be on. A node writing images and landing
+// tars via tarfs simply exercises both paths, since Sniff still decides which
+// arrangement an incoming archive gets.
+
+// LandingMode decides what a restore does with a durable-dir tar.
+type LandingMode string
+
+const (
+	// LandingExtract is the default: Extract writes the tree out file by file.
+	LandingExtract LandingMode = "extract"
+	// LandingTarfs builds a metadata-only erofs index over the tar and mounts
+	// the pair, with the tar as the data device and a writable overlay on top.
+	// Landing stops scaling with the actor's data.
+	LandingTarfs LandingMode = "tarfs"
+)
+
+// LandingEnvVar selects the landing mode. Anything unrecognized — including
+// unset — means LandingExtract, so no node changes behavior without an explicit
+// opt-in.
+const LandingEnvVar = "ATEOM_DURABLE_LANDING"
+
+// Landing reports how this node should land a durable-dir tar.
+//
+// Read from the environment on every call, for the reason WriteFormat gives.
+func Landing() LandingMode {
+	if LandingMode(strings.ToLower(strings.TrimSpace(os.Getenv(LandingEnvVar)))) == LandingTarfs {
+		return LandingTarfs
+	}
+	return LandingExtract
+}
+
+// tarfsBlockSize is the only block size a tarfs index can use, and it is a
+// constraint of the layout rather than a tuning knob: the index addresses file
+// data at its offset inside the tar, and tar members are aligned to 512 bytes.
+// A 512-byte erofs block needs Linux 6.4 or newer, which is where the kernel
+// stopped assuming the block size was the page size.
+const tarfsBlockSize = "512"
+
+// CreateTarIndex writes a metadata-only erofs index for tarPath at indexPath.
+//
+// The index holds no file data: each inode addresses its bytes where they
+// already are, inside the tar, so mounting it requires the tar alongside as a
+// data device. That is what makes this cheap — a few kilobytes and a few
+// milliseconds for a gibibyte of tar, because nothing is copied.
+//
+// The tar must be one Create wrote, or equivalent: mkfs.erofs reads the member
+// headers to build the inodes, so a compressed or otherwise wrapped stream will
+// not do.
+func CreateTarIndex(ctx context.Context, indexPath, tarPath string) error {
+	// mkfs.erofs appends to, rather than truncates, a file that is already
+	// there, so a re-run over a previous index would produce a corrupt one.
+	if err := os.Remove(indexPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("clearing stale tarfs index %q: %w", indexPath, err)
+	}
+	// No force-inode-extended, unlike CreateImage: tar mode already writes
+	// extended inodes, so mtimes and 32-bit ids survive without it (measured —
+	// the flag changes neither the metadata read back nor the index size).
+	cmd := exec.CommandContext(ctx, mkfsErofs, "--tar=i", "-b", tarfsBlockSize, indexPath, tarPath)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := reaper.Run(cmd); err != nil {
+		return fmt.Errorf("building tarfs index %q over %q: %w (%s)", indexPath, tarPath, err, strings.TrimSpace(stderr.String()))
+	}
+	// No fsync, unlike CreateImage. That one syncs because atelet uploads the
+	// image the moment it returns; this index is never uploaded and never
+	// leaves the node — it is read back through a loop device on this same
+	// host, which the page cache serves whether or not it reached the platter.
+	//
+	// Nor is there a socket-exclusion pass. The input is a tar, and Create
+	// already dropped the sockets when it wrote it.
+	return nil
+}
+
+// MountTarfs mounts the tarfs pair read-only at mountpoint: indexPath supplies
+// the metadata, tarPath the data. The caller owns UnmountTarfs.
+//
+// Two loop devices, and they are set up differently on purpose. The index is
+// the mounted device, so mount(8) can attach it via -o loop=<dev> and thereby
+// keep LO_FLAGS_AUTOCLEAR on it — that binding is released with the mount even
+// if this process dies. The tar is not the mounted device; mount(8) will not
+// attach it for us, so we do it ourselves, and a loop device attached that way
+// has no autoclear. UnmountTarfs is what releases it, and CleanupSandboxState
+// is the backstop, because a leaked loop device is a cost to the whole node
+// rather than to this actor: the pool is max_loop, commonly 8.
+func MountTarfs(ctx context.Context, indexPath, tarPath, mountpoint string) error {
+	if err := os.MkdirAll(mountpoint, 0o755); err != nil {
+		return fmt.Errorf("creating tarfs mountpoint %q: %w", mountpoint, err)
+	}
+	devs, err := GrantedLoopDevices()
+	if err != nil {
+		return err
+	}
+	if len(devs) < 2 {
+		return fmt.Errorf("mounting tarfs %q at %q: this worker's /dev holds %d loop device(s) and tarfs needs 2, one for the index and one for the tar (the pod needs a %s request of 2)",
+			indexPath, mountpoint, len(devs), deviceplugin.ResourceLoop)
+	}
+
+	var errs []error
+	for i, dataDev := range devs {
+		if err := attachLoop(ctx, dataDev, tarPath); err != nil {
+			errs = append(errs, fmt.Errorf("attaching %q to %s: %w", tarPath, dataDev, err))
+			continue
+		}
+		for j, indexDev := range devs {
+			if j == i {
+				continue
+			}
+			cmd := exec.CommandContext(ctx, "mount", "-t", "erofs",
+				"-o", "ro,loop="+indexDev+",device="+dataDev, indexPath, mountpoint)
+			var stderr strings.Builder
+			cmd.Stderr = &stderr
+			if err := reaper.Run(cmd); err != nil {
+				errs = append(errs, fmt.Errorf("index on %s over data on %s: %w (%s)", indexDev, dataDev, err, strings.TrimSpace(stderr.String())))
+				continue
+			}
+			return nil
+		}
+		// No index device worked against this data device, so it is ours to
+		// release before trying the next one.
+		detachLoop(ctx, dataDev)
+	}
+	return fmt.Errorf("mounting tarfs %q at %q: %w", indexPath, mountpoint, errors.Join(errs...))
+}
+
+// UnmountTarfs drops a MountTarfs mount and releases the loop device holding
+// the tar. Best-effort, like the rest of teardown.
+//
+// The tar's device is found by asking losetup what is bound to the file rather
+// than by remembering what MountTarfs chose: teardown also runs after a crash,
+// or in a process that never did the mount, and the binding is the only record
+// that survives either.
+func UnmountTarfs(ctx context.Context, mountpoint, tarPath string) {
+	if err := reaper.Run(exec.Command("umount", mountpoint)); err != nil {
+		_ = reaper.Run(exec.Command("umount", "-l", mountpoint))
+	}
+	ReleaseLoopDevices(ctx, tarPath)
+}
+
+// ReleaseLoopDevices unbinds every loop device currently backed by path.
+//
+// Teardown calls this before deleting the file, and so does the reset at the
+// start of an activation: a binding left by a crashed predecessor would
+// otherwise hold the inode alive after the unlink, so the disk would not come
+// back and the device would stay spent for the whole node.
+//
+// Best-effort and quiet about a device that is still busy. losetup turns that
+// case into a deferred detach — the binding drops when the last user closes it
+// — which is the outcome we want anyway.
+func ReleaseLoopDevices(ctx context.Context, path string) {
+	// Detached from the caller's cancellation. This runs on teardown paths
+	// whose context is often already done, and skipping it there would leak a
+	// device the whole node shares rather than merely abandoning this actor's
+	// work. The commands are two losetup invocations, so there is nothing to
+	// bound. The context is kept for its values, which is what the logging
+	// below reads.
+	ctx = context.WithoutCancel(ctx)
+	devs, err := loopDevicesBackedBy(ctx, path)
+	if err != nil {
+		slog.WarnContext(ctx, "Could not look up the loop devices backing a file",
+			slog.String("path", path), slog.Any("err", err))
+		return
+	}
+	for _, dev := range devs {
+		detachLoop(ctx, dev)
+	}
+}
+
+// attachLoop binds dev to path. The device must be one kubelet granted this
+// worker: /dev/loop-control is not open to an unprivileged pod, so there is no
+// asking the kernel for a free one.
+func attachLoop(ctx context.Context, dev, path string) error {
+	cmd := exec.CommandContext(ctx, "losetup", dev, path)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := reaper.Run(cmd); err != nil {
+		return fmt.Errorf("%w (%s)", err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+// detachLoop releases dev. Best-effort: a device that was never attached, or
+// was already released by an autoclear, is not a problem to report.
+func detachLoop(ctx context.Context, dev string) {
+	_ = reaper.Run(exec.CommandContext(ctx, "losetup", "-d", dev))
+}
+
+// loopDevicesBackedBy lists the loop devices currently bound to path.
+//
+// It parses `losetup -j`'s default output — "/dev/loopN: [id]:ino (path)", one
+// per line — rather than asking for a single column with -O, which is a newer
+// option than the rest of what this package relies on.
+func loopDevicesBackedBy(ctx context.Context, path string) ([]string, error) {
+	cmd := exec.CommandContext(ctx, "losetup", "-j", path)
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := reaper.Run(cmd); err != nil {
+		return nil, fmt.Errorf("listing loop devices for %q: %w (%s)", path, err, strings.TrimSpace(stderr.String()))
+	}
+	var devs []string
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		dev, _, ok := strings.Cut(strings.TrimSpace(line), ":")
+		if ok && dev != "" {
+			devs = append(devs, dev)
+		}
+	}
+	return devs, nil
+}
+
+// preflightTarfsLanding is the LandingTarfs half of Preflight, and it is a
+// round trip for the reasons Preflight gives — most of all the xattr, since a
+// tarfs lower that dropped trusted.overlay.opaque would silently resurrect
+// directories the guest emptied.
+//
+// It needs no separate version checks for the two things tarfs requires beyond
+// plain erofs — mkfs.erofs new enough for --tar=i, and a kernel that will mount
+// a 512-byte-block image. Each fails this round trip loudly at the step that
+// needs it, which is more reliable than parsing a version out of a
+// /boot/config file a container usually cannot read.
+func preflightTarfsLanding(ctx context.Context) error {
+	if Landing() != LandingTarfs {
+		return nil
+	}
+	if _, err := exec.LookPath(mkfsErofs); err != nil {
+		return fmt.Errorf("%s=%s but %s is not on PATH (the ateom image needs erofs-utils): %w",
+			LandingEnvVar, LandingTarfs, mkfsErofs, err)
+	}
+
+	dir, err := os.MkdirTemp("", "tarfs-preflight-")
+	if err != nil {
+		return fmt.Errorf("tarfs preflight: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(dir) }() // a probe tree; leaking one is not worth failing startup over
+
+	// One level down, not at the root of the probe tree: Create archives a
+	// directory's CONTENTS, so the root itself is never an entry and an xattr
+	// set on it would never reach the tar. The real thing has the same shape —
+	// the durable dir holds one subdirectory per volume — so this is what the
+	// mode has to carry anyway.
+	src := filepath.Join(dir, "src")
+	vol := filepath.Join(src, "vol")
+	if err := os.MkdirAll(vol, 0o755); err != nil {
+		return fmt.Errorf("tarfs preflight: %w", err)
+	}
+	const probeData = "tarfs-preflight"
+	if err := os.WriteFile(filepath.Join(vol, "probe"), []byte(probeData), 0o600); err != nil {
+		return fmt.Errorf("tarfs preflight: %w", err)
+	}
+	if err := unix.Lsetxattr(vol, overlayOpaqueXattr, []byte("y"), 0); err != nil {
+		return fmt.Errorf("tarfs preflight: setting %s on the probe tree: %w", overlayOpaqueXattr, err)
+	}
+
+	tarPath := filepath.Join(dir, "probe.tar")
+	if err := Create(ctx, tarPath, src); err != nil {
+		return fmt.Errorf("tarfs preflight: %w", err)
+	}
+	idxPath := filepath.Join(dir, "probe.erofs.idx")
+	if err := CreateTarIndex(ctx, idxPath, tarPath); err != nil {
+		return fmt.Errorf("tarfs preflight: %w (erofs-utils 1.6 or newer is needed for --tar=i)", err)
+	}
+	mnt := filepath.Join(dir, "mnt")
+	if err := MountTarfs(ctx, idxPath, tarPath, mnt); err != nil {
+		return fmt.Errorf("tarfs preflight: %w (CONFIG_EROFS_FS, a kernel older than 6.4, or fewer than two loop devices granted)", err)
+	}
+	defer UnmountTarfs(ctx, mnt, tarPath)
+
+	got, err := os.ReadFile(filepath.Join(mnt, "vol", "probe"))
+	if err != nil {
+		return fmt.Errorf("tarfs preflight: reading the probe file back: %w", err)
+	}
+	if string(got) != probeData {
+		return fmt.Errorf("tarfs preflight: probe file read back as %q, want %q", got, probeData)
+	}
+	sz, err := unix.Lgetxattr(filepath.Join(mnt, "vol"), overlayOpaqueXattr, make([]byte, 16))
+	if err != nil {
+		return fmt.Errorf("tarfs preflight: reading %s back off the mounted index: %w "+
+			"(CONFIG_EROFS_FS_XATTR is most likely off, which loses overlay whiteouts and silently resurrects deleted files after a resume)",
+			overlayOpaqueXattr, err)
+	}
+	if sz == 0 {
+		return fmt.Errorf("tarfs preflight: %s came back empty off the mounted index (CONFIG_EROFS_FS_XATTR?)", overlayOpaqueXattr)
+	}
+	return nil
 }

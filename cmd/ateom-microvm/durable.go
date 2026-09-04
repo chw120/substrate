@@ -36,12 +36,16 @@ package main
 // archive is complete.
 //
 // The archive is a tar by default and a read-only erofs image when the node
-// sets tarutil.FormatEnvVar. The two differ only in how restore lands them —
-// the tar is unpacked into the host directory above, the image is mounted and
-// given a writable overlay — and the format is detected from the file, not
-// from the setting, so an image and a tar are equally restorable on any node
-// (see tarutil.Sniff). Which of the two is in play at any moment is answered
-// by durableOverlayActive: the presence of the image at durableImagePath.
+// sets tarutil.FormatEnvVar. The format is detected from the file, not from the
+// setting, so an image and a tar are equally restorable on any node (see
+// tarutil.Sniff).
+//
+// There are three ways a restore can land what it was handed. An image is
+// mounted and given a writable overlay. A tar is unpacked into the host
+// directory above — or, on a node that sets tarutil.LandingEnvVar, indexed and
+// mounted like the image, which is the tarfs arrangement. Which one an
+// activation is on is answered by durableLowerKind, from the files the landing
+// left behind.
 
 import (
 	"context"
@@ -111,19 +115,80 @@ func durableImagePath(actorUID string) string {
 	return filepath.Join(ateompath.ActorPath(actorUID), "durable-dir.erofs")
 }
 
+// durableTarPath is where landDurableVolumes parks a tar it is going to serve
+// through tarfs instead of unpacking.
+//
+// It is the mount's data device, so it has to outlive the restore dir it came
+// from for exactly as long as the image does on the other path: a loop device
+// reads from it for the whole activation. Same reasoning as durableImagePath
+// for why it is here and not under VMDir.
+func durableTarPath(actorUID string) string {
+	return filepath.Join(ateompath.ActorPath(actorUID), durableTarFile)
+}
+
+// durableIndexPath is the metadata-only erofs index CreateTarIndex builds over
+// durableTarPath. Kilobytes, purely local, never uploaded.
+func durableIndexPath(actorUID string) string {
+	return filepath.Join(ateompath.ActorPath(actorUID), "durable-dir.erofs.idx")
+}
+
 // durableUpperWorkDirs are the overlay upperdir and workdir that go on top of
-// the image: siblings on real disk, beside the rootfs uppers, for the reasons
+// the lower: siblings on real disk, beside the rootfs uppers, for the reasons
 // kata.UpperWorkDirs and rootfsupper.go record.
 func durableUpperWorkDirs(actorUID string) (upper, work string) {
 	base := ateompath.ActorPath(actorUID)
 	return filepath.Join(base, "durable-upper"), filepath.Join(base, "durable-work")
 }
 
-// durableOverlayActive reports whether this activation serves its durable
-// volumes from an image plus overlay rather than from the plain host directory.
-func durableOverlayActive(actorUID string) bool {
-	_, err := os.Stat(durableImagePath(actorUID))
+// durableLower names what this activation's durable overlay reads through, if
+// it has one at all.
+type durableLower int
+
+const (
+	// durableLowerNone is the plain host directory: no overlay, no lower.
+	durableLowerNone durableLower = iota
+	// durableLowerImage is a read-only erofs image the snapshot arrived as.
+	durableLowerImage
+	// durableLowerTarfs is a tar the snapshot arrived as, mounted through an
+	// erofs index built over it.
+	durableLowerTarfs
+)
+
+// durableLowerKind reports which arrangement landDurableVolumes chose, by
+// looking for the file that arrangement leaves behind. The two are mutually
+// exclusive: a restore lands one or the other, never both, and a fallback
+// clears whichever it had.
+func durableLowerKind(actorUID string) durableLower {
+	if fileExists(durableImagePath(actorUID)) {
+		return durableLowerImage
+	}
+	// The index, not the tar: the tar alone is what a half-finished landing
+	// leaves, and serving that as a lower is impossible. The index exists only
+	// once the pair is ready.
+	if fileExists(durableIndexPath(actorUID)) {
+		return durableLowerTarfs
+	}
+	return durableLowerNone
+}
+
+// fileExists reports whether path is there, treating any stat error as absent:
+// the callers all go on to do something best-effort, and a path they cannot
+// stat is one they cannot act on either.
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
 	return err == nil
+}
+
+// String names the arrangement for logs.
+func (k durableLower) String() string {
+	switch k {
+	case durableLowerImage:
+		return "erofs-image"
+	case durableLowerTarfs:
+		return "tarfs"
+	default:
+		return "none"
+	}
 }
 
 // durableArchiveDir is the directory a checkpoint must archive to capture the
@@ -136,7 +201,7 @@ func durableOverlayActive(actorUID string) bool {
 // therefore writes a full image and stays O(data size) — this path makes
 // restore cheap, not suspend.
 func durableArchiveDir(actorUID string) string {
-	if durableOverlayActive(actorUID) {
+	if durableLowerKind(actorUID) != durableLowerNone {
 		return kata.DurableMergedDir(actorUID)
 	}
 	return ateompath.DurableDirVolumeMountsDir(actorUID)
@@ -144,34 +209,51 @@ func durableArchiveDir(actorUID string) string {
 
 // durableReset is how long each part of resetDurableOverlayState took.
 //
-// Teardown reports it because reclaiming these two trees is the entire cost the
-// image path carries over the plain-directory path: the image stays whole for
+// Teardown reports it because reclaiming these trees is the entire cost an
+// overlay path carries over the plain-directory path: the lower stays whole for
 // the actor's lifetime while the upper accumulates beside it, so a suspend has
-// to free both where a plain directory frees nothing. Which of the two is
+// to free both where a plain directory frees nothing. Which of them is
 // expensive is not something the byte counts predict — freeing one large file
 // and freeing the same bytes as an overlay upper are different work for the
 // filesystem — so they are timed apart.
 type durableReset struct {
 	Image time.Duration
+	Tar   time.Duration
+	Index time.Duration
 	Upper time.Duration
 	Work  time.Duration
 }
 
-// resetDurableOverlayState clears the image and overlay dirs so the actor
+// resetDurableOverlayState clears every lower and overlay dir so the actor
 // starts from the plain-directory arrangement. Called before a cold boot and
-// at the start of every restore, so a previous activation's image can never
-// decide the current one's format, and so the upper is empty when
+// at the start of every restore, so a previous activation's lower can never
+// decide the current one's arrangement, and so the upper is empty when
 // kata.StageDurableOverlay demands it.
 //
+// It clears both arrangements' files unconditionally rather than dispatching on
+// durableLowerKind. An activation only ever has one of them, but the point of
+// this call is to be sure of that, and asking first would trust the very state
+// it is here to discard.
+//
 // The timings are always returned; callers that only need the reset ignore them.
-func resetDurableOverlayState(actorUID string) (durableReset, error) {
+func resetDurableOverlayState(ctx context.Context, actorUID string) (durableReset, error) {
 	upper, work := durableUpperWorkDirs(actorUID)
+	// A tarfs mount holds the tar through a loop device that, unlike the one
+	// mount(8) sets up for the index, carries no autoclear. Unlinking the file
+	// under a live binding frees no disk and spends a device the whole node
+	// shares, so the binding goes first. Skipped unless there is a tar to hold,
+	// which is every activation that is not on the tarfs path.
+	if tarPath := durableTarPath(actorUID); fileExists(tarPath) {
+		tarutil.ReleaseLoopDevices(ctx, tarPath)
+	}
 	var d durableReset
 	for _, e := range []struct {
 		path string
 		into *time.Duration
 	}{
 		{durableImagePath(actorUID), &d.Image},
+		{durableTarPath(actorUID), &d.Tar},
+		{durableIndexPath(actorUID), &d.Index},
 		{upper, &d.Upper},
 		{work, &d.Work},
 	} {
@@ -191,9 +273,15 @@ func resetDurableOverlayState(actorUID string) (durableReset, error) {
 // guest sees the same tree either way.
 func (s *AteomService) stageDurableVolumes(ctx context.Context, actorUID string, containers []*ateompb.Container) error {
 	src := ateompath.DurableDirVolumeMountsDir(actorUID)
-	if durableOverlayActive(actorUID) {
+	if kind := durableLowerKind(actorUID); kind != durableLowerNone {
 		upper, work := durableUpperWorkDirs(actorUID)
-		err := kata.StageDurableOverlay(ctx, durableImagePath(actorUID), actorUID, upper, work)
+		var err error
+		switch kind {
+		case durableLowerImage:
+			err = kata.StageDurableOverlay(ctx, durableImagePath(actorUID), actorUID, upper, work)
+		case durableLowerTarfs:
+			err = kata.StageDurableTarfsOverlay(ctx, durableIndexPath(actorUID), durableTarPath(actorUID), actorUID, upper, work)
+		}
 		if err == nil {
 			// A volume the image predates has no directory in the lower, and
 			// atelet's mkdir went into ITS directory, which this arrangement
@@ -208,24 +296,36 @@ func (s *AteomService) stageDurableVolumes(ctx context.Context, actorUID string,
 			}
 			return nil
 		}
-		// This node cannot mount an image another node wrote: no
-		// CONFIG_EROFS_FS, no CONFIG_EROFS_FS_XATTR, or no free loop device.
-		// The actor's own configuration has no say in that, so refusing here
-		// would strand it for a property of whoever is restoring it. Unpack
-		// instead and serve it the old way: landing goes back to O(data size)
-		// and this restore gets none of the format's benefit, but the actor
-		// comes back.
-		slog.WarnContext(ctx, "Cannot mount the durable-dir image on this node; extracting it instead",
-			slog.String("id", actorUID), slog.Any("err", err))
-		if xerr := tarutil.ExtractImage(ctx, durableImagePath(actorUID), src); xerr != nil {
+		// This node cannot mount what another node wrote: no CONFIG_EROFS_FS,
+		// no CONFIG_EROFS_FS_XATTR, a kernel too old for a 512-byte block, or
+		// too few free loop devices. The actor's own configuration has no say
+		// in that, so refusing here would strand it for a property of whoever
+		// is restoring it. Unpack instead and serve it the old way: landing
+		// goes back to O(data size) and this restore gets none of the benefit,
+		// but the actor comes back.
+		//
+		// On the tarfs path the way back is Extract over the very same tar,
+		// which is to say the arrangement this node would have used had the
+		// setting never been on. That symmetry is the point of landing as a
+		// read-side choice: falling back costs the speedup and nothing else.
+		slog.WarnContext(ctx, "Cannot mount the durable-dir lower on this node; extracting it instead",
+			slog.String("id", actorUID), slog.String("lower", kind.String()), slog.Any("err", err))
+		var xerr error
+		switch kind {
+		case durableLowerImage:
+			xerr = tarutil.ExtractImage(ctx, durableImagePath(actorUID), src)
+		case durableLowerTarfs:
+			xerr = tarutil.Extract(durableTarPath(actorUID), src)
+		}
+		if xerr != nil {
 			return fmt.Errorf("while staging the durable-dir overlay: %w (extract fallback: %v)", err, xerr)
 		}
-		// Drop the image before falling through. Leaving it would keep
-		// durableOverlayActive true for the rest of the activation, and the
+		// Drop the lower before falling through. Leaving it would keep
+		// durableLowerKind non-none for the rest of the activation, and the
 		// next suspend would archive kata.DurableMergedDir — a directory
 		// nothing ever mounted — silently checkpointing an empty durable dir
 		// over all of the actor's data.
-		if _, rerr := resetDurableOverlayState(actorUID); rerr != nil {
+		if _, rerr := resetDurableOverlayState(ctx, actorUID); rerr != nil {
 			return rerr
 		}
 	}
@@ -270,18 +370,23 @@ func archiveDurableVolumes(ctx context.Context, dir, checkpointDir string) error
 // mid-restore.
 //
 // A tar is unpacked into the actor's host directory (dir, which atelet has
-// already created, empty), which costs a write of every file. An image is
-// only moved into place — the mount that turns it into a directory happens in
+// already created, empty), which costs a write of every file — unless this node
+// lands tars through tarfs, in which case the tar is only moved into place and
+// an index is built over it. An image is likewise only moved into place. Either
+// way the mount that turns the file into a directory happens in
 // stageDurableVolumes, because CleanupSandboxState runs between here and there
-// and would sweep any mount made now. That deferral is the point of the whole
-// format: landing stops scaling with the actor's data.
+// and would sweep any mount made now, while it has no reason to touch a plain
+// file. That split is what makes both overlay arrangements work: produce files
+// here, produce mounts there.
 //
-// The format is read from the file rather than from this node's setting, so a
-// snapshot written by a differently-configured node still restores.
-func landDurableVolumes(dir, snapshotDir, actorUID string) error {
+// The archive format is read from the file rather than from this node's
+// setting, so a snapshot written by a differently-configured node still
+// restores. The landing mode is this node's own choice, because unlike the
+// format it leaves no trace anyone else has to read.
+func landDurableVolumes(ctx context.Context, dir, snapshotDir, actorUID string) error {
 	// Whichever way this restore goes, it must not inherit the last one's
-	// image or its overlay upper.
-	if _, err := resetDurableOverlayState(actorUID); err != nil {
+	// lower or its overlay upper.
+	if _, err := resetDurableOverlayState(ctx, actorUID); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -292,28 +397,58 @@ func landDurableVolumes(dir, snapshotDir, actorUID string) error {
 	if err != nil {
 		return fmt.Errorf("while identifying the durable-dir archive: %w", err)
 	}
-	if format == tarutil.FormatTar {
-		if err := tarutil.Extract(src, dir); err != nil {
-			return fmt.Errorf("while restoring durable-dir volumes into %q: %w", dir, err)
+	if format == tarutil.FormatErofs {
+		if err := adoptDurableArchive(src, durableImagePath(actorUID)); err != nil {
+			return fmt.Errorf("while landing the durable-dir image: %w", err)
 		}
 		return nil
 	}
-	if err := adoptDurableImage(src, durableImagePath(actorUID)); err != nil {
-		return fmt.Errorf("while landing the durable-dir image: %w", err)
+	if tarutil.Landing() == tarutil.LandingTarfs {
+		err := landDurableTarfs(ctx, src, actorUID)
+		if err == nil {
+			return nil
+		}
+		// Nothing about the actor is wrong, only this node's ability to index
+		// the tar, so unpacking it is the same result the node would have
+		// produced with the setting off.
+		slog.WarnContext(ctx, "Cannot build a tarfs index for the durable-dir tar; extracting it instead",
+			slog.String("id", actorUID), slog.Any("err", err))
+		if _, rerr := resetDurableOverlayState(ctx, actorUID); rerr != nil {
+			return rerr
+		}
+	}
+	if err := tarutil.Extract(src, dir); err != nil {
+		return fmt.Errorf("while restoring durable-dir volumes into %q: %w", dir, err)
 	}
 	return nil
 }
 
-// adoptDurableImage moves the image out of the restore dir, which belongs to
-// atelet and is reused by the next restore, into ateom's own per-actor
+// landDurableTarfs parks the tar where the mount can reach it and builds the
+// index beside it. Both files together are what durableLowerKind reads as
+// durableLowerTarfs, and the index is written second so a failure halfway
+// leaves the actor on the plain-directory path rather than on a path whose
+// lower cannot be mounted.
+func landDurableTarfs(ctx context.Context, src, actorUID string) error {
+	tarPath := durableTarPath(actorUID)
+	if err := adoptDurableArchive(src, tarPath); err != nil {
+		return fmt.Errorf("while landing the durable-dir tar: %w", err)
+	}
+	if err := tarutil.CreateTarIndex(ctx, durableIndexPath(actorUID), tarPath); err != nil {
+		return fmt.Errorf("while indexing the durable-dir tar: %w", err)
+	}
+	return nil
+}
+
+// adoptDurableArchive moves the archive out of the restore dir, which belongs
+// to atelet and is reused by the next restore, into ateom's own per-actor
 // location.
 //
 // A hardlink, because both are under ActorPath and so on one filesystem: the
-// image is the one thing on this path that must not be copied, since copying
-// it is the O(data size) write the image exists to avoid. Rename would do as
-// well but leaves the restore dir short of a file atelet put there; a link
-// leaves both views intact and costs the same.
-func adoptDurableImage(src, dst string) error {
+// archive is the one thing on this path that must not be copied, since copying
+// it is the O(data size) write these arrangements exist to avoid. Rename would
+// do as well but leaves the restore dir short of a file atelet put there; a
+// link leaves both views intact and costs the same.
+func adoptDurableArchive(src, dst string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return fmt.Errorf("creating %q: %w", filepath.Dir(dst), err)
 	}
