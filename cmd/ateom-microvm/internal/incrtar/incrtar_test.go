@@ -415,7 +415,7 @@ func TestRestoreDetectsATamperedArchive(t *testing.T) {
 	c.snap()
 
 	// Stand in for a truncated or wrong-generation object: an archive whose
-	// bytes no longer match what the manifest promises.
+	// entries no longer match what the manifest promises.
 	swapped := filepath.Join(t.TempDir(), "swapped.tar")
 	other := t.TempDir()
 	if err := os.WriteFile(filepath.Join(other, "a.txt"), []byte("not alpha"), 0o644); err != nil {
@@ -430,7 +430,47 @@ func TestRestoreDetectsATamperedArchive(t *testing.T) {
 		t.Fatal("Restore succeeded from a mismatched archive, want an error")
 	}
 	if !strings.Contains(err.Error(), "a.txt") {
-		t.Errorf("error = %v, want it to name the path whose contents do not match", err)
+		t.Errorf("error = %v, want it to name the path whose size does not match", err)
+	}
+}
+
+// TestRestoreDetectsAnArchiveMissingWhatItOwns covers the case the size check
+// cannot see: an archive whose entries are all correct, but which does not
+// carry every path the manifest attributes to its generation. Only the
+// accounting of what extraction took catches that.
+func TestRestoreDetectsAnArchiveMissingWhatItOwns(t *testing.T) {
+	c := newChain(t)
+	c.populate()
+	c.snap()
+
+	// A faithful copy of a.txt and nothing else, so every check that looks at a
+	// single entry passes and only the accounting is left to object to it.
+	partial := filepath.Join(t.TempDir(), "partial.tar")
+	other := t.TempDir()
+	want, err := os.Stat(c.path("a.txt"))
+	if err != nil {
+		t.Fatalf("stat a.txt: %v", err)
+	}
+	copied := filepath.Join(other, "a.txt")
+	if err := os.WriteFile(copied, []byte("alpha"), want.Mode().Perm()); err != nil {
+		t.Fatalf("writing partial tree: %v", err)
+	}
+	if err := os.Chtimes(copied, want.ModTime(), want.ModTime()); err != nil {
+		t.Fatalf("restoring times: %v", err)
+	}
+	if err := tarutil.Create(t.Context(), partial, other); err != nil {
+		t.Fatalf("creating partial tar: %v", err)
+	}
+
+	err = Restore(RestoreOptions{DstDir: t.TempDir(), Manifest: c.current, Tars: map[int]string{1: partial}})
+	if err == nil {
+		t.Fatal("Restore succeeded from an archive missing a path it owns, want an error")
+	}
+	if !strings.Contains(err.Error(), "b.txt") {
+		t.Errorf("error = %v, want it to name the path the archive does not carry", err)
+	}
+	if !strings.Contains(err.Error(), "not the archive this snapshot was written from") {
+		t.Errorf("error = %v, want it to say the archive is the wrong one", err)
 	}
 }
 
@@ -577,7 +617,10 @@ func TestOwnershipSurvivesAGeneration(t *testing.T) {
 	sameTree(t, c.src, dst)
 }
 
-func TestUnreadableFileIsStillVerified(t *testing.T) {
+// TestUnreadableFileRoundTrips covers a file no one but root can open. Capture
+// has to read it to hash it, and neither that nor verification may leave the
+// mode any wider than it found it.
+func TestUnreadableFileRoundTrips(t *testing.T) {
 	c := newChain(t)
 	c.populate()
 	if err := os.Chmod(c.path("b.txt"), 0o000); err != nil {
@@ -591,6 +634,6 @@ func TestUnreadableFileIsStillVerified(t *testing.T) {
 		t.Fatalf("stat restored b.txt: %v", err)
 	}
 	if info.Mode().Perm() != 0 {
-		t.Errorf("restored mode = %v, want 0000: verification must put the mode back", info.Mode().Perm())
+		t.Errorf("restored mode = %v, want 0000", info.Mode().Perm())
 	}
 }

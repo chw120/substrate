@@ -18,11 +18,8 @@ package incrtar
 
 import (
 	"archive/tar"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -55,11 +52,19 @@ type RestoreOptions struct {
 // thrown away, so a long chain would cost several times a full capture to
 // restore and give back more than this scheme saves.
 //
-// Verification is not optional. A chain has more ways to be silently incomplete
-// than a single archive does — one missing generation is enough — so every file
-// is re-hashed against the manifest and any surplus or missing path is an
-// error. Handing an actor a plausible-looking but wrong durable directory would
-// corrupt its state invisibly.
+// Verification is not optional, but it is done by accounting rather than by
+// re-reading. A chain has one failure mode a single archive does not: an
+// archive that is not the one the manifest was written against, whether because
+// a generation is missing or because the wrong object was supplied for it.
+// Extraction already knows which paths it took from which generation, so
+// comparing that with the manifest costs nothing and catches exactly that.
+//
+// Re-hashing the restored tree would cost a second pass over every byte, on the
+// critical path of every resume — around 300 MiB/s, which measured as the whole
+// of the resume-side regression this scheme otherwise has. What it would add
+// over the checks here is detection of an archive whose bytes are corrupt but
+// whose entries still have the right names and sizes, and the object store
+// checksums its own objects against precisely that.
 func Restore(opts RestoreOptions) error {
 	m := opts.Manifest
 	if m == nil {
@@ -86,10 +91,11 @@ func Restore(opts RestoreOptions) error {
 	if err := createDirs(root, m); err != nil {
 		return err
 	}
-	if err := extractGenerations(opts); err != nil {
+	extracted, err := extractGenerations(opts)
+	if err != nil {
 		return err
 	}
-	if err := verifyTree(root, opts.DstDir, m); err != nil {
+	if err := verifyTree(root, opts.DstDir, m, extracted); err != nil {
 		return err
 	}
 	return restoreDirs(root, m)
@@ -115,23 +121,33 @@ func createDirs(root *os.Root, m *Manifest) error {
 }
 
 // extractGenerations unpacks each needed archive, taking from it only the paths
-// the manifest says it owns.
-func extractGenerations(opts RestoreOptions) error {
+// the manifest says it owns, and returns the set of paths it took.
+//
+// A path the manifest attributes to a generation whose archive does not carry
+// it is never added to that set, which is how verifyTree tells an archive that
+// is merely missing a file from one that is the wrong archive entirely.
+func extractGenerations(opts RestoreOptions) (map[string]bool, error) {
 	owner := make(map[string]int, len(opts.Manifest.Entries))
 	for _, e := range opts.Manifest.Entries {
 		if e.OriginGen > 0 {
 			owner[e.Path] = e.OriginGen
 		}
 	}
+	taken := make(map[string]bool, len(owner))
 	for _, gen := range opts.Manifest.NeededGenerations() {
 		keep := func(name string, _ *tar.Header) bool {
-			return owner[filepath.ToSlash(name)] == gen
+			name = filepath.ToSlash(name)
+			if owner[name] != gen {
+				return false
+			}
+			taken[name] = true
+			return true
 		}
 		if err := tarutil.ExtractFiltered(opts.Tars[gen], opts.DstDir, keep); err != nil {
-			return fmt.Errorf("while restoring generation %d: %w", gen, err)
+			return nil, fmt.Errorf("while restoring generation %d: %w", gen, err)
 		}
 	}
-	return nil
+	return taken, nil
 }
 
 // restoreDirs applies the manifest's directory modes, ownership, and times,
@@ -198,7 +214,11 @@ func lchown(root *os.Root, e Entry) error {
 // path it finds must be described, and every path described must be found.
 // Directory modes and times are excluded because restoreDirs has not applied
 // them yet — it checks its own work.
-func verifyTree(root *os.Root, dstDir string, m *Manifest) error {
+//
+// extracted is what extractGenerations took, and separates the two reasons a
+// described path can be absent: an archive that did not carry it, which means
+// the chain is not this snapshot's, and anything else.
+func verifyTree(root *os.Root, dstDir string, m *Manifest, extracted map[string]bool) error {
 	want := m.byPath()
 	found := make(map[string]bool, len(want))
 	// Inode identity per hardlink set, so the members can be checked against
@@ -242,9 +262,13 @@ func verifyTree(root *os.Root, dstDir string, m *Manifest) error {
 	}
 
 	for _, e := range m.Entries {
-		if !found[e.Path] {
-			return fmt.Errorf("verifying restored tree in %q: %q is missing; generation %d supplied nothing for it", dstDir, e.Path, e.OriginGen)
+		if found[e.Path] {
+			continue
 		}
+		if e.Type != TypeDir && !extracted[e.Path] {
+			return fmt.Errorf("verifying restored tree in %q: %q is missing; the archive supplied for generation %d does not carry it, so it is not the archive this snapshot was written from", dstDir, e.Path, e.OriginGen)
+		}
+		return fmt.Errorf("verifying restored tree in %q: %q is missing", dstDir, e.Path)
 	}
 	return nil
 }
@@ -287,26 +311,15 @@ func checkMeta(e Entry, info os.FileInfo) error {
 	return nil
 }
 
-// checkContents re-reads a restored file and compares it with the manifest.
-// This is the check that catches a missing generation in the chain, so it hashes
-// the bytes rather than trusting the size.
+// checkContents compares what a restored entry holds with what the manifest
+// records, without reading a regular file's bytes: its size, and a symlink's
+// target. Whether the bytes came from the right archive is settled by
+// accounting instead — see Restore.
 func checkContents(root *os.Root, e Entry, info os.FileInfo) error {
 	switch e.Type {
 	case TypeRegular:
 		if info.Size() != e.Size {
 			return fmt.Errorf("%q was restored with %d bytes, not %d", e.Path, info.Size(), e.Size)
-		}
-		f, err := openForHashing(root, e)
-		if err != nil {
-			return fmt.Errorf("re-reading restored file %q: %w", e.Path, err)
-		}
-		defer f.Close()
-		h := sha256.New()
-		if _, err := io.Copy(h, f); err != nil {
-			return fmt.Errorf("re-hashing restored file %q: %w", e.Path, err)
-		}
-		if got := hex.EncodeToString(h.Sum(nil)); got != e.ContentHash {
-			return fmt.Errorf("%q was restored with contents hashing to %s, not %s", e.Path, got, e.ContentHash)
 		}
 	case TypeSymlink:
 		target, err := root.Readlink(e.Path)
@@ -318,27 +331,6 @@ func checkContents(root *os.Root, e Entry, info os.FileInfo) error {
 		}
 	}
 	return nil
-}
-
-// openForHashing opens a restored file for reading, widening its mode if it has
-// to.
-//
-// A workload may leave a file unreadable — 0o000 on a secret is not unusual —
-// and the mode is already back in place by the time verification runs. ateom is
-// root and reads it regardless; elsewhere, rather than skipping the check that
-// catches a broken chain, the mode is widened just long enough to get a
-// descriptor and then restored. Permission is settled at open, so the deferred
-// chmod does not disturb the read that follows.
-func openForHashing(root *os.Root, e Entry) (*os.File, error) {
-	f, err := root.Open(e.Path)
-	if err == nil || !errors.Is(err, os.ErrPermission) {
-		return f, err
-	}
-	if chmodErr := root.Chmod(e.Path, 0o400); chmodErr != nil {
-		return nil, err
-	}
-	defer func() { _ = root.Chmod(e.Path, e.restoredMode()) }()
-	return root.Open(e.Path)
 }
 
 // checkLinkSet confirms that the paths the manifest grouped by inode really do

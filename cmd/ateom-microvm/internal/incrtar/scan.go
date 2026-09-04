@@ -194,14 +194,17 @@ func assignLinkSets(entries []Entry, members map[inodeKey][]string) {
 
 // hashFile returns the hex SHA-256 of path's contents.
 //
-// This read is not new work. A full capture already reads every byte to copy it
-// into the tar; here the same read feeds the hash, and only the files that turn
-// out to have changed are read a second time — by then from the page cache.
+// This is the dominant cost of an incremental capture, and it does not shrink
+// with the delta: what changed can only be known by hashing everything. Nothing
+// cheaper will do, because every cycle begins by extracting the volume afresh,
+// which leaves every file with a new mtime and a new inode.
 //
 // SHA-256 is the standard library's, which keeps the package dependency-free.
-// The proposal asks for at least 128 bits and suggests blake3 or xxh128; both
-// would be faster per byte and neither is vendored today, so switching is a
-// contained change if the hash ever shows up in a profile.
+// It runs at roughly 300 MiB/s on one core, which is what bounds how much a
+// small delta can save: a capture cannot beat a full one by more than the ratio
+// of tar throughput to hash throughput, whatever the delta. A faster 128-bit
+// hash — blake3, xxh128 — would raise that ceiling; neither is vendored today,
+// so it is a contained change to make if the ceiling starts to bind.
 func hashFile(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
