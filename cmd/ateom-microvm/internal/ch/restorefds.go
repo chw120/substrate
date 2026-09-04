@@ -19,9 +19,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -142,15 +144,7 @@ func (c *Client) RestoreWithNetFDs(ctx context.Context, sourceDir string, nets [
 		return fmt.Errorf("sending vm.restore with fds: %w", err)
 	}
 
-	status, err := bufio.NewReader(conn).ReadString('\n')
-	if err != nil {
-		return fmt.Errorf("reading vm.restore response: %w", err)
-	}
-	parts := strings.SplitN(strings.TrimSpace(status), " ", 3)
-	if len(parts) < 2 || !strings.HasPrefix(parts[1], "2") {
-		return fmt.Errorf("vm.restore failed: %s", strings.TrimSpace(status))
-	}
-	return nil
+	return readAPIResponse("vm.restore", bufio.NewReader(conn))
 }
 
 // AddNetWithFDs hotplugs a virtio-net device into a freshly-created (pre-boot or
@@ -190,15 +184,70 @@ func (c *Client) AddNetWithFDs(ctx context.Context, mac string, numQueues int, f
 	if _, _, err := conn.WriteMsgUnix([]byte(req), oob, nil); err != nil {
 		return fmt.Errorf("sending vm.add-net with fds: %w", err)
 	}
-	status, err := bufio.NewReader(conn).ReadString('\n')
+	return readAPIResponse("vm.add-net", bufio.NewReader(conn))
+}
+
+// maxAPIErrorBody bounds how much of a failed response is quoted back. CH's
+// error bodies are a sentence; anything longer is a malformed Content-Length,
+// not a reason worth reading.
+const maxAPIErrorBody = 4096
+
+// readAPIResponse reads one HTTP/1.1 response from an api-socket and turns a
+// non-2xx status into an error naming what failed, the status line, and the
+// body. CH puts the reason a request was rejected in that body, so a status
+// line alone reports only that something went wrong — "vm.add-net failed:
+// HTTP/1.1 500 Internal Server Error" is true of every rejection there is.
+func readAPIResponse(what string, r *bufio.Reader) error {
+	status, err := r.ReadString('\n')
 	if err != nil {
-		return fmt.Errorf("reading vm.add-net response: %w", err)
+		return fmt.Errorf("reading %s response: %w", what, err)
 	}
-	parts := strings.SplitN(strings.TrimSpace(status), " ", 3)
-	if len(parts) < 2 || !strings.HasPrefix(parts[1], "2") {
-		return fmt.Errorf("vm.add-net failed: %s", strings.TrimSpace(status))
+	status = strings.TrimSpace(status)
+	parts := strings.SplitN(status, " ", 3)
+	if len(parts) >= 2 && strings.HasPrefix(parts[1], "2") {
+		return nil
 	}
-	return nil
+	if body := readAPIBody(r); body != "" {
+		return fmt.Errorf("%s failed: %s: %s", what, status, body)
+	}
+	return fmt.Errorf("%s failed: %s", what, status)
+}
+
+// readAPIBody returns the body following a response's status line, or "" if
+// there is none. Best-effort by design: it only ever decorates an error that is
+// already being returned, so a response it cannot parse degrades to the status
+// line rather than replacing one failure with a different one. CH sends
+// Content-Length on every response, so there is no chunked encoding to decode.
+func readAPIBody(r *bufio.Reader) string {
+	length := 0
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			return ""
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			break
+		}
+		name, value, ok := strings.Cut(line, ":")
+		if !ok || !strings.EqualFold(strings.TrimSpace(name), "content-length") {
+			continue
+		}
+		if length, err = strconv.Atoi(strings.TrimSpace(value)); err != nil || length < 0 {
+			return ""
+		}
+	}
+	if length == 0 {
+		return ""
+	}
+	if length > maxAPIErrorBody {
+		length = maxAPIErrorBody
+	}
+	buf := make([]byte, length)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(buf))
 }
 
 // SnapshotNetDevice describes one net device found in a CH snapshot's
