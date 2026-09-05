@@ -1392,12 +1392,13 @@ elsewhere: atelet's copy, and the guest's cold page cache.
    and `ResumeActor`, and a suspend uploads. A scenario that pauses is the
    precondition for measuring that change at all.
 
-   Note also that atelet's hardlinking, as it stands, shares `durable-dir.tar`
-   alone. A chain is `durable-dir.chain.json` plus `durable-dir.layer-*.qcow2`
-   and is still copied file by file, so the arrangement measured here gets
-   nothing from it even on a pause. Extending the allow-list to the layers is
-   sound — `landDurableQcow2` stacks a fresh top layer, so a shared layer is
-   never written through — and is not yet done.
+   The allow-list this branch carries is `ateompath.DurableDirSnapshotFile`, so
+   it already covers a chain — `durable-dir.chain.json` and every
+   `durable-dir.layer-*.qcow2` — and not the tar alone. That is sound here
+   because `landDurableQcow2` stacks a fresh top layer and never writes through
+   to an adopted one. The version proposed upstream shares `durable-dir.tar`
+   alone, since the chain's names do not exist there; widening it is a change
+   that only makes sense alongside the arrangement that writes them.
 
    What would take the cost off the measured path is not writing the bytes
    twice: staging the download directly where ateom will read it. atelet, not

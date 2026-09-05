@@ -94,13 +94,13 @@ the whole snapshot before ateom is called, and so does the arithmetic tying
 those writes to the drain. What does not stand is the remedy: an object-storage
 fetch has no local inode to share, so hardlinking cannot take this cost off the
 measured workload. It would only help a pause/resume, which nothing here
-measures — and on the arrangement this document is about it would not help even
-then: the hardlinking that atelet has since grown shares one snapshot file,
-`durable-dir.tar`, so a chain's `durable-dir.chain.json` and
-`durable-dir.layer-*.qcow2` are still copied in full. Covering them is a further
-change, and a safe one, because `landDurableQcow2` stacks a fresh top layer and
-so never writes through to an adopted inode. Making an EXTERNAL restore cheaper
-is a different change again, and an open question.
+measures. The hardlinking this branch carries would apply if one did: its
+allow-list is `ateompath.DurableDirSnapshotFile`, which covers a whole chain —
+`durable-dir.chain.json` and every `durable-dir.layer-*.qcow2` — and is safe
+because `landDurableQcow2` stacks a fresh top layer and so never writes through
+to an adopted inode. What is missing is a pause/resume scenario to measure it
+on. Making an EXTERNAL restore cheaper is a different change again, and an open
+question.
 
 **The guest's first reads** are an empty guest page cache and ext4 walking
 metadata in 4 KiB requests. Every other explanation has been eliminated, and the
