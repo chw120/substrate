@@ -49,6 +49,17 @@ const (
 // what catches a byte count pasted into the wrong flag.
 const MaxDurDirFileCount = 1024
 
+// Cycle modes. They pick which idle edge the DurDir benchmark drives, and the
+// two differ in where the checkpoint lands: a suspend uploads it to object
+// storage, so the restore that follows downloads it; a pause keeps it on the
+// node, so the restore stages it from the local filesystem. The restore paths
+// are separate code in atelet, thus a change to one is unmeasurable under the
+// other.
+const (
+	CycleModeSuspend = "suspend"
+	CycleModePause   = "pause"
+)
+
 // Config is the dynamic-mutable subset of boomer's behavior. Holder swaps
 // it atomically so task goroutines read a consistent snapshot.
 type Config struct {
@@ -59,6 +70,7 @@ type Config struct {
 	DurDirFileCount  int    // files the DurdirUser rotates over; 0 or 1 rewrites one file every cycle
 	ResumeMode       string // ResumeModeExplicit | ResumeModeImplicit
 	DurDirReadMode   string // ReadModeData | ReadModeDigest
+	DurDirCycleMode  string // CycleModeSuspend | CycleModePause
 	DurDirTemplate   string // ActorTemplate name
 	MemTarget        string // resident RAM the GluttonUser fills via WriteRAM, suffixed (e.g. "2Gi"); "" disables
 	MemChurn         string // RAM re-randomized in place each cycle via WriteRAM overwrite, suffixed (e.g. "64Mi"); "" disables
@@ -99,6 +111,7 @@ type payload struct {
 	DurDirFileCount  *float64 `json:"durdir_file_count"`
 	ResumeMode       *string  `json:"resume_mode"`
 	DurDirReadMode   *string  `json:"durdir_read_mode"`
+	DurDirCycleMode  *string  `json:"durdir_cycle_mode"`
 	DurDirTemplate   *string  `json:"durdir_template"`
 	MemTarget        *string  `json:"mem_target"`
 	MemChurn         *string  `json:"mem_churn"`
@@ -182,6 +195,9 @@ func (c Config) Validate() error {
 	if c.DurDirReadMode != "" && c.DurDirReadMode != ReadModeData && c.DurDirReadMode != ReadModeDigest {
 		return fmt.Errorf("invalid durdir_read_mode %q: must be %q or %q", c.DurDirReadMode, ReadModeData, ReadModeDigest)
 	}
+	if c.DurDirCycleMode != "" && c.DurDirCycleMode != CycleModeSuspend && c.DurDirCycleMode != CycleModePause {
+		return fmt.Errorf("invalid durdir_cycle_mode %q: must be %q or %q", c.DurDirCycleMode, CycleModeSuspend, CycleModePause)
+	}
 	// MemTarget and MemChurn are passed to glutton verbatim, which owns the
 	// parse; invalid values fail loudly there as GluttonFillRAM /
 	// GluttonChurnRAM errors.
@@ -213,6 +229,9 @@ func (p payload) merge(current Config) Config {
 	}
 	if p.DurDirReadMode != nil {
 		out.DurDirReadMode = *p.DurDirReadMode
+	}
+	if p.DurDirCycleMode != nil {
+		out.DurDirCycleMode = *p.DurDirCycleMode
 	}
 	if p.DurDirTemplate != nil {
 		out.DurDirTemplate = *p.DurDirTemplate
@@ -288,6 +307,7 @@ func StartPoll(
 					slog.Int("durdir_file_count", next.DurDirFileCount),
 					slog.String("resume_mode", next.ResumeMode),
 					slog.String("durdir_read_mode", next.DurDirReadMode),
+					slog.String("durdir_cycle_mode", next.DurDirCycleMode),
 					slog.String("durdir_template", next.DurDirTemplate),
 					slog.String("mem_target", next.MemTarget),
 					slog.String("mem_churn", next.MemChurn),
@@ -324,6 +344,7 @@ func SubscribeSpawn(url string, holder *Holder, sampler ProbabilityUpdater, fetc
 			slog.Int("durdir_file_count", next.DurDirFileCount),
 			slog.String("resume_mode", next.ResumeMode),
 			slog.String("durdir_read_mode", next.DurDirReadMode),
+			slog.String("durdir_cycle_mode", next.DurDirCycleMode),
 			slog.String("durdir_template", next.DurDirTemplate),
 			slog.String("mem_target", next.MemTarget),
 			slog.String("mem_churn", next.MemChurn),

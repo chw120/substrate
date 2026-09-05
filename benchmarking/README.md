@@ -100,6 +100,9 @@ and state restoration latency when a durable directory is attached to the actor.
 * `--durdir-read-mode`: Verification read mode:
   * `data` (default): Server returns full payload bytes for client-side SHA-256 verification.
   * `digest`: Server hashes the file and returns size and digest, reducing network transfer.
+* `--durdir-cycle-mode`: Idle edge each cycle drives:
+  * `suspend` (default): Commits the checkpoint to object storage, so the resume downloads it.
+  * `pause`: Keeps the checkpoint on the node, so the resume stages it from the local filesystem. atelet has separate code for the two, so a change to one is invisible under the other.
 * `--durdir-template`: ActorTemplate name:
   * `glutton-durdir-data` (default): Attaches a durable data directory without memory snapshot restore.
   * `glutton-durdir-full`: Attaches a durable data directory and performs a full memory snapshot restore.
@@ -108,7 +111,8 @@ and state restoration latency when a durable directory is attached to the actor.
 
 * `DurDirWrite`: Initial truncate-write creating the data file.
 * `DurDirServeInitial`: First read immediately following file creation.
-* `SuspendActor`: Actor suspend latency (snapshot creation + persistence upload).
+* `SuspendActor`: Actor suspend latency (snapshot creation + persistence upload), reported in `suspend` cycle mode.
+* `PauseActor`: Actor pause latency (node-local snapshot creation), reported in `pause` cycle mode.
 * `ResumeActor`: Actor resume latency.
 * `DurDirServeAfterResume`: First read after resume (measures page faults / lazy load overhead on restored volume).
 * `DurDirServeWarm`: Subsequent read within the same active cycle (cached state baseline).

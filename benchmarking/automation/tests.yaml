@@ -320,6 +320,27 @@ tests:
       - "1.0"
       - "--max-wait-time"
       - "1.0"
+  - name: durdir_pause_baseline
+    type: locust
+    description: "DurDir pause baseline: durdir_data_baseline over the pause edge, so the resume stages a node-local checkpoint instead of downloading one"
+    targetCluster: dev
+    file: /app/tests/durdir.py
+    duration: 1m
+    users: 1
+    workerCount: 1
+    flags:
+      - "--durdir-template"
+      - "glutton-durdir-data"
+      - "--durdir-cycle-mode"
+      - "pause"
+      - "--resume-mode"
+      - "explicit"
+      - "--durdir-file-size-bytes"
+      - "8388608"
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
   - name: durdir_implicit_resume
     type: locust
     description: "DurDir implicit resume: 1 concurrent user, 8 MiB file, traffic-triggered resume"
@@ -671,6 +692,32 @@ tests:
     flags:
       - "--durdir-template"
       - "glutton-durdir-data"
+      - "--resume-mode"
+      - "explicit"
+      - "--durdir-read-mode"
+      - "digest"
+      - "--durdir-file-size-bytes"
+      - "67108864"
+      - "--durdir-file-count"
+      - "8"
+      - "--min-wait-time"
+      - "1.0"
+      - "--max-wait-time"
+      - "1.0"
+  - name: durdir_partial_512mb_pause_microvm
+    type: locust
+    description: "DurDir partial rewrite on micro-VM over the pause edge: 8 x 64 MiB, one file rewritten per cycle, resume stages a node-local checkpoint"
+    targetCluster: dev
+    sandboxClass: microvm
+    file: /app/tests/durdir.py
+    duration: 20m
+    users: 1
+    workerCount: 1
+    flags:
+      - "--durdir-template"
+      - "glutton-durdir-data"
+      - "--durdir-cycle-mode"
+      - "pause"
       - "--resume-mode"
       - "explicit"
       - "--durdir-read-mode"

@@ -34,6 +34,7 @@ func TestDurDirLoopSequence(t *testing.T) {
 	tests := []struct {
 		name         string
 		resumeMode   string
+		cycleMode    string
 		wantGRPCCall []string
 		wantHTTPCall []string
 	}{
@@ -49,6 +50,22 @@ func TestDurDirLoopSequence(t *testing.T) {
 			wantGRPCCall: []string{"SuspendActor"}, // No ResumeActor RPC!
 			wantHTTPCall: []string{fake.ReadDiskRoute, fake.ReadDiskRoute, fake.WriteDiskRoute},
 		},
+		{
+			name:         "suspend cycle mode named explicitly",
+			resumeMode:   dynconfig.ResumeModeExplicit,
+			cycleMode:    dynconfig.CycleModeSuspend,
+			wantGRPCCall: []string{"SuspendActor", "ResumeActor"},
+			wantHTTPCall: []string{fake.ReadDiskRoute, fake.ReadDiskRoute, fake.WriteDiskRoute},
+		},
+		{
+			// The whole point of the mode: pause writes a node-local checkpoint,
+			// which is the only kind atelet stages from the local filesystem.
+			name:         "pause cycle mode",
+			resumeMode:   dynconfig.ResumeModeExplicit,
+			cycleMode:    dynconfig.CycleModePause,
+			wantGRPCCall: []string{"PauseActor", "ResumeActor"},
+			wantHTTPCall: []string{fake.ReadDiskRoute, fake.ReadDiskRoute, fake.WriteDiskRoute},
+		},
 	}
 
 	for _, tc := range tests {
@@ -58,7 +75,8 @@ func TestDurDirLoopSequence(t *testing.T) {
 			cfg := &userclass.Config{
 				APIStub: fakeCtrl,
 				Dyn: dynconfig.NewHolder(dynconfig.Config{
-					ResumeMode: tc.resumeMode,
+					ResumeMode:      tc.resumeMode,
+					DurDirCycleMode: tc.cycleMode,
 				}),
 			}
 			du := newTestDurDirUser(t, srv, cfg)

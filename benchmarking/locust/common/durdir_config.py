@@ -45,6 +45,16 @@ def add_durdir_arguments(parser: LocustArgumentParser) -> None:
         "'digest' returns only size+sha256 for reduced network overhead",
     )
     group.add_argument(
+        "--durdir-cycle-mode",
+        type=str,
+        default="suspend",
+        choices=["suspend", "pause"],
+        help="Idle edge each DurDir cycle drives: 'suspend' (default) commits the "
+        "checkpoint to object storage, so the resume downloads it; 'pause' keeps it "
+        "on the node, so the resume stages it from the local filesystem. atelet "
+        "stages the two with separate code, so this picks which one is measured",
+    )
+    group.add_argument(
         "--durdir-template",
         type=str,
         default="glutton-durdir-data",

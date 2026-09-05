@@ -253,6 +253,28 @@ func (u *durDirUser) suspend(ctx context.Context) {
 	})
 }
 
+func (u *durDirUser) pause(ctx context.Context) {
+	_ = u.tracedCall(ctx, "PauseActor", func(callCtx context.Context, tr *metadata.MD) error {
+		_, err := u.cfg.APIStub.PauseActor(callCtx, &ateapipb.PauseActorRequest{
+			Actor: u.ref(),
+		}, grpc.Trailer(tr))
+		return err
+	})
+}
+
+// idle takes the actor down the edge `mode` names, so the resume that follows
+// restores from the checkpoint that edge wrote. The two land in different
+// places — a suspend in object storage, a pause on the node — and atelet stages
+// each with its own code, so the mode decides which of those two is on the
+// measured path.
+func (u *durDirUser) idle(ctx context.Context, mode string) {
+	if mode == dynconfig.CycleModePause {
+		u.pause(ctx)
+		return
+	}
+	u.suspend(ctx)
+}
+
 // suspendAndDelete suspends the actor before deleting it. DeleteActor requires
 // SUSPENDED or CRASHED; deleting a running actor leaks it. The suspend is
 // unmetered (teardown precondition, not benchmark latency), while the delete
@@ -310,8 +332,8 @@ func (u *durDirUser) params(dynCfg dynconfig.Config) (int64, gluttonpb.ReadMode)
 func (u *durDirUser) step(ctx context.Context, dynCfg dynconfig.Config) {
 	fileSize, readMode := u.params(dynCfg)
 
-	// 1. Suspend actor
-	u.suspend(ctx)
+	// 1. Take the actor idle, by suspend or by pause
+	u.idle(ctx, dynCfg.DurDirCycleMode)
 
 	// 2. Resume — a no-op in implicit mode, where router traffic wakes the actor.
 	if !u.resume(ctx, dynCfg.ResumeMode) {

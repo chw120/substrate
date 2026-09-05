@@ -53,6 +53,7 @@ _FLAGS = {
     "--durdir-file-count": int,
     "--resume-mode": str,
     "--durdir-read-mode": str,
+    "--durdir-cycle-mode": str,
     "--durdir-template": str,
     "--mem-target": str,
     "--mem-churn": str,

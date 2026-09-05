@@ -34,6 +34,7 @@ func TestParseValid(t *testing.T) {
 		"durdir_file_count": 8,
 		"resume_mode": "explicit",
 		"durdir_read_mode": "data",
+		"durdir_cycle_mode": "pause",
 		"durdir_template": "glutton-durdir-data"
 	}`)
 
@@ -62,6 +63,12 @@ func TestParseValid(t *testing.T) {
 	}
 	if cfg.DurDirReadMode != ReadModeData {
 		t.Errorf("DurDirReadMode: got %q, want %q", cfg.DurDirReadMode, ReadModeData)
+	}
+	if cfg.DurDirCycleMode != CycleModePause {
+		t.Errorf("DurDirCycleMode: got %q, want %q", cfg.DurDirCycleMode, CycleModePause)
+	}
+	if cfg.DurDirCycleMode != CycleModePause {
+		t.Errorf("DurDirCycleMode: got %q, want %q", cfg.DurDirCycleMode, CycleModePause)
 	}
 	if cfg.DurDirTemplate != "glutton-durdir-data" {
 		t.Errorf("DurDirTemplate: got %q, want glutton-durdir-data", cfg.DurDirTemplate)
@@ -116,6 +123,10 @@ func TestParseInvalidValues(t *testing.T) {
 		{
 			name: "invalid read mode",
 			json: `{"durdir_read_mode": "invalid_read"}`,
+		},
+		{
+			name: "invalid cycle mode",
+			json: `{"durdir_cycle_mode": "invalid_cycle"}`,
 		},
 	}
 
