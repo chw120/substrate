@@ -1192,22 +1192,29 @@ gives it back with interest in the guest's first reads.
 
 [Write amplification](#write-amplification) recorded that a restore leaves far
 more dirty host page cache than the delta it landed, and could not say what
-wrote it. It is `copyLocalCheckpoint`: before ateom is called at all, atelet
-byte-copies every file the snapshot names from the local checkpoint directory
-into the restore directory, and for a chain that is every layer.
+wrote it. It is atelet's staging: before ateom is called at all, atelet writes
+every file the snapshot names into the restore directory, and for a chain that
+is every layer. In these arms that is `downloadExternalCheckpoint` — the
+restores all ran as `CHECKPOINT_TYPE_EXTERNAL` — and the sibling path
+`copyLocalCheckpoint` would write the same bytes for a resume from a pause.
 
 The arithmetic closes. At 512 MiB the chain is 823 MB, the node writes at a
 measured 183 MB/s, and the drain takes 4 171 ms — 763 MB of writeback. ateom's
-own contribution to that cycle is the 68.5 MB top layer. The copy lands on the
-same filesystem ateom's `syncfs` covers, which is why the drain waits for it.
+own contribution to that cycle is the 68.5 MB top layer. The staged files land
+on the same filesystem ateom's `syncfs` covers, which is why the drain waits
+for them.
 
 So the drain is not cleaning up after the chain arrangement; it is cleaning up
 after the stager, and tar pays a version of the same bill in its own `download`
-column. Not making the copy — hardlinking a local checkpoint into the restore
-directory, where the source and destination are on one filesystem and nothing
-downstream writes to the landed files — would take the larger part of both
-backends' `download` and all of qcow2's drain off the restore path at once. It
-is an atelet change and out of this branch's scope.
+column.
+
+Hardlinking the staged files, so the restore directory shares inodes instead of
+holding a second copy, is the obvious remedy and does not apply here: an
+EXTERNAL restore's bytes arrive from object storage and there is no local inode
+to share. It would help a resume from a pause, which none of these arms are.
+Taking the cost off *this* path means not writing the bytes twice — having the
+download land where ateom will read it. Either way it is an atelet change and
+out of this branch's scope.
 
 ## The chain depth sweep
 
@@ -1371,15 +1378,30 @@ elsewhere: atelet's copy, and the guest's cold page cache.
 
 ## Follow-ups
 
-1. **Stop copying local checkpoints and hardlink them.** This is now the
+1. **Make atelet's staging stop writing the data set twice.** This is the
    largest single item on the restore path: `download` is the biggest term in
-   every arm measured, and for a local checkpoint it is `copyLocalCheckpoint`
-   writing the actor's whole durable data set a second time. It would take
-   ~1.2 s off qcow2's 512 MiB resume, a comparable share off tar's, and all of
-   qcow2's drain — which exists only because those pages are dirty. The
-   question the change has to answer is which snapshot files are safe to share
-   an inode with: the layers are never written after landing, but the guest
-   memory image is a different argument. atelet, not this branch.
+   every arm measured, ~1.2 s of qcow2's 512 MiB resume, and all of qcow2's
+   drain — which exists only because those pages are dirty.
+
+   Hardlinking looked like the answer and is not. Every restore in every arm
+   ran as
+   `CHECKPOINT_TYPE_EXTERNAL`, which fetches from object storage; there is no
+   local inode to link and `copyLocalCheckpoint` was never called. Sharing an
+   inode helps a resume from a pause and nothing else, and no scenario in the
+   benchmark suite produces one — the locust workloads drive `SuspendActor`
+   and `ResumeActor`, and a suspend uploads. A scenario that pauses is the
+   precondition for measuring that change at all.
+
+   Note also that atelet's hardlinking, as it stands, shares `durable-dir.tar`
+   alone. A chain is `durable-dir.chain.json` plus `durable-dir.layer-*.qcow2`
+   and is still copied file by file, so the arrangement measured here gets
+   nothing from it even on a pause. Extending the allow-list to the layers is
+   sound — `landDurableQcow2` stacks a fresh top layer, so a shared layer is
+   never written through — and is not yet done.
+
+   What would take the cost off the measured path is not writing the bytes
+   twice: staging the download directly where ateom will read it. atelet, not
+   this branch.
 2. **Test a `FULL` scope restore.** `containers` is the other half of the resume
    gap — 1 247 ms against tar's 69 at 512 MiB — and [the sweep](#the-chain-depth-sweep)
    has eliminated every explanation for it but one. It is not chain depth, which

@@ -53,9 +53,9 @@ job. The flatten stays on the restore path because there is nowhere else to put
 it.
 
 **3. The 12× write amplification is the stager's, not either arrangement's.**
-Before ateom is called, atelet's `copyLocalCheckpoint` byte-copies every file the
-snapshot names into the restore directory — 823 MB of chain at this size. That
-is also the entire reason the drain has anything to do.
+Before ateom is called, atelet writes every file the snapshot names into the
+restore directory — 823 MB of chain at this size, fetched from object storage.
+That is also the entire reason the drain has anything to do.
 
 **4. Chain depth is not the guest's cold-boot cost.** A `MAX_CHAIN` sweep of
 2/4/8/11 with tar controls at both ends:
@@ -77,7 +77,7 @@ is also the entire reason the drain has anything to do.
 
 | term | qcow2 − tar |
 |---|---|
-| atelet's `copyLocalCheckpoint` | **+1 186 ms** |
+| atelet's staging of the snapshot | **+1 186 ms** |
 | the guest's first reads (`containers`) | **+1 178 ms** |
 | ateom's own landing — hardlinks against an unpack | −156 ms |
 | **`total`** | **+2 498 ms** |
@@ -85,20 +85,35 @@ is also the entire reason the drain has anything to do.
 Two terms, 95% of the gap, and ateom's own work is the only part that is
 already faster.
 
-**atelet's copy** is fixable: hardlink instead, where source and destination
-share a filesystem and nothing downstream writes the landed files. It would take
-the larger part off both backends' `download` and all of qcow2's drain. It is an
-atelet change and out of this branch.
+**atelet's staging** is the term, but not by the route this document first gave
+it. Every restore in every arm here is `CHECKPOINT_TYPE_EXTERNAL`: atelet
+fetches the snapshot from object storage and writes it into the restore
+directory. `copyLocalCheckpoint` — the local-checkpoint path, taken only for a
+resume from a pause — never ran. The mechanism stands, since either path writes
+the whole snapshot before ateom is called, and so does the arithmetic tying
+those writes to the drain. What does not stand is the remedy: an object-storage
+fetch has no local inode to share, so hardlinking cannot take this cost off the
+measured workload. It would only help a pause/resume, which nothing here
+measures — and on the arrangement this document is about it would not help even
+then: the hardlinking that atelet has since grown shares one snapshot file,
+`durable-dir.tar`, so a chain's `durable-dir.chain.json` and
+`durable-dir.layer-*.qcow2` are still copied in full. Covering them is a further
+change, and a safe one, because `landDurableQcow2` stacks a fresh top layer and
+so never writes through to an adopted inode. Making an EXTERNAL restore cheaper
+is a different change again, and an open question.
 
 **The guest's first reads** are an empty guest page cache and ext4 walking
 metadata in 4 KiB requests. Every other explanation has been eliminated, and the
-only remaining lever is a `FULL` scope restore, which brings the guest's memory —
-and so its page cache — back with it. Untested; the `glutton-durdir-full`
-template already exists, so it costs an hour and no code.
+only lever anyone identified was a `FULL` scope restore, which brings the
+guest's memory — and so its page cache — back with it. It was measured on
+`glutton-durdir-full` and it does not work: resume p50 goes from 5 100 ms to
+8 800 ms on qcow2 and 3 200 to 4 700 on tar, and the ratio widens from 1.59× to
+1.87×. Moving the memory costs more than the cold reads it saves. This term has
+no known remedy.
 
-Fixing both puts resume at roughly parity, ~150 ms ahead. That is not the prize;
-the prize is that it removes the one term that currently makes the cycle win a
-trade rather than a free one.
+Parity was the case for continuing, and it no longer holds: of the two terms,
+one has no fix and the other's fix does not apply to the path measured. Even a
+complete win on the staging term leaves qcow2 behind tar on resume.
 
 ## Status
 
