@@ -98,9 +98,15 @@ measures. The hardlinking this branch carries would apply if one did: its
 allow-list is `ateompath.DurableDirSnapshotFile`, which covers a whole chain —
 `durable-dir.chain.json` and every `durable-dir.layer-*.qcow2` — and is safe
 because `landDurableQcow2` stacks a fresh top layer and so never writes through
-to an adopted inode. What is missing is a pause/resume scenario to measure it
-on. Making an EXTERNAL restore cheaper is a different change again, and an open
-question.
+to an adopted inode. That scenario now exists —
+`durdir_partial_512mb_pause_microvm`, on `durdir-pause-cycle` — and the change
+was bracketed on it, against the tar arrangement, since that is what ships.
+Subtracting `ateom_restore`, which the change cannot touch and which drifted
+mid-bracket, atelet's staging goes from 375 / 1 618 / 1 171 ms across three copy
+arms to 4–5 ms across two link arms, and `download` from 367 / 1 261 / 565 ms to
+0. So the mechanism holds and the remedy works; it simply is not collectible on
+an EXTERNAL restore. Making one of those cheaper is a different change again,
+and an open question.
 
 **The guest's first reads** are an empty guest page cache and ext4 walking
 metadata in 4 KiB requests. Every other explanation has been eliminated, and the
@@ -117,5 +123,19 @@ complete win on the staging term leaves qcow2 behind tar on resume.
 
 ## Status
 
-The branch carries the depth clamp, the reverted background flatten, and the
-drain. Nothing is committed.
+qcow2 is not being pursued. The branch is kept as the record of why, and nothing
+on it is proposed for `main`.
+
+`poc5-qcow2` holds eight commits, unpushed. Besides the arrangement itself they
+carry the depth clamp (`maxNestingDepth = 11`), the reverted background flatten,
+the drain, and the seal-side collapse — a checkpoint flattens its own chain so
+that the restore reading it lands a shallow one, with the restore's own flatten
+kept for the snapshots written before that. The seal-side collapse is the one
+piece neither document brackets.
+
+The parts worth keeping do not depend on qcow2 and are split out already:
+
+* the pause/resume benchmark mode, on `durdir-pause-cycle`;
+* atelet's sharing of a local checkpoint, on `atelet-hardlink-checkpoints`,
+  narrowed there to `durable-dir.tar` because the chain's names do not exist
+  off this branch.

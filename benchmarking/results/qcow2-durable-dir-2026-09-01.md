@@ -1388,9 +1388,14 @@ elsewhere: atelet's copy, and the guest's cold page cache.
    `CHECKPOINT_TYPE_EXTERNAL`, which fetches from object storage; there is no
    local inode to link and `copyLocalCheckpoint` was never called. Sharing an
    inode helps a resume from a pause and nothing else, and no scenario in the
-   benchmark suite produces one — the locust workloads drive `SuspendActor`
-   and `ResumeActor`, and a suspend uploads. A scenario that pauses is the
-   precondition for measuring that change at all.
+   benchmark suite produced one at the time — the locust workloads drove
+   `SuspendActor` and `ResumeActor`, and a suspend uploads.
+
+   `durdir_partial_512mb_pause_microvm` since added one, and the change
+   brackets cleanly on it against tar: with the drifting `ateom_restore`
+   control subtracted, staging goes from 375 / 1 618 / 1 171 ms across three
+   copy arms to 4–5 ms across two link arms. That settles the mechanism and
+   leaves the EXTERNAL path exactly where it was.
 
    The allow-list this branch carries is `ateompath.DurableDirSnapshotFile`, so
    it already covers a chain — `durable-dir.chain.json` and every
@@ -1403,7 +1408,7 @@ elsewhere: atelet's copy, and the guest's cold page cache.
    What would take the cost off the measured path is not writing the bytes
    twice: staging the download directly where ateom will read it. atelet, not
    this branch.
-2. **Test a `FULL` scope restore.** `containers` is the other half of the resume
+2. **A `FULL` scope restore — closed, it does not work.** `containers` is the other half of the resume
    gap — 1 247 ms against tar's 69 at 512 MiB — and [the sweep](#the-chain-depth-sweep)
    has eliminated every explanation for it but one. It is not chain depth, which
    the cost is flat across from 2 to 11; and it is not cold host page cache,
@@ -1411,7 +1416,11 @@ elsewhere: atelet's copy, and the guest's cold page cache.
    `qemu-img convert` having just written the whole image. What is left is the
    guest's own page cache being empty and ext4 walking metadata in 4 KiB reads,
    and the only restore that brings a guest page cache back with it is a `FULL`
-   one. This is now the only untried lever on the second half of the resume gap.
+   one. That was the last untried lever, and it has since been tried on
+   `glutton-durdir-full`: it does not work. Resume p50 goes from 5 100 ms to
+   8 800 ms on qcow2 and 3 200 to 4 700 on tar, widening the ratio from 1.59× to
+   1.87× — moving the guest's memory costs more than the cold reads it saves.
+   This half of the gap has no known remedy.
 3. Re-run the two largest steps at their committed 20m and 30m durations, now
    that the route timeout no longer caps a write at 10 s. Until then the sweep
    has no valid data point above 500 MiB.
