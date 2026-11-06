@@ -472,6 +472,22 @@ def _harvest_snapshots(
     c_end = round(count_end) if count_end is not None else None
     snap_avg = _ratio(delta(snap_selector % "_sum"), count, scale=mb)
 
+    # Uploads record what object storage holds, after compression. Every
+    # uploaded snapshot writes one manifest.json, whatever its fidelity.
+    upload_mem = (
+        "atelet_snapshot_upload_size_bytes%s"
+        '{file_name=~"pages.img|memory-ranges"}'
+    )
+    upload_avg = _ratio(
+        delta(upload_mem % "_sum"), delta(upload_mem % "_count"), scale=mb
+    )
+    uploads = delta(
+        'atelet_snapshot_upload_size_bytes_count{file_name="manifest.json"}'
+    )
+    upload_total = _ratio(
+        delta("atelet_snapshot_upload_size_bytes_sum"), uploads, scale=mb
+    )
+
     def op_mean(op: str) -> float | None:
         return _ratio(
             delta(_snapshot_op(op, "sum")), delta(_snapshot_op(op, "count"))
@@ -493,6 +509,8 @@ def _harvest_snapshots(
         "size_p95_mb": size_q[2],
         "size_p99_mb": size_q[3],
         "size_avg_mb": snap_avg,
+        "upload_size_avg_mb": upload_avg,
+        "upload_total_avg_mb": upload_total,
         "checkpoints_in_window": window_checkpoints,
         "checkpoints_cumulative": c_end,
         "restore_p50_s": restore_q[0],
@@ -903,6 +921,12 @@ def extract_and_record_server_telemetry(
     for p in ps:
         measurements[f"snapshot_size_{p}_mb"] = snaps.get(f"size_{p}_mb")
     measurements["snapshot_size_avg_mb"] = snaps.get("size_avg_mb")
+    measurements["snapshot_upload_size_avg_mb"] = snaps.get(
+        "upload_size_avg_mb"
+    )
+    measurements["snapshot_upload_total_avg_mb"] = snaps.get(
+        "upload_total_avg_mb"
+    )
     measurements["checkpoints_in_window"] = snaps.get("checkpoints_in_window")
     for rpc in ("restore", "checkpoint"):
         for p in ps:

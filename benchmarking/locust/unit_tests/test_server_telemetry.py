@@ -99,6 +99,11 @@ SUMS = {
     "count": "atelet_snapshot_size_bytes_count" + MEMORY_IMAGE,
     "size": "atelet_snapshot_size_bytes_sum" + MEMORY_IMAGE,
     "bytes": "sum(atelet_snapshot_size_bytes_sum)",
+    "upload_count": "atelet_snapshot_upload_size_bytes_count" + MEMORY_IMAGE,
+    "upload_size": "atelet_snapshot_upload_size_bytes_sum" + MEMORY_IMAGE,
+    "upload_manifests":
+        'atelet_snapshot_upload_size_bytes_count{file_name="manifest.json"}',
+    "upload_bytes": "sum(atelet_snapshot_upload_size_bytes_sum)",
     # Checkpoint seconds: both checkpoint_mb_s and checkpoint_mean_s read it.
     "seconds": "ate_actor_checkpoint_duration_seconds_sum" + SNAPSHOT_OP,
     "restore_sum": "ate_actor_restore_duration_seconds_sum" + SNAPSHOT_OP,
@@ -266,7 +271,9 @@ class ServerTelemetryTest(unittest.TestCase):
                    "checkpoint_count": "0"},
             end={"count": "150", "size": str(100 * MB), "bytes": str(100 * MB),
                  "seconds": "50", "restore_sum": "4", "restore_count": "8",
-                 "checkpoint_count": "25"},
+                 "checkpoint_count": "25", "upload_count": "50",
+                 "upload_manifests": "50",
+                 "upload_size": str(25 * MB), "upload_bytes": str(40 * MB)},
             at=(135, 140), oom="0")
 
         with tempfile.TemporaryDirectory() as td:
@@ -320,7 +327,7 @@ class ServerTelemetryTest(unittest.TestCase):
         self.assertEqual(row["metric"], "server_summary")
         m = row["measurements"]
         # Every source answered, so a key wired to a wrong name would read None.
-        self.assertEqual(len(m), 80)
+        self.assertEqual(len(m), 82)
         self.assertEqual([k for k, v in m.items() if v is None], [])
         # Every value a string, so one row's types match every other row's.
         self.assertTrue(all(isinstance(v, str) for v in m.values()))
@@ -329,6 +336,8 @@ class ServerTelemetryTest(unittest.TestCase):
         self.assertEqual(m["psi_cpu_stall_p90"], "0.0")
         self.assertEqual(m["cluster_packing_p95"], "0.8")
         self.assertEqual(m["snapshot_size_p95_mb"], "11.5")
+        self.assertEqual(m["snapshot_upload_size_avg_mb"], "0.5")
+        self.assertEqual(m["snapshot_upload_total_avg_mb"], "0.8")
         self.assertEqual(m["restore_mean_s"], "0.5")
         self.assertEqual(m["checkpoint_mean_s"], "2.0")
         self.assertEqual(m["active_actors_p99"], "3.0")
@@ -405,6 +414,8 @@ class ServerTelemetryTest(unittest.TestCase):
         self.assertIsNone(snaps["checkpoint_mb_s"])
         self.assertIsNone(snaps["size_p95_mb"])
         self.assertIsNone(snaps["size_avg_mb"])
+        self.assertIsNone(snaps["upload_size_avg_mb"])
+        self.assertIsNone(snaps["upload_total_avg_mb"])
         self.assertIsNone(snaps["restore_mean_s"])
 
         # 0 bytes written over 4s -> measured 0.0.
@@ -631,6 +642,36 @@ class ServerTelemetryTest(unittest.TestCase):
         self.assertTrue(any("_sum" + MEMORY_IMAGE in q for q in sizes))
         self.assertFalse(any('file_name="pages.img"' in q for q in sizes))
         self.assertIn("sum(atelet_snapshot_size_bytes_sum)", queries)
+
+    @mock.patch("server_telemetry.query_prometheus_instant")
+    def test_upload_sizes_per_uploaded_snapshot(self, mock_instant):
+        # 20 uploads stored 30 MiB of memory images and 50 MiB of every file.
+        mock_instant.side_effect = snapshot_prom(
+            "1.0",
+            start={"upload_count": "10", "upload_manifests": "10",
+                   "upload_size": str(10 * MB), "upload_bytes": str(20 * MB)},
+            end={"upload_count": "30", "upload_manifests": "30",
+                 "upload_size": str(40 * MB), "upload_bytes": str(70 * MB)})
+        snaps = snapshots()
+        self.assertEqual(snaps["upload_size_avg_mb"], 1.5)
+        self.assertEqual(snaps["upload_total_avg_mb"], 2.5)
+
+        # Data-only (VOLUMES/ROOTFS) uploads write manifest.json and no memory
+        # image: upload_total_avg_mb still resolves while upload_size_avg_mb is None.
+        mock_instant.side_effect = snapshot_prom(
+            "1.0",
+            start={"upload_manifests": "5", "upload_bytes": str(10 * MB)},
+            end={"upload_manifests": "15", "upload_bytes": str(35 * MB)})
+        snaps = snapshots()
+        self.assertIsNone(snaps["upload_size_avg_mb"])
+        self.assertEqual(snaps["upload_total_avg_mb"], 2.5)
+
+        # No upload in the window -> None.
+        mock_instant.side_effect = snapshot_prom(
+            "1.0",
+            start={"upload_manifests": "10", "upload_bytes": str(20 * MB)},
+            end={"upload_manifests": "10", "upload_bytes": str(20 * MB)})
+        self.assertIsNone(snapshots()["upload_total_avg_mb"])
 
     @mock.patch("server_telemetry.query_prometheus_instant")
     def test_restore_and_checkpoint_read_atelet_histograms(self, mock_instant):

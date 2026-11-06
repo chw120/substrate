@@ -916,6 +916,12 @@ actually did, independent of what the load generator reported.
   pod's samples pooled. `pod_psi.pods` is how many pods were seen.
 * `snapshots.size_p50_mb` through `size_p99_mb`: actor memory image sizes.
 * `snapshots.size_avg_mb`: mean memory image size.
+* `snapshots.upload_size_avg_mb`: mean memory image size in object storage,
+  after compression (`atelet.snapshot.upload.size`).
+* `snapshots.upload_total_avg_mb`: mean size in object storage of all the files
+  of one uploaded snapshot, across every snapshot fidelity. Both count uploads
+  completed in the steady-state window, so a run that keeps its snapshots on
+  the node (or defers uploads past the window) reports `null`.
 * `snapshots.restore_p50_s` through `restore_p99_s`, `restore_mean_s`, and the
   same for `checkpoint_*`: how long the atelet took to resume or suspend an
   actor (`ate_actor_{restore,checkpoint}_duration`, `total` phase). Every
