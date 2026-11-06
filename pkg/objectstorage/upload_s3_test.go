@@ -110,7 +110,7 @@ func TestUploaderSlowS3Multipart(t *testing.T) {
 						file, err := os.Open(path)
 						if err == nil {
 							defer file.Close()
-							err = u.SendFile(t.Context(), "gs://bucket/"+name, file)
+							_, err = u.SendFile(t.Context(), "gs://bucket/"+name, file)
 						}
 						done <- err
 					}()

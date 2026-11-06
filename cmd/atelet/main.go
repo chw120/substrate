@@ -958,9 +958,7 @@ func initSnapshotSizeMetric() error {
 		metric.WithUnit("By"),
 		metric.WithDescription("Uncompressed allocated size in bytes of each snapshot image written during checkpoint."),
 
-		metric.WithExplicitBucketBoundaries(
-			1e6, 5e6, 1e7, 2.5e7, 5e7, 1e8, 2.5e8, 5e8, 1e9, 2e9, 5e9, 1e10,
-		),
+		metric.WithExplicitBucketBoundaries(snapshotSizeBuckets...),
 	)
 	return err
 }
@@ -1407,8 +1405,10 @@ func (s *Atelet) uploadExternalCheckpoint(ctx context.Context, req *ateletpb.Che
 // files, never a manifest pointing at files that never landed; retries
 // overwrite the deterministic object names. opts are passed to every plugin
 // call, and plugin errors are returned as uploadSnapshotFiles returns them.
+// Once the manifest is up, it records the bytes the plugin stored for each file.
 func (s *Atelet) uploadSnapshot(ctx context.Context, actor actorRef, uri resources.SnapshotURI, srcDir string, rec *sandboxAssetsRecord, opts ...grpc.CallOption) error {
-	if err := s.uploadSnapshotFiles(ctx, actor, uri.String(), srcDir, rec.SnapshotFiles, opts...); err != nil {
+	stored, err := s.uploadSnapshotFiles(ctx, actor, uri.String(), srcDir, rec.SnapshotFiles, opts...)
+	if err != nil {
 		return fmt.Errorf("while uploading snapshot files: %w", err)
 	}
 
@@ -1419,8 +1419,17 @@ func (s *Atelet) uploadSnapshot(ctx context.Context, actor actorRef, uri resourc
 	if err != nil {
 		return fmt.Errorf("while marshaling snapshot manifest: %w", err)
 	}
-	if err := s.uploadManifest(ctx, actor, uri.String(), manifest, opts...); err != nil {
+	manifestStored, err := s.uploadManifest(ctx, actor, uri.String(), manifest, opts...)
+	if err != nil {
 		return fmt.Errorf("while uploading snapshot manifest: %w", err)
+	}
+	for _, file := range rec.SnapshotFiles {
+		if n, ok := stored[file]; ok && n >= 0 {
+			s.instruments.recordSnapshotUploadSize(ctx, file, n, rec.ActorTemplateAtespace, rec.ActorTemplateName)
+		}
+	}
+	if n, ok := manifestStored[sandboxManifestName]; ok && n >= 0 {
+		s.instruments.recordSnapshotUploadSize(ctx, sandboxManifestName, n, rec.ActorTemplateAtespace, rec.ActorTemplateName)
 	}
 	return nil
 }

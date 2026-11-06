@@ -93,7 +93,13 @@ message UploadSnapshotRequest {
   repeated string files = 4;
 }
 
-message UploadSnapshotResponse {}
+// UploadSnapshotResponse reports what UploadSnapshot stored.
+message UploadSnapshotResponse {
+  // Bytes the platform stores for each file, keyed by its name in files,
+  // after any compression. Values are non-negative. A plugin that cannot tell
+  // leaves a file out.
+  map<string, int64> stored_bytes = 1;
+}
 
 // ControlProvider is the plugin API an object storage platform
 // implements for the control plane. ate-api-server calls it to manage whole

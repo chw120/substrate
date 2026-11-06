@@ -71,6 +71,7 @@ func (g *gcsClient) PutSparseFile(ctx context.Context, bucket, object string, f 
 	}
 	defer removeScratch(ctx, parts)
 
+	written := make([]countingWriter, len(groups))
 	grp, gctx := errgroup.WithContext(ctx)
 	for i, ranges := range groups {
 		grp.Go(func() error {
@@ -78,7 +79,8 @@ func (g *gcsClient) PutSparseFile(ctx context.Context, bucket, object string, f 
 			obj := g.uploadClient(i).Bucket(bucket).Object(parts[i].ObjectName())
 			w := obj.NewWriter(gctx)
 			w.ChunkSize = partWriterChunk
-			if err := writeSparsePart(contextWriter{ctx: gctx, dst: w}, f, size, ranges, i == 0, i == len(groups)-1); err != nil {
+			written[i].w = w
+			if err := writeSparsePart(contextWriter{ctx: gctx, dst: &written[i]}, f, size, ranges, i == 0, i == len(groups)-1); err != nil {
 				_ = w.Close()
 				return fmt.Errorf("while writing part %d of %q: %w", i, object, err)
 			}
@@ -87,6 +89,10 @@ func (g *gcsClient) PutSparseFile(ctx context.Context, bucket, object string, f 
 	}
 	if err := grp.Wait(); err != nil {
 		return res, err
+	}
+	// The composed object is the parts back to back.
+	for i := range written {
+		res.compressedBytes += written[i].n
 	}
 	return res, composeAll(ctx, bkt, object, parts, runID)
 }

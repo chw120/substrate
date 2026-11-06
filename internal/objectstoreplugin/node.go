@@ -29,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 
 	"go.ate.dev/substrate/api/objectstore/v1"
 	"go.ate.dev/substrate/internal/resources"
@@ -149,6 +150,13 @@ func (p *NodePlugin) UploadSnapshot(ctx context.Context, req *objectstore.Upload
 	defer root.Close()
 	tr := p.begin(req.GetActorJwt())
 
+	var mu sync.Mutex
+	stored := make(map[string]int64, len(req.GetFiles()))
+	record := func(fileName string, n int64) {
+		mu.Lock()
+		defer mu.Unlock()
+		stored[fileName] = n
+	}
 	upload := func(ctx context.Context, fileName string) error {
 		local, err := root.Open(fileName)
 		if err != nil {
@@ -163,21 +171,29 @@ func (p *NodePlugin) UploadSnapshot(ctx context.Context, req *objectstore.Upload
 			return fmt.Errorf("snapshot file %s is not a regular file", fileName)
 		}
 		if fileName == manifestFile {
-			return p.uploadManifest(ctx, tr, uri, local)
+			if err := p.uploadManifest(ctx, tr, uri, local); err != nil {
+				return err
+			}
+			record(fileName, info.Size())
+			return nil
 		}
 		objectURI, err := uri.ObjectURI(fileName + ".zstd")
 		if err != nil {
 			return fmt.Errorf("while addressing %s in GCS: %w", fileName, err)
 		}
+		var n int64
 		err = tr.do(ctx, func(_ objectstorage.ObjectStorage, uploader *objectstorage.Uploader) error {
 			if err := rewind(local); err != nil {
 				return err
 			}
-			return uploader.SendFile(ctx, objectURI, local)
+			sent, err := uploader.SendFile(ctx, objectURI, local)
+			n = sent
+			return err
 		})
 		if err != nil {
 			return fmt.Errorf("while uploading %s to GCS: %w", fileName, err)
 		}
+		record(fileName, n)
 		return nil
 	}
 	g, gCtx := errgroup.WithContext(ctx)
@@ -196,7 +212,7 @@ func (p *NodePlugin) UploadSnapshot(ctx context.Context, req *objectstore.Upload
 			return nil, toStatus(err)
 		}
 	}
-	return &objectstore.UploadSnapshotResponse{}, nil
+	return &objectstore.UploadSnapshotResponse{StoredBytes: stored}, nil
 }
 
 // fetchManifest downloads the uncompressed manifest into root.

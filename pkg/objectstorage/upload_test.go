@@ -168,7 +168,10 @@ func TestUploaderSmallSparseFilesShareBudget(t *testing.T) {
 		}
 		done := make(chan error, len(files))
 		for _, f := range files {
-			go func() { done <- u.SendFile(t.Context(), "gs://bucket/"+filepath.Base(f.Name()), f) }()
+			go func() {
+				_, err := u.SendFile(t.Context(), "gs://bucket/"+filepath.Base(f.Name()), f)
+				done <- err
+			}()
 		}
 		synctest.Wait()
 		if got := len(store.started); got != len(files) {
@@ -223,7 +226,10 @@ func TestUploaderWaitCancelAndRelease(t *testing.T) {
 				}
 				send := func(ctx context.Context, name string) <-chan error {
 					done := make(chan error, 1)
-					go func() { done <- u.sendZstd(ctx, "gs://bucket/"+name, strings.NewReader("payload")) }()
+					go func() {
+						_, err := u.sendZstd(ctx, "gs://bucket/"+name, strings.NewReader("payload"))
+						done <- err
+					}()
 					return done
 				}
 				first := send(t.Context(), "first")
@@ -278,7 +284,10 @@ func TestUploaderCancellationReleasesActiveReservation(t *testing.T) {
 		}
 		ctx, cancel := context.WithCancel(t.Context())
 		done := make(chan error, 1)
-		go func() { done <- u.sendZstd(ctx, "gs://bucket/canceled", strings.NewReader("payload")) }()
+		go func() {
+			_, err := u.sendZstd(ctx, "gs://bucket/canceled", strings.NewReader("payload"))
+			done <- err
+		}()
 		synctest.Wait()
 		<-store.started
 		cancel()
@@ -287,7 +296,7 @@ func TestUploaderCancellationReleasesActiveReservation(t *testing.T) {
 			t.Fatal(err)
 		}
 		close(gate)
-		if err := u.sendZstd(t.Context(), "gs://bucket/next", strings.NewReader("payload")); err != nil {
+		if _, err := u.sendZstd(t.Context(), "gs://bucket/next", strings.NewReader("payload")); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -299,10 +308,10 @@ func TestUploaderReadFailureReleasesReservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := errors.New("source failed")
-	if err := u.sendZstd(t.Context(), "gs://bucket/bad", failingUploadReader{want}); !errors.Is(err, want) {
+	if _, err := u.sendZstd(t.Context(), "gs://bucket/bad", failingUploadReader{want}); !errors.Is(err, want) {
 		t.Fatalf("got %v, want source error", err)
 	}
-	if err := u.sendZstd(t.Context(), "gs://bucket/next", strings.NewReader("payload")); err != nil {
+	if _, err := u.sendZstd(t.Context(), "gs://bucket/next", strings.NewReader("payload")); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -338,7 +347,7 @@ func TestUploaderDestinationFailureStopsCompression(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := u.SendFile(t.Context(), "gs://bucket/object", f); !errors.Is(err, want) {
+	if _, err := u.SendFile(t.Context(), "gs://bucket/object", f); !errors.Is(err, want) {
 		t.Fatalf("got %v, want destination error", err)
 	}
 	// Compression must stop before reading the full populated extent.

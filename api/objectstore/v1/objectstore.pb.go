@@ -230,8 +230,13 @@ func (x *UploadSnapshotRequest) GetFiles() []string {
 	return nil
 }
 
+// UploadSnapshotResponse reports what UploadSnapshot stored.
 type UploadSnapshotResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Bytes the platform stores for each file, keyed by its name in files,
+	// after any compression. Values are non-negative. A plugin that cannot tell
+	// leaves a file out.
+	StoredBytes   map[string]int64 `protobuf:"bytes,1,rep,name=stored_bytes,json=storedBytes,proto3" json:"stored_bytes,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -264,6 +269,13 @@ func (x *UploadSnapshotResponse) ProtoReflect() protoreflect.Message {
 // Deprecated: Use UploadSnapshotResponse.ProtoReflect.Descriptor instead.
 func (*UploadSnapshotResponse) Descriptor() ([]byte, []int) {
 	return file_api_objectstore_v1_objectstore_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *UploadSnapshotResponse) GetStoredBytes() map[string]int64 {
+	if x != nil {
+		return x.StoredBytes
+	}
+	return nil
 }
 
 // CleanupSnapshotRequest names the snapshots to delete.
@@ -575,8 +587,12 @@ const file_api_objectstore_v1_objectstore_proto_rawDesc = "" +
 	"\tactor_jwt\x18\x02 \x01(\tB\x03\x80\x01\x01R\bactorJwt\x12\x1d\n" +
 	"\n" +
 	"local_path\x18\x03 \x01(\tR\tlocalPath\x12\x14\n" +
-	"\x05files\x18\x04 \x03(\tR\x05files\"\x18\n" +
-	"\x16UploadSnapshotResponse\";\n" +
+	"\x05files\x18\x04 \x03(\tR\x05files\"\xbe\x01\n" +
+	"\x16UploadSnapshotResponse\x12d\n" +
+	"\fstored_bytes\x18\x01 \x03(\v2A.substrate.objectstore.v1.UploadSnapshotResponse.StoredBytesEntryR\vstoredBytes\x1a>\n" +
+	"\x10StoredBytesEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\x03R\x05value:\x028\x01\";\n" +
 	"\x16CleanupSnapshotRequest\x12!\n" +
 	"\fsnapshot_uri\x18\x01 \x01(\tR\vsnapshotUri\"\x19\n" +
 	"\x17CleanupSnapshotResponse\"G\n" +
@@ -613,7 +629,7 @@ func file_api_objectstore_v1_objectstore_proto_rawDescGZIP() []byte {
 	return file_api_objectstore_v1_objectstore_proto_rawDescData
 }
 
-var file_api_objectstore_v1_objectstore_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
+var file_api_objectstore_v1_objectstore_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
 var file_api_objectstore_v1_objectstore_proto_goTypes = []any{
 	(*FetchSnapshotRequest)(nil),    // 0: substrate.objectstore.v1.FetchSnapshotRequest
 	(*FetchSnapshotResponse)(nil),   // 1: substrate.objectstore.v1.FetchSnapshotResponse
@@ -625,23 +641,25 @@ var file_api_objectstore_v1_objectstore_proto_goTypes = []any{
 	(*CopySnapshotResponse)(nil),    // 7: substrate.objectstore.v1.CopySnapshotResponse
 	(*FetchAssetRequest)(nil),       // 8: substrate.objectstore.v1.FetchAssetRequest
 	(*FetchAssetResponse)(nil),      // 9: substrate.objectstore.v1.FetchAssetResponse
+	nil,                             // 10: substrate.objectstore.v1.UploadSnapshotResponse.StoredBytesEntry
 }
 var file_api_objectstore_v1_objectstore_proto_depIdxs = []int32{
-	0, // 0: substrate.objectstore.v1.NodeProvider.FetchSnapshot:input_type -> substrate.objectstore.v1.FetchSnapshotRequest
-	2, // 1: substrate.objectstore.v1.NodeProvider.UploadSnapshot:input_type -> substrate.objectstore.v1.UploadSnapshotRequest
-	4, // 2: substrate.objectstore.v1.ControlProvider.CleanupSnapshot:input_type -> substrate.objectstore.v1.CleanupSnapshotRequest
-	6, // 3: substrate.objectstore.v1.ControlProvider.CopySnapshot:input_type -> substrate.objectstore.v1.CopySnapshotRequest
-	8, // 4: substrate.objectstore.v1.AssetProvider.FetchAsset:input_type -> substrate.objectstore.v1.FetchAssetRequest
-	1, // 5: substrate.objectstore.v1.NodeProvider.FetchSnapshot:output_type -> substrate.objectstore.v1.FetchSnapshotResponse
-	3, // 6: substrate.objectstore.v1.NodeProvider.UploadSnapshot:output_type -> substrate.objectstore.v1.UploadSnapshotResponse
-	5, // 7: substrate.objectstore.v1.ControlProvider.CleanupSnapshot:output_type -> substrate.objectstore.v1.CleanupSnapshotResponse
-	7, // 8: substrate.objectstore.v1.ControlProvider.CopySnapshot:output_type -> substrate.objectstore.v1.CopySnapshotResponse
-	9, // 9: substrate.objectstore.v1.AssetProvider.FetchAsset:output_type -> substrate.objectstore.v1.FetchAssetResponse
-	5, // [5:10] is the sub-list for method output_type
-	0, // [0:5] is the sub-list for method input_type
-	0, // [0:0] is the sub-list for extension type_name
-	0, // [0:0] is the sub-list for extension extendee
-	0, // [0:0] is the sub-list for field type_name
+	10, // 0: substrate.objectstore.v1.UploadSnapshotResponse.stored_bytes:type_name -> substrate.objectstore.v1.UploadSnapshotResponse.StoredBytesEntry
+	0,  // 1: substrate.objectstore.v1.NodeProvider.FetchSnapshot:input_type -> substrate.objectstore.v1.FetchSnapshotRequest
+	2,  // 2: substrate.objectstore.v1.NodeProvider.UploadSnapshot:input_type -> substrate.objectstore.v1.UploadSnapshotRequest
+	4,  // 3: substrate.objectstore.v1.ControlProvider.CleanupSnapshot:input_type -> substrate.objectstore.v1.CleanupSnapshotRequest
+	6,  // 4: substrate.objectstore.v1.ControlProvider.CopySnapshot:input_type -> substrate.objectstore.v1.CopySnapshotRequest
+	8,  // 5: substrate.objectstore.v1.AssetProvider.FetchAsset:input_type -> substrate.objectstore.v1.FetchAssetRequest
+	1,  // 6: substrate.objectstore.v1.NodeProvider.FetchSnapshot:output_type -> substrate.objectstore.v1.FetchSnapshotResponse
+	3,  // 7: substrate.objectstore.v1.NodeProvider.UploadSnapshot:output_type -> substrate.objectstore.v1.UploadSnapshotResponse
+	5,  // 8: substrate.objectstore.v1.ControlProvider.CleanupSnapshot:output_type -> substrate.objectstore.v1.CleanupSnapshotResponse
+	7,  // 9: substrate.objectstore.v1.ControlProvider.CopySnapshot:output_type -> substrate.objectstore.v1.CopySnapshotResponse
+	9,  // 10: substrate.objectstore.v1.AssetProvider.FetchAsset:output_type -> substrate.objectstore.v1.FetchAssetResponse
+	6,  // [6:11] is the sub-list for method output_type
+	1,  // [1:6] is the sub-list for method input_type
+	1,  // [1:1] is the sub-list for extension type_name
+	1,  // [1:1] is the sub-list for extension extendee
+	0,  // [0:1] is the sub-list for field type_name
 }
 
 func init() { file_api_objectstore_v1_objectstore_proto_init() }
@@ -655,7 +673,7 @@ func file_api_objectstore_v1_objectstore_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_objectstore_v1_objectstore_proto_rawDesc), len(file_api_objectstore_v1_objectstore_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   10,
+			NumMessages:   11,
 			NumExtensions: 0,
 			NumServices:   3,
 		},

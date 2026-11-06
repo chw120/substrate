@@ -69,25 +69,28 @@ func (s *Atelet) fetchSnapshotFiles(ctx context.Context, actor actorRef, snapsho
 }
 
 // uploadSnapshotFiles uploads the named files in srcDir to the snapshot,
-// passing opts to the plugin call. It returns the plugin's code without its
-// message, or the mint's, and leaves the Unavailable mapping to the caller:
-// an upload that can be retried reports it through pluginsocket.CallError,
-// one that cannot does not.
-func (s *Atelet) uploadSnapshotFiles(ctx context.Context, actor actorRef, snapshotURI, srcDir string, files []string, opts ...grpc.CallOption) error {
+// passing opts to the plugin call, and returns the bytes the plugin stored for
+// each file. It returns the plugin's code without its message, or the mint's,
+// and leaves the Unavailable mapping to the caller: an upload that can be
+// retried reports it through pluginsocket.CallError, one that cannot does not.
+func (s *Atelet) uploadSnapshotFiles(ctx context.Context, actor actorRef, snapshotURI, srcDir string, files []string, opts ...grpc.CallOption) (map[string]int64, error) {
 	if len(files) == 0 {
-		return nil
+		return nil, nil
 	}
 	jwt, err := s.workerActorJWT(ctx, actor)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	_, err = s.objectStorePlugin.UploadSnapshot(ctx, &objectstore.UploadSnapshotRequest{
+	resp, err := s.objectStorePlugin.UploadSnapshot(ctx, &objectstore.UploadSnapshotRequest{
 		SnapshotUri: snapshotURI,
 		LocalPath:   srcDir,
 		Files:       files,
 		ActorJwt:    jwt,
 	}, opts...)
-	return pluginCallError("upload", snapshotURI, err)
+	if err != nil {
+		return nil, pluginCallError("upload", snapshotURI, err)
+	}
+	return resp.GetStoredBytes(), nil
 }
 
 // fetchManifest returns a snapshot's manifest. The returned error is the
@@ -105,15 +108,15 @@ func (s *Atelet) fetchManifest(ctx context.Context, actor actorRef, snapshotURI 
 }
 
 // uploadManifest uploads manifest as the snapshot's manifest, as
-// uploadSnapshotFiles does.
-func (s *Atelet) uploadManifest(ctx context.Context, actor actorRef, snapshotURI string, manifest []byte, opts ...grpc.CallOption) error {
+// uploadSnapshotFiles does, and returns the bytes the plugin stored for it.
+func (s *Atelet) uploadManifest(ctx context.Context, actor actorRef, snapshotURI string, manifest []byte, opts ...grpc.CallOption) (map[string]int64, error) {
 	dir, err := s.snapshotScratch()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
 	if err := os.WriteFile(filepath.Join(dir, sandboxManifestName), manifest, 0o600); err != nil {
-		return fmt.Errorf("while staging snapshot manifest: %w", err)
+		return nil, fmt.Errorf("while staging snapshot manifest: %w", err)
 	}
 	return s.uploadSnapshotFiles(ctx, actor, snapshotURI, dir, []string{sandboxManifestName}, opts...)
 }

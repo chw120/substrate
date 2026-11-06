@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -329,7 +330,7 @@ func TestPlainZstdBackwardCompatRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	const gsURL = "gs://bucket/snap/config.json.zstd"
 	// Use a non-file reader to hit the plain-zstd branch (no magic).
-	if err := sendZstd(ctx, store, gsURL, bytes.NewReader(want)); err != nil {
+	if _, err := sendZstd(ctx, store, gsURL, bytes.NewReader(want)); err != nil {
 		t.Fatalf("upload: %v", err)
 	}
 	stored := store.m["bucket/snap/config.json.zstd"]
@@ -347,6 +348,63 @@ func TestPlainZstdBackwardCompatRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("plain round-trip mismatch: len(got)=%d len(want)=%d", len(got), len(want))
+	}
+}
+
+// TestSendZstdReturnsStoredSize checks that each upload path returns the size of
+// the object it stored. PutSparseFile has its own test, since it needs GCS.
+func TestSendZstdReturnsStoredSize(t *testing.T) {
+	const size = 8 << 20
+	srcPath := filepath.Join(t.TempDir(), "memory-ranges")
+	src, err := os.Create(srcPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := src.Truncate(size); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := src.WriteAt(bytes.Repeat([]byte("resident page\n"), 5000), 2<<20); err != nil {
+		t.Fatal(err)
+	}
+	src.Close()
+
+	for _, tc := range []struct {
+		name      string
+		streaming bool
+		file      bool
+	}{
+		{name: "buffered file", file: true},
+		{name: "streaming file", streaming: true, file: true},
+		{name: "buffered reader"},
+		{name: "streaming reader", streaming: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newMemStore()
+			var client ObjectStorage = store
+			if tc.streaming {
+				client = &streamingMemStore{store}
+			}
+			var content io.Reader = strings.NewReader("config payload")
+			if tc.file {
+				f, err := os.Open(srcPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer f.Close()
+				content = f
+			}
+			u, err := NewUploader(client, DefaultUploadMemory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := u.sendZstd(t.Context(), "gs://bucket/object", content)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := int64(len(store.m["bucket/object"])); got != want || want == 0 {
+				t.Errorf("sendZstd() = %d, want the stored object's %d bytes", got, want)
+			}
+		})
 	}
 }
 

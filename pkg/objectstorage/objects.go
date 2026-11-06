@@ -147,7 +147,7 @@ func SendLocalFileToGCSWithZstd(ctx context.Context, client ObjectStorage, gsURL
 		}
 	}()
 
-	if err := sendZstd(ctx, client, gsURL, localFile); err != nil {
+	if _, err := sendZstd(ctx, client, gsURL, localFile); err != nil {
 		return fmt.Errorf("in sendZstd: %w", err)
 	}
 
@@ -177,6 +177,20 @@ type writeContentResult struct {
 	populatedBytes int64
 	// sparse is true when the sparse-extent format was used (the source was a file).
 	sparse bool
+	// compressedBytes is the size of what was written: the stored object.
+	compressedBytes int64
+}
+
+// countingWriter counts the bytes written through it.
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(b []byte) (int, error) {
+	n, err := c.w.Write(b)
+	c.n += int64(n)
+	return n, err
 }
 
 // writeContent compresses content to out, choosing the sparse-extent format for a
@@ -184,28 +198,30 @@ type writeContentResult struct {
 // plain zstd stream otherwise. It touches only io, so it is unit-testable without
 // an object store, and is shared by the buffered and streaming upload paths.
 func writeContent(ctx context.Context, out io.Writer, content io.Reader, workers int) (writeContentResult, error) {
+	cw := &countingWriter{w: out}
 	if sf, ok := content.(*sparseFile); ok {
-		logical, populated, err := writeSparseExtents(ctx, out, sf.File, sf.size, sf.exts, sf.populated, workers)
+		logical, populated, err := writeSparseExtents(ctx, cw, sf.File, sf.size, sf.exts, sf.populated, workers)
 		if err != nil {
 			return writeContentResult{}, err
 		}
-		return writeContentResult{logicalBytes: logical, populatedBytes: populated, sparse: true}, nil
+		return writeContentResult{logicalBytes: logical, populatedBytes: populated, sparse: true, compressedBytes: cw.n}, nil
 	}
 	if f, ok := content.(*os.File); ok {
-		logical, populated, err := writeSparseZstd(ctx, out, f, workers)
+		logical, populated, err := writeSparseZstd(ctx, cw, f, workers)
 		if err != nil {
 			return writeContentResult{}, err
 		}
-		return writeContentResult{logicalBytes: logical, populatedBytes: populated, sparse: true}, nil
+		return writeContentResult{logicalBytes: logical, populatedBytes: populated, sparse: true, compressedBytes: cw.n}, nil
 	}
-	logical, err := plainZstd(ctx, out, content, workers)
+	logical, err := plainZstd(ctx, cw, content, workers)
 	if err != nil {
 		return writeContentResult{}, err
 	}
-	return writeContentResult{logicalBytes: logical, populatedBytes: logical}, nil
+	return writeContentResult{logicalBytes: logical, populatedBytes: logical, compressedBytes: cw.n}, nil
 }
 
-// sendZstd zstd-compresses content and uploads it to gsURL.
+// sendZstd zstd-compresses content, uploads it to gsURL, and returns the size of
+// the stored object.
 //
 // The snapshot memory-ranges is the large object here (the whole guest RAM image,
 // mostly zero) on the SUSPEND critical path, so we compress with SpeedFastest within
@@ -219,23 +235,23 @@ func writeContent(ctx context.Context, out io.Writer, content io.Reader, workers
 //     stage the ~100MiB compressed payload to a temp file.
 //   - Other backends receive a seekable temporary file containing the compressed
 //     content.
-func sendZstd(ctx context.Context, client ObjectStorage, gsURL string, content io.Reader) error {
+func sendZstd(ctx context.Context, client ObjectStorage, gsURL string, content io.Reader) (int64, error) {
 	u := &Uploader{client: client, budget: defaultUploadBudget}
 	return u.sendZstd(ctx, gsURL, content)
 }
 
-func (u *Uploader) sendZstd(ctx context.Context, gsURL string, content io.Reader) error {
+func (u *Uploader) sendZstd(ctx context.Context, gsURL string, content io.Reader) (int64, error) {
 	client := u.client
 	bucket, object, err := parseGCSURL(gsURL)
 	if err != nil {
-		return fmt.Errorf("while parsing URL: %w", err)
+		return 0, fmt.Errorf("while parsing URL: %w", err)
 	}
 	plan, streamMax, plannedContent, err := u.planStream(content)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if err := u.budget.reserved.Acquire(ctx, plan.memory); err != nil {
-		return fmt.Errorf("waiting for upload memory: %w", err)
+		return 0, fmt.Errorf("waiting for upload memory: %w", err)
 	}
 	defer u.budget.reserved.Release(plan.memory)
 	tStart := time.Now()
@@ -249,14 +265,15 @@ func (u *Uploader) sendZstd(ctx context.Context, gsURL string, content io.Reader
 					slog.Bool("ranged", true),
 					slog.Int64("logical_bytes", res.logicalBytes),
 					slog.Int64("populated_bytes", res.populatedBytes),
+					slog.Int64("compressed_bytes", res.compressedBytes),
 					slog.Duration("total", time.Since(tStart)))
-				return nil
+				return res.compressedBytes, nil
 			case !errors.Is(err, errSparseTooSmall):
-				return fmt.Errorf("while putting object %q: %w", object, err)
+				return 0, fmt.Errorf("while putting object %q: %w", object, err)
 			}
 			// Too small to split: fall through to the streaming path.
 			if _, err := f.Seek(0, io.SeekStart); err != nil {
-				return err
+				return 0, err
 			}
 		}
 	}
@@ -269,10 +286,10 @@ func (u *Uploader) sendZstd(ctx context.Context, gsURL string, content io.Reader
 // sendBufferedZstd compresses content to a seekable temp file, then uploads it.
 // Used for backends that require a seekable body; the streaming counterpart is
 // sendStreamingZstd.
-func sendBufferedZstd(ctx context.Context, client ObjectStorage, bucket, object string, content io.Reader, tStart time.Time, workers int) error {
+func sendBufferedZstd(ctx context.Context, client ObjectStorage, bucket, object string, content io.Reader, tStart time.Time, workers int) (int64, error) {
 	tmpFile, err := os.CreateTemp("", "substrate-upload-compress-")
 	if err != nil {
-		return fmt.Errorf("while creating temp compress file: %w", err)
+		return 0, fmt.Errorf("while creating temp compress file: %w", err)
 	}
 	defer os.Remove(tmpFile.Name())
 	defer tmpFile.Close()
@@ -280,21 +297,22 @@ func sendBufferedZstd(ctx context.Context, client ObjectStorage, bucket, object 
 	t0 := time.Now()
 	res, err := writeContent(ctx, tmpFile, content, workers)
 	if err != nil {
-		return fmt.Errorf("while compressing %q: %w", object, err)
+		return 0, fmt.Errorf("while compressing %q: %w", object, err)
 	}
 	dCompress := time.Since(t0)
 
 	if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("while seeking temp file: %w", err)
+		return 0, fmt.Errorf("while seeking temp file: %w", err)
 	}
 	if err := client.PutObject(ctx, bucket, object, tmpFile); err != nil {
-		return fmt.Errorf("while putting object %q: %w", object, err)
+		return 0, fmt.Errorf("while putting object %q: %w", object, err)
 	}
 	slog.InfoContext(ctx, "Compressed zstd upload",
 		slog.String("object", object), slog.Bool("sparse", res.sparse),
 		slog.Int64("logical_bytes", res.logicalBytes), slog.Int64("populated_bytes", res.populatedBytes),
+		slog.Int64("compressed_bytes", res.compressedBytes),
 		slog.Duration("compress", dCompress), slog.Duration("total", time.Since(tStart)))
-	return nil
+	return res.compressedBytes, nil
 }
 
 // sendStreamingZstd compresses content and uploads it in one overlapped pass: a
@@ -302,7 +320,7 @@ func sendBufferedZstd(ctx context.Context, client ObjectStorage, bucket, object 
 // PutObject streams the read end to the object store. No seekable temp file, and
 // the compress runs concurrently with the network PUT. Used only for streaming
 // backends (GCS and S3); see sendZstd.
-func sendStreamingZstd(ctx context.Context, client ObjectStorage, bucket, object string, content io.Reader, tStart time.Time, workers int, streamMax int64) error {
+func sendStreamingZstd(ctx context.Context, client ObjectStorage, bucket, object string, content io.Reader, tStart time.Time, workers int, streamMax int64) (int64, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	type result struct {
@@ -331,16 +349,17 @@ func sendStreamingZstd(ctx context.Context, client ObjectStorage, bucket, object
 	}
 	r := <-ch
 	if putErr != nil {
-		return fmt.Errorf("while putting object %q: %w", object, putErr)
+		return 0, fmt.Errorf("while putting object %q: %w", object, putErr)
 	}
 	if r.err != nil {
-		return fmt.Errorf("while compressing %q: %w", object, r.err)
+		return 0, fmt.Errorf("while compressing %q: %w", object, r.err)
 	}
 	slog.InfoContext(ctx, "Compressed zstd upload",
 		slog.String("object", object), slog.Bool("sparse", r.res.sparse), slog.Bool("streaming", true),
 		slog.Int64("logical_bytes", r.res.logicalBytes), slog.Int64("populated_bytes", r.res.populatedBytes),
+		slog.Int64("compressed_bytes", r.res.compressedBytes),
 		slog.Duration("total", time.Since(tStart)))
-	return nil
+	return r.res.compressedBytes, nil
 }
 
 // plainZstd writes src to w as a single plain zstd stream and returns the

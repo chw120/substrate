@@ -176,7 +176,7 @@ func BenchmarkConcurrentSnapshotUploads(b *testing.B) {
 							return
 						}
 						defer f.Close()
-						if err := u.SendFile(b.Context(), fmt.Sprintf("gs://bucket/file%d", i), f); err != nil {
+						if _, err := u.SendFile(b.Context(), fmt.Sprintf("gs://bucket/file%d", i), f); err != nil {
 							b.Error(err)
 						}
 					})
@@ -256,7 +256,7 @@ func BenchmarkLargeSparseUpload(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
-			err = u.SendFile(b.Context(), "gs://bucket/pages.img", f)
+			_, err = u.SendFile(b.Context(), "gs://bucket/pages.img", f)
 			f.Close()
 			if err != nil {
 				b.Fatal(err)
@@ -281,7 +281,7 @@ func BenchmarkLargeSparseUpload(b *testing.B) {
 							return
 						}
 						defer f.Close()
-						if err := u.SendFile(b.Context(), fmt.Sprintf("gs://bucket/a%d-small-%d.img", actor, i), f); err != nil {
+						if _, err := u.SendFile(b.Context(), fmt.Sprintf("gs://bucket/a%d-small-%d.img", actor, i), f); err != nil {
 							b.Error(err)
 						}
 					})
@@ -293,7 +293,7 @@ func BenchmarkLargeSparseUpload(b *testing.B) {
 						return
 					}
 					defer f.Close()
-					if err := u.SendFile(b.Context(), fmt.Sprintf("gs://bucket/a%d-pages.img", actor), f); err != nil {
+					if _, err := u.SendFile(b.Context(), fmt.Sprintf("gs://bucket/a%d-pages.img", actor), f); err != nil {
 						b.Error(err)
 					}
 				})

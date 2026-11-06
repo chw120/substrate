@@ -155,7 +155,7 @@ func TestTransfersCarryTheActorJWT(t *testing.T) {
 	if err := s.fetchSnapshotFiles(t.Context(), testActor, pausedSnapshotURI, t.TempDir(), []string{"a"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.uploadSnapshotFiles(t.Context(), testActor, pausedSnapshotURI, t.TempDir(), []string{"a"}); err != nil {
+	if _, err := s.uploadSnapshotFiles(t.Context(), testActor, pausedSnapshotURI, t.TempDir(), []string{"a"}); err != nil {
 		t.Fatal(err)
 	}
 	if len(plugin.fetches) != 1 || plugin.fetches[0].GetActorJwt() != "test-actor-jwt" {

@@ -21,11 +21,14 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 
@@ -36,6 +39,8 @@ import (
 type slowGCSTransport struct {
 	parts   chan string
 	release <-chan struct{}
+	// sent adds up the object bytes the uploads carry.
+	sent atomic.Int64
 }
 
 func (s *slowGCSTransport) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -58,9 +63,11 @@ func (s *slowGCSTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		if r.URL.Query().Get("uploadType") == "multipart" {
 			name = r.URL.Query().Get("name")
 		}
-		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+		n, err := objectBytes(r)
+		if err != nil {
 			return nil, err
 		}
+		s.sent.Add(n)
 		s.parts <- name
 		select {
 		case <-s.release:
@@ -75,6 +82,51 @@ func (s *slowGCSTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	default:
 		return nil, fmt.Errorf("unexpected GCS request: %s %s", r.Method, r.URL)
 	}
+}
+
+// objectBytes reads an upload's body and returns how many bytes of the object it
+// carries: all of a resumable upload's body, or a multipart upload's media part.
+func objectBytes(r *http.Request) (int64, error) {
+	if r.URL.Query().Get("uploadType") != "multipart" {
+		return io.Copy(io.Discard, r.Body)
+	}
+	_, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil {
+		return 0, err
+	}
+	mr := multipart.NewReader(r.Body, params["boundary"])
+	if _, err := mr.NextPart(); err != nil { // the object's metadata
+		return 0, err
+	}
+	media, err := mr.NextPart()
+	if err != nil {
+		return 0, err
+	}
+	return io.Copy(io.Discard, media)
+}
+
+// sparsePartsFile returns a mostly-hole file whose resident data PutSparseFile
+// splits into parts parts.
+func sparsePartsFile(t *testing.T, parts int) *os.File {
+	t.Helper()
+	file, err := os.Create(filepath.Join(t.TempDir(), "memory"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { file.Close() })
+	block := bytes.Repeat([]byte{0x5a}, 1<<20)
+	for range parts * sparsePartTarget / len(block) {
+		if _, err := file.Write(block); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := file.Truncate(2 << 30); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	return file
 }
 
 func TestUploaderSlowGCSComposite(t *testing.T) {
@@ -133,23 +185,7 @@ func TestUploaderSlowGCSComposite(t *testing.T) {
 }
 
 func TestGCSSparseUploadHonorsReservedParts(t *testing.T) {
-	file, err := os.Create(filepath.Join(t.TempDir(), "memory"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	block := bytes.Repeat([]byte{0x5a}, 1<<20)
-	for range 3 * sparsePartTarget / len(block) {
-		if _, err := file.Write(block); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := file.Truncate(2 << 30); err != nil {
-		t.Fatal(err)
-	}
-	if err := file.Sync(); err != nil {
-		t.Fatal(err)
-	}
+	file := sparsePartsFile(t, 3)
 	synctest.Test(t, func(t *testing.T) {
 		gate := make(chan struct{})
 		transport := &slowGCSTransport{parts: make(chan string, 8), release: gate}
@@ -176,6 +212,31 @@ func TestGCSSparseUploadHonorsReservedParts(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+}
+
+func TestGCSSparseUploadReturnsComposedSize(t *testing.T) {
+	file := sparsePartsFile(t, 2)
+	released := make(chan struct{})
+	close(released)
+	transport := &slowGCSTransport{parts: make(chan string, 8), release: released}
+	client, err := NewGCSClient(t.Context(), option.WithoutAuthentication(), option.WithHTTPClient(&http.Client{Transport: transport}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := client.(*gcsClient)
+	defer func() {
+		g.client.Close()
+		for _, c := range g.pool {
+			c.Close()
+		}
+	}()
+	res, err := g.PutSparseFile(t.Context(), "bucket", "memory", file, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := res.compressedBytes, transport.sent.Load(); got != want || want == 0 {
+		t.Errorf("compressedBytes = %d, want the %d bytes the parts uploaded", got, want)
+	}
 }
 
 func TestUploaderGCSSnapshotBurstFitsDefaultBudget(t *testing.T) {
@@ -220,11 +281,13 @@ func TestUploaderGCSSnapshotBurstFitsDefaultBudget(t *testing.T) {
 		done := make(chan error, len(smallFiles)+1)
 		for i, f := range smallFiles {
 			go func() {
-				done <- u.SendFile(t.Context(), fmt.Sprintf("gs://bucket/small-%d.img", i), f)
+				_, err := u.SendFile(t.Context(), fmt.Sprintf("gs://bucket/small-%d.img", i), f)
+				done <- err
 			}()
 		}
 		go func() {
-			done <- u.SendFile(t.Context(), "gs://bucket/pages.img", pages)
+			_, err := u.SendFile(t.Context(), "gs://bucket/pages.img", pages)
+			done <- err
 		}()
 		synctest.Wait()
 		// All 6 small files and both ranged parts of pages.img must fit in
@@ -343,7 +406,7 @@ func TestSingleUploadLookaheadThroughPublicUploaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := u.SendFile(t.Context(), "gs://bucket/small.img", sparseFile); err != nil {
+	if _, err := u.SendFile(t.Context(), "gs://bucket/small.img", sparseFile); err != nil {
 		t.Fatal(err)
 	}
 	if err := u.Send(t.Context(), "gs://bucket/manifest.json", manifestFile); err != nil {

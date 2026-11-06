@@ -169,9 +169,10 @@ func streamBufferMemory(client ObjectStorage, size int64) int64 {
 	return uploadBufferMemory(client)
 }
 
-// SendFile compresses and uploads an already-open snapshot file. The caller keeps
-// ownership of the file. Waiting for memory is canceled with ctx.
-func (u *Uploader) SendFile(ctx context.Context, url string, file *os.File) error {
+// SendFile compresses and uploads an already-open snapshot file, and returns the
+// size of the stored object. The caller keeps ownership of the file. Waiting for
+// memory is canceled with ctx.
+func (u *Uploader) SendFile(ctx context.Context, url string, file *os.File) (int64, error) {
 	ctx, span := tracer.Start(ctx, "sendFileToGCSWithZstd")
 	defer span.End()
 	return u.sendZstd(ctx, url, file)

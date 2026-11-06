@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -179,14 +180,16 @@ func TestUploadFetchRoundTrip(t *testing.T) {
 		}
 	}
 
-	if _, err := client.UploadSnapshot(ctx, &objectstore.UploadSnapshotRequest{
+	data, err := client.UploadSnapshot(ctx, &objectstore.UploadSnapshotRequest{
 		SnapshotUri: testURI, LocalPath: src, Files: []string{"memory.img", "state.bin", "fs/fscheckpoint.pb"},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("UploadSnapshot(data) = %v", err)
 	}
-	if _, err := client.UploadSnapshot(ctx, &objectstore.UploadSnapshotRequest{
+	manifest, err := client.UploadSnapshot(ctx, &objectstore.UploadSnapshotRequest{
 		SnapshotUri: testURI, LocalPath: src, Files: []string{manifestFile},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("UploadSnapshot(manifest) = %v", err)
 	}
 
@@ -202,6 +205,24 @@ func TestUploadFetchRoundTrip(t *testing.T) {
 	}
 	if got := backend.m[want[1]]; !bytes.Equal(got, files[manifestFile]) {
 		t.Errorf("stored manifest = %q, want it uncompressed", got)
+	}
+	// Each response reports the size of every object its call stored.
+	wantStored := func(names ...string) map[string]int64 {
+		m := map[string]int64{}
+		for _, name := range names {
+			object := testBucket + "/" + testPrefix + "/" + name
+			if name != manifestFile {
+				object += ".zstd"
+			}
+			m[name] = int64(len(backend.m[object]))
+		}
+		return m
+	}
+	if got, want := data.GetStoredBytes(), wantStored("memory.img", "state.bin", "fs/fscheckpoint.pb"); !maps.Equal(got, want) {
+		t.Errorf("UploadSnapshot(data) stored_bytes = %v, want %v", got, want)
+	}
+	if got, want := manifest.GetStoredBytes(), wantStored(manifestFile); !maps.Equal(got, want) {
+		t.Errorf("UploadSnapshot(manifest) stored_bytes = %v, want %v", got, want)
 	}
 
 	if _, err := client.FetchSnapshot(ctx, &objectstore.FetchSnapshotRequest{

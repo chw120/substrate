@@ -1828,8 +1828,13 @@ func TestRetriedCheckpointAnswersFromCommittedSnapshot(t *testing.T) {
 			if err := reader.Collect(t.Context(), &rm); err != nil {
 				t.Fatalf("collect: %v", err)
 			}
-			if len(rm.ScopeMetrics) != 0 {
-				t.Error("the retry recorded a checkpoint duration, want none")
+			// A retry that uploads records the upload's size, but no checkpoint.
+			for _, sm := range rm.ScopeMetrics {
+				for _, m := range sm.Metrics {
+					if m.Name == checkpointDurationMetric {
+						t.Error("the retry recorded a checkpoint duration, want none")
+					}
+				}
 			}
 		})
 	}

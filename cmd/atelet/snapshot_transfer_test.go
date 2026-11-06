@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -37,6 +38,9 @@ import (
 	"go.ate.dev/substrate/internal/pluginsocket"
 	"go.ate.dev/substrate/internal/resources"
 	"go.ate.dev/substrate/pkg/objectstorage"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
@@ -143,13 +147,131 @@ func TestUploadSnapshotManifestLast(t *testing.T) {
 	}
 }
 
+// TestUploadSnapshotRecordsStoredSize checks that each uploaded file, including
+// manifest.json, is recorded at the size the plugin stored it.
+func TestUploadSnapshotRecordsStoredSize(t *testing.T) {
+	store := &orderedObjectStorage{}
+	s := newPluginHerder(t, store)
+	var reader *sdkmetric.ManualReader
+	s.instruments, reader = newTestInstruments(t)
+	uri, err := resources.ParseSnapshotURI(pausedSnapshotURI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	rec := sandboxAssetsRecord{
+		SandboxClass:          "gvisor",
+		ActorTemplateAtespace: testTemplateNamespace,
+		ActorTemplateName:     testTemplateName,
+		SnapshotFiles:         []string{"pages.img", "checkpoint.img"},
+	}
+	for _, f := range rec.SnapshotFiles {
+		if err := os.WriteFile(filepath.Join(dir, f), bytes.Repeat([]byte(f), 4096), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.uploadSnapshot(t.Context(), testActor, uri, dir, &rec); err != nil {
+		t.Fatalf("uploadSnapshot: %v", err)
+	}
+
+	want := map[string]int64{}
+	for object, data := range store.data {
+		if strings.HasSuffix(object, "/"+sandboxManifestName) {
+			want[sandboxManifestName] = int64(len(data))
+		}
+		for _, f := range rec.SnapshotFiles {
+			if strings.HasSuffix(object, "/"+f+".zstd") {
+				want[f] = int64(len(data))
+			}
+		}
+	}
+	m := collectHistogram(t, reader, snapshotUploadSizeMetric)
+	if m.Unit != "By" {
+		t.Errorf("unit = %q, want By", m.Unit)
+	}
+	hist, ok := m.Data.(metricdata.Histogram[int64])
+	if !ok {
+		t.Fatalf("%s is %T, want an int64 histogram", m.Name, m.Data)
+	}
+	got := map[string]int64{}
+	for _, dp := range hist.DataPoints {
+		if dp.Count != 1 {
+			t.Errorf("datapoint %v has %d observations, want 1", dp.Attributes.ToSlice(), dp.Count)
+		}
+		if a := attrString(t, dp.Attributes, ateattr.TemplateAtespaceKey); a != testTemplateNamespace {
+			t.Errorf("template atespace = %q, want %q", a, testTemplateNamespace)
+		}
+		if n := attrString(t, dp.Attributes, ateattr.TemplateNameKey); n != testTemplateName {
+			t.Errorf("template name = %q, want %q", n, testTemplateName)
+		}
+		got[attrString(t, dp.Attributes, semconv.FileNameKey)] = dp.Sum
+	}
+	if len(want) != len(rec.SnapshotFiles)+1 || !maps.Equal(got, want) {
+		t.Errorf("recorded sizes = %v, want the stored objects' %v", got, want)
+	}
+}
+
+// fixedSizesNodePlugin succeeds every UploadSnapshot with sizes.
+type fixedSizesNodePlugin struct {
+	sizes map[string]int64
+}
+
+func (p fixedSizesNodePlugin) FetchSnapshot(context.Context, *objectstore.FetchSnapshotRequest, ...grpc.CallOption) (*objectstore.FetchSnapshotResponse, error) {
+	return &objectstore.FetchSnapshotResponse{}, nil
+}
+
+func (p fixedSizesNodePlugin) UploadSnapshot(_ context.Context, req *objectstore.UploadSnapshotRequest, _ ...grpc.CallOption) (*objectstore.UploadSnapshotResponse, error) {
+	out := map[string]int64{}
+	for _, f := range req.GetFiles() {
+		if n, ok := p.sizes[f]; ok {
+			out[f] = n
+		}
+	}
+	return &objectstore.UploadSnapshotResponse{StoredBytes: out}, nil
+}
+
+func TestUploadSnapshotSkipsUnreportedAndNegativeSizes(t *testing.T) {
+	instruments, reader := newTestInstruments(t)
+	s := &Atelet{
+		objectStorePlugin: fixedSizesNodePlugin{sizes: map[string]int64{
+			"reported":          42,
+			"negative":          -1,
+			sandboxManifestName: -1,
+		}},
+		workerActorJWTs:    testWorkerActorJWTs(),
+		snapshotScratchDir: t.TempDir(),
+		instruments:        instruments,
+	}
+	uri, err := resources.ParseSnapshotURI(pausedSnapshotURI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := sandboxAssetsRecord{
+		SandboxClass:          "gvisor",
+		ActorTemplateAtespace: testTemplateNamespace,
+		ActorTemplateName:     testTemplateName,
+		SnapshotFiles:         []string{"reported", "omitted", "negative"},
+	}
+	if err := s.uploadSnapshot(t.Context(), testActor, uri, t.TempDir(), &rec); err != nil {
+		t.Fatalf("uploadSnapshot: %v", err)
+	}
+	hist := collectHistogram(t, reader, snapshotUploadSizeMetric).Data.(metricdata.Histogram[int64])
+	got := map[string]int64{}
+	for _, dp := range hist.DataPoints {
+		got[attrString(t, dp.Attributes, semconv.FileNameKey)] = dp.Sum
+	}
+	if want := map[string]int64{"reported": 42}; !maps.Equal(got, want) {
+		t.Errorf("recorded sizes = %v, want %v", got, want)
+	}
+}
+
 func TestSnapshotTransferSkipsEmptyFileLists(t *testing.T) {
 	store := &orderedObjectStorage{}
 	s := newPluginHerder(t, store)
 	if err := s.downloadExternalCheckpoint(context.Background(), testActor, pausedSnapshotURI, t.TempDir(), nil, cacheModeOff); err != nil {
 		t.Errorf("downloadExternalCheckpoint(no files) = %v, want nil", err)
 	}
-	if err := s.uploadSnapshotFiles(context.Background(), testActor, pausedSnapshotURI, t.TempDir(), nil); err != nil {
+	if _, err := s.uploadSnapshotFiles(context.Background(), testActor, pausedSnapshotURI, t.TempDir(), nil); err != nil {
 		t.Errorf("uploadSnapshotFiles(no files) = %v, want nil", err)
 	}
 	if len(store.puts) != 0 {
@@ -322,7 +444,8 @@ func TestObjectStorePluginErrorKeepsCredentialsOut(t *testing.T) {
 			return s.downloadExternalCheckpoint(ctx, testActor, signedURI, t.TempDir(), []string{"a"}, cacheModeCopy)
 		}},
 		{"upload", signedURI, func(ctx context.Context, s *Atelet) error {
-			return s.uploadSnapshotFiles(ctx, testActor, signedURI, t.TempDir(), []string{"a"})
+			_, err := s.uploadSnapshotFiles(ctx, testActor, signedURI, t.TempDir(), []string{"a"})
+			return err
 		}},
 		{"manifest fetch", signedURI, func(ctx context.Context, s *Atelet) error {
 			_, err := s.fetchManifest(ctx, testActor, signedURI)

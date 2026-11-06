@@ -21,6 +21,7 @@ import (
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 
 	"go.ate.dev/substrate/internal/ateattr"
 	"go.ate.dev/substrate/internal/proto/ateletpb"
@@ -29,6 +30,7 @@ import (
 const (
 	restoreDurationMetric    = "ate.actor.restore.duration"
 	checkpointDurationMetric = "ate.actor.checkpoint.duration"
+	snapshotUploadSizeMetric = "atelet.snapshot.upload.size"
 )
 
 // snapshotPhaseBuckets have to cover both ends of a phase breakdown: a warm OCI
@@ -36,11 +38,17 @@ const (
 // fetching a multi-GiB snapshot runs for tens of seconds.
 var snapshotPhaseBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 60}
 
-// Instruments holds atelet's cold-start histograms. A nil *Instruments is a
+// snapshotSizeBuckets have to cover both ends of a snapshot's images: a state
+// file of a few KB lands in the first bucket, while a guest memory image runs to
+// several GB.
+var snapshotSizeBuckets = []float64{1e6, 5e6, 1e7, 2.5e7, 5e7, 1e8, 2.5e8, 5e8, 1e9, 2e9, 5e9, 1e10}
+
+// Instruments holds atelet's snapshot histograms. A nil *Instruments is a
 // valid no-op, so call sites need no guard.
 type Instruments struct {
 	restoreDuration    metric.Float64Histogram
 	checkpointDuration metric.Float64Histogram
+	snapshotUploadSize metric.Int64Histogram
 }
 
 func NewInstruments(meter metric.Meter) (*Instruments, error) {
@@ -64,9 +72,20 @@ func NewInstruments(meter metric.Meter) (*Instruments, error) {
 		return nil, fmt.Errorf("create %s histogram: %w", checkpointDurationMetric, err)
 	}
 
+	snapshotUploadSize, err := meter.Int64Histogram(
+		snapshotUploadSizeMetric,
+		metric.WithUnit("By"),
+		metric.WithDescription("Bytes object storage holds for each file that a snapshot upload writes, as the object-store plugin reports them."),
+		metric.WithExplicitBucketBoundaries(snapshotSizeBuckets...),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create %s histogram: %w", snapshotUploadSizeMetric, err)
+	}
+
 	return &Instruments{
 		restoreDuration:    restoreDuration,
 		checkpointDuration: checkpointDuration,
+		snapshotUploadSize: snapshotUploadSize,
 	}, nil
 }
 
@@ -117,6 +136,19 @@ func (i *Instruments) recordCheckpoint(ctx context.Context, op snapshotOp, phase
 		return
 	}
 	recordPhases(ctx, i.checkpointDuration, op, phases)
+}
+
+// recordSnapshotUploadSize records the bytes object storage holds for one
+// uploaded snapshot file, labeled like atelet.snapshot.size.
+func (i *Instruments) recordSnapshotUploadSize(ctx context.Context, file string, size int64, templateAtespace, templateName string) {
+	if i == nil || i.snapshotUploadSize == nil {
+		return
+	}
+	i.snapshotUploadSize.Record(ctx, size, metric.WithAttributes(
+		semconv.FileNameKey.String(file),
+		ateattr.TemplateAtespaceKey.String(templateAtespace),
+		ateattr.TemplateNameKey.String(templateName),
+	))
 }
 
 // recordPhases skips zero-valued phases: those never started, because the

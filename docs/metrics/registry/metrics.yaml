@@ -1080,6 +1080,36 @@ groups:
       - ref: ate.template.name
         requirement_level: required
 
+  - id: metric.atelet.snapshot.upload.size
+    type: metric
+    metric_name: atelet.snapshot.upload.size
+    instrument: histogram
+    unit: By
+    stability: development
+    brief: The bytes object storage holds for each file that a snapshot upload writes.
+    note: >
+      The object-store plugin reports the size it stored each file at, after
+      compression. atelet records one measurement for each snapshot file and
+      for manifest.json once the manifest is uploaded, for every upload: a
+      synchronous checkpoint, a background upload, and PromoteSnapshot. It
+      records none for a file the plugin does not report. The manifest.json
+      count is the number of uploaded snapshots. Compare its mean with
+      atelet.snapshot.size by file.name for the compression ratio.
+    annotations:
+      substrate:
+        emitted_by: [atelet]
+        golden_signals: [saturation]
+        code_anchor: cmd/atelet/metrics.go
+        buckets: [1000000, 5000000, 10000000, 25000000, 50000000, 100000000, 250000000, 500000000, 1000000000, 2000000000, 5000000000, 10000000000]
+        cuj: How much object storage do the snapshots take? Which template, and which image?
+    attributes:
+      - ref: file.name
+        requirement_level: required
+      - ref: ate.template.atespace
+        requirement_level: required
+      - ref: ate.template.name
+        requirement_level: required
+
   - id: metric.atelet.snapshot.upload.duration
     type: metric
     metric_name: atelet.snapshot.upload.duration
